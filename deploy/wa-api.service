@@ -1,0 +1,35 @@
+# Unit systemd untuk daemon waapi dengan batas RAM keras 100 MB
+[Unit]
+Description=waapi Private WhatsApp API Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=waapi
+Group=waapi
+UMask=0007
+Environment=WAAPI_DATA_DIR=/var/lib/waapi
+Environment=WAAPI_HTTP_ADDR=127.0.0.1:8080
+Environment=GOMEMLIMIT=80MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=2
+ExecStart=/usr/local/bin/waapi serve
+Restart=always
+RestartSec=3
+
+# Throttle memori mulai 90 MB dan batasi maksimum 100 MB tanpa swap
+MemoryHigh=90M
+MemoryMax=100M
+MemorySwapMax=0
+
+# Hardening keamanan sistem operasi
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/waapi
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

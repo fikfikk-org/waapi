@@ -1,0 +1,48 @@
+# Workflow GitHub Actions untuk membangun dan merilis binary statis waapi (amd64 & arm64)
+name: Release Static Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Run tests
+        run: CGO_ENABLED=0 go test ./...
+
+      - name: Build static binaries (linux/amd64 & linux/arm64)
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME#v}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -buildid= -X github.com/fikfikk-org/waapi/internal/cli.Version=${VERSION}" \
+            -o dist/waapi-linux-amd64 ./cmd/waapi
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+            -ldflags="-s -w -buildid= -X github.com/fikfikk-org/waapi/internal/cli.Version=${VERSION}" \
+            -o dist/waapi-linux-arm64 ./cmd/waapi
+          cd dist && sha256sum waapi-linux-* > checksums.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/waapi-linux-amd64
+            dist/waapi-linux-arm64
+            dist/checksums.txt
+          generate_release_notes: true

@@ -1,0 +1,9 @@
+# Pastikan seluruh skrip shell, systemd unit, dan kode sumber menggunakan line ending LF (Unix)
+* text=auto eol=lf
+*.sh text eol=lf
+*.service text eol=lf
+*.go text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf

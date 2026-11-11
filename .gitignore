@@ -1,0 +1,10 @@
+# Binary dan artefak lokal
+bin/
+*.exe
+*.db
+*.db-wal
+*.db-shm
+*.sock
+.wa-api/
+tmp/
+
