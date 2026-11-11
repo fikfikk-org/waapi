@@ -1,5 +1,8 @@
 # waapi — Ultra-Lightweight Headless WhatsApp API Gateway
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/fikfikk-org/waapi)](https://github.com/fikfikk-org/waapi/releases)
+
 Private WhatsApp Multi-Device API Gateway dalam **1 binary statis Go** (`whatsmeow` + pure-Go SQLite) tanpa admin panel web. Seluruh manajemen instance, pairing QR/kode 8 digit, webhook, dan API key dikendalikan langsung lewat terminal (`waapi`), dengan konsumsi RAM **< 100 MB** (`GOMEMLIMIT=80MiB`, `MemoryMax=100M`).
 
 ---
@@ -355,3 +358,205 @@ go build -o bin/waapi ./cmd/waapi
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Analisis first-principles, alokasi budget memori < 100 MB, pragma SQLite, dan diagram alur sistem.
 - [documentation.md](documentation.md) — Siklus hidup entitas, transisi status instance, dan batasan bisnis.
 - [documentation-api.md](documentation-api.md) — Tabel spesifikasi lengkap seluruh endpoint REST API dan payload webhook.
+
+---
+
+## Lisensi, Hak Cipta & Kredit
+
+- **Hak Cipta & Lisensi Kode Sumber**: Dirilis di bawah [MIT License](LICENSE) — `Copyright (c) 2026 Fikri (fikfikk-org)`. Setiap salinan atau *fork* wajib mempertahankan pemberitahuan hak cipta asli.
+- **Pustaka Pihak Ketiga**: Menggunakan [`go.mau.fi/whatsmeow`](https://github.com/tulir/whatsmeow) (MPL-2.0), [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (BSD-3-Clause), dan [`github.com/mdp/qrterminal/v3`](https://github.com/mdp/qrterminal) (MIT). Lihat detail lengkap di [NOTICE](NOTICE).
+- **Disclaimer**: Proyek ini independen dan tidak berafiliasi dengan atau didukung oleh WhatsApp LLC maupun Meta Platforms, Inc. Penggunaan sepenuhnya menjadi tanggung jawab pengguna.
+
+
+### C. Kirim Media dari URL (`https://`)
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/instances/sales/messages/media-url \
+  -H "X-API-Key: wak_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "6289876543210",
+    "type": "image",
+    "url": "https://example.com/produk.jpg",
+    "caption": "Foto produk"
+  }'
+```
+
+### D. Cek Apakah Nomor Terdaftar di WhatsApp
+
+Maksimal 20 nomor per request (hasil di-cache selama 24 jam):
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/instances/sales/contacts/check \
+  -H "X-API-Key: wak_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "numbers": ["6281234567890", "6289999999999"]
+  }'
+```
+
+### E. Cek Status Instance via API
+
+```bash
+curl http://127.0.0.1:8080/v1/instances/sales \
+  -H "X-API-Key: wak_..."
+```
+
+---
+
+## 4. Menerima Pesan Masuk via Webhook
+
+### Pasang URL Webhook pada Instance
+
+```bash
+waapi webhook set sales https://api.domain-anda.com/webhook/wa --events message,receipt,connection
+```
+
+### Uji Pengiriman Webhook
+
+```bash
+waapi webhook test sales
+```
+
+### Contoh Payload Webhook (`POST`)
+
+Setiap request webhook menyertakan header:
+- `X-WA-Event`: `message` | `receipt` | `connection`
+- `X-WA-Instance`: ID instance (mis. `sales`)
+- `X-WA-Timestamp`: Unix epoch detik
+- `X-WA-Signature`: `sha256=<hex HMAC-SHA256(webhook_secret, timestamp + "." + raw_body)>`
+
+```json
+{
+  "event": "message",
+  "instance": "sales",
+  "timestamp": 1794360100,
+  "data": {
+    "id": "3EB0F00D...",
+    "from": "6281234567890@s.whatsapp.net",
+    "chat": "6281234567890@s.whatsapp.net",
+    "is_group": false,
+    "from_me": false,
+    "push_name": "Budi",
+    "type": "text",
+    "text": "Halo, apakah stok masih ada?"
+  }
+}
+```
+
+Jika pesan masuk berupa media (`image`, `video`, `audio`, `document`), field `data.media` akan berisi *descriptor* yang dapat diunduh secara *on-demand* (streaming) melalui endpoint `POST /v1/instances/{id}/media/download` dengan mengirimkan JSON `data.media` sebagai request body.
+
+---
+
+## 5. Referensi Perintah CLI (`waapi`)
+
+```text
+PERINTAH INSTANCE:
+  waapi list                                   Daftar semua instance WhatsApp
+  waapi add <id> [--rate 20] [--no-autostart]  Buat instance baru
+  waapi show <id>                              Detail status satu instance
+  waapi edit <id> [opsi]                       Ubah rate limit / webhook / autostart instance
+  waapi pair <id> [--phone 62812xxx]           Tautkan nomor via QR ASCII atau 8-digit kode
+  waapi restart <id>                           Sambungkan ulang instance
+  waapi stop <id>                              Hentikan koneksi instance dan matikan autostart
+  waapi logout <id>                            Unlink perangkat dari WhatsApp
+  waapi rm <id> [--yes]                        Logout dan hapus instance beserta datanya
+
+OPSI EDIT INSTANCE (waapi edit <id>):
+  --rate <n>              Batas kirim pesan per menit (contoh: --rate 30)
+  --webhook <url>         URL tujuan webhook (kosongkan "" untuk menghapus)
+  --events <csv>          Filter event: message,receipt,connection
+  --autostart <bool>      true atau false
+  --rotate-secret         Putar ulang secret HMAC webhook
+
+MANAJEMEN API KEY:
+  waapi key list                               Daftar seluruh API key
+  waapi key add --name <nama> [--instance <id>] Buat API key baru (ditampilkan sekali)
+  waapi key rm <key-id>                        Cabut (revoke) API key
+
+MANAJEMEN WEBHOOK:
+  waapi webhook set <id> <url> [--events ...]  Pasang URL webhook pada instance
+  waapi webhook unset <id>                     Hapus URL webhook dari instance
+  waapi webhook test <id>                      Kirim event uji coba ke webhook
+
+DAEMON, UPDATE & DIAGNOSTIK:
+  waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
+  waapi logs [<id>]                            Pantau log service systemd (journalctl)
+  waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
+  sudo waapi update | sudo waapi update:latest Update ke versi terbaru (otomatis backup versi lama)
+  sudo waapi update v1.0.0                     Pasang/downgrade ke versi spesifik
+  sudo waapi rollback [v1.0.0]                 Kembalikan ke backup lokal terakhir atau versi tertentu
+  waapi versions                               Lihat daftar rilis GitHub & backup lokal
+  sudo waapi uninstall [--purge]               Hapus service & binary (--purge untuk hapus data)
+  waapi serve                                  Jalankan background daemon
+  waapi version                                Tampilkan versi binary
+```
+
+### Contoh Cek Update & Rollback
+
+Session WhatsApp (`wa.db`) dan API key (`app.db`) **tidak pernah terhapus** saat update maupun rollback:
+
+```bash
+# 1. Cek apakah ada versi baru di GitHub Releases
+waapi update --check
+
+# 2. Lihat daftar versi di GitHub & backup lokal yang tersimpan di /var/lib/waapi/backups
+waapi versions
+
+# 3. Update ke versi terbaru (otomatis mem-backup binary lama & verifikasi SHA-256)
+sudo waapi update:latest
+
+# 4. Rollback instan ke versi sebelumnya (atau sebutkan versi: sudo waapi rollback v1.0.0)
+sudo waapi rollback
+```
+
+---
+
+## 6. Konfigurasi Environment Variable
+
+Secara default dikonfigurasi di `/etc/systemd/system/waapi.service`:
+
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `WAAPI_DATA_DIR` | `/var/lib/waapi` (`~/.wa-api` jika lokal) | Lokasi `app.db`, `wa.db`, `control.sock`, dan `tmp/` |
+| `WAAPI_HTTP_ADDR` | `127.0.0.1:8080` | Alamat bind HTTP REST API |
+| `WAAPI_MEMORY_LIMIT_MIB` | `80` | Fallback soft memory limit jika `GOMEMLIMIT` kosong |
+| `WAAPI_MAX_CONNS` | `64` | Batas koneksi HTTP publik konkuren |
+| `WAAPI_MEDIA_MAX_MIB` | `16` | Batas ukuran upload gambar/video/audio (MiB) |
+| `WAAPI_DOCUMENT_MAX_MIB` | `64` | Batas ukuran upload dokumen (MiB) |
+| `WAAPI_WEBHOOK_WORKERS` | `4` | Jumlah goroutine worker pengirim webhook |
+
+---
+
+## 7. Menjalankan di Lokal (Tanpa systemd)
+
+Untuk pengembangan di komputer lokal (Linux / macOS / Windows):
+
+```bash
+# Terminal 1 — Jalankan daemon
+go build -o bin/waapi ./cmd/waapi
+./bin/waapi serve
+
+# Terminal 2 — Kelola via CLI
+./bin/waapi status
+./bin/waapi add dev
+./bin/waapi pair dev
+./bin/waapi key add --name local-test --instance dev
+```
+
+---
+
+## 8. Dokumentasi Lanjutan
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Analisis first-principles, alokasi budget memori < 100 MB, pragma SQLite, dan diagram alur sistem.
+- [documentation.md](documentation.md) — Siklus hidup entitas, transisi status instance, dan batasan bisnis.
+- [documentation-api.md](documentation-api.md) — Tabel spesifikasi lengkap seluruh endpoint REST API dan payload webhook.
+
+---
+
+## Lisensi, Hak Cipta & Kredit
+
+- **Hak Cipta & Lisensi Kode Sumber**: Dirilis di bawah [MIT License](LICENSE) — `Copyright (c) 2026 Fikri (fikfikk-org)`. Setiap salinan atau *fork* wajib mempertahankan pemberitahuan hak cipta asli.
+- **Pustaka Pihak Ketiga**: Menggunakan [`go.mau.fi/whatsmeow`](https://github.com/tulir/whatsmeow) (MPL-2.0), [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (BSD-3-Clause), dan [`github.com/mdp/qrterminal/v3`](https://github.com/mdp/qrterminal) (MIT). Lihat detail lengkap di [NOTICE](NOTICE).
+- **Disclaimer**: Proyek ini independen dan tidak berafiliasi dengan atau didukung oleh WhatsApp LLC maupun Meta Platforms, Inc. Penggunaan sepenuhnya menjadi tanggung jawab pengguna.
+

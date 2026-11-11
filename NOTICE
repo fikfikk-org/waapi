@@ -1,0 +1,40 @@
+waapi — Ultra-Lightweight Headless WhatsApp API Gateway
+Copyright (c) 2026 Fikri (https://github.com/fikfikk-org/waapi)
+
+========================================================================
+NON-AFFILIATION & TRADEMARK DISCLAIMER
+========================================================================
+This project is an independent open-source software and is NOT affiliated,
+associated, authorized, endorsed by, or in any way officially connected
+with WhatsApp LLC, Meta Platforms, Inc., or any of their subsidiaries or
+affiliates. The official WhatsApp website can be found at https://whatsapp.com.
+"WhatsApp" as well as related names, marks, emblems, and images are
+registered trademarks of their respective owners.
+
+Use of this software is at the user's sole risk and responsibility.
+
+========================================================================
+THIRD-PARTY OPEN SOURCE SOFTWARE NOTICES
+========================================================================
+waapi incorporates and links against the following third-party open-source
+libraries via Go modules (see go.mod for exact versions):
+
+1. go.mau.fi/whatsmeow
+   Copyright (c) Tulir Asokan and contributors
+   License: Mozilla Public License 2.0 (MPL-2.0)
+   Source: https://github.com/tulir/whatsmeow
+
+2. modernc.org/sqlite
+   Copyright (c) The Modernc Authors / SQLite Authors
+   License: BSD-3-Clause
+   Source: https://gitlab.com/cznic/sqlite
+
+3. github.com/mdp/qrterminal/v3
+   Copyright (c) Mark Percival and contributors
+   License: MIT License
+   Source: https://github.com/mdp/qrterminal
+
+4. golang.org/x/sync, golang.org/x/time, google.golang.org/protobuf
+   Copyright (c) The Go Authors
+   License: BSD-3-Clause
+   Source: https://go.dev/
