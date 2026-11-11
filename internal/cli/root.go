@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/fikfikk-org/waapi/internal/config"
@@ -73,11 +74,27 @@ func Execute(args []string) error {
 		return runWebhookSubcommand(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
-	case "update":
-		return runUpdate(ctx)
+	case "update", "self-update":
+		return runUpdateCommand(ctx, cfg, rest)
+	case "update:latest":
+		return runUpdateCommand(ctx, cfg, append([]string{"latest"}, rest...))
+	case "update:check", "check-update":
+		return runCheckUpdate(ctx)
+	case "rollback":
+		return runRollbackCommand(ctx, cfg, rest)
+	case "versions":
+		return runListVersions(ctx, cfg)
 	case "uninstall":
 		return runUninstall(ctx, cfg, rest)
 	default:
+		if strings.HasPrefix(cmd, "update:") {
+			ver := strings.TrimPrefix(cmd, "update:")
+			return runUpdateCommand(ctx, cfg, append([]string{ver}, rest...))
+		}
+		if strings.HasPrefix(cmd, "rollback:") {
+			ver := strings.TrimPrefix(cmd, "rollback:")
+			return runRollbackCommand(ctx, cfg, append([]string{ver}, rest...))
+		}
 		return fmt.Errorf("perintah tidak dikenal: %q (jalankan 'waapi --help' untuk daftar perintah)", cmd)
 	}
 }
@@ -96,25 +113,6 @@ func runLogs(ctx context.Context, args []string) error {
 	c.Stderr = os.Stderr
 	c.Stdin = os.Stdin
 	return c.Run()
-}
-
-// runUpdate membangun ulang atau menjalankan installer lalu me-restart service systemd waapi.
-func runUpdate(ctx context.Context) error {
-	if _, err := os.Stat("deploy/install.sh"); err == nil {
-		c := exec.CommandContext(ctx, "bash", "deploy/install.sh")
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		c.Stdin = os.Stdin
-		return c.Run()
-	}
-	c := exec.CommandContext(ctx, "systemctl", "restart", "waapi")
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	if err := c.Run(); err != nil {
-		return fmt.Errorf("restart service waapi gagal (jalankan dengan sudo): %w", err)
-	}
-	fmt.Println("✔ Service waapi berhasil dimulai ulang.")
-	return nil
 }
 
 // runUninstall menghentikan service systemd, menghapus binary/unit, dan opsional menghapus data (--purge).
@@ -168,10 +166,14 @@ MANAJEMEN WEBHOOK:
   waapi webhook unset <id>                     Hapus URL webhook dari instance
   waapi webhook test <id>                      Kirim event uji coba ke webhook
 
-DAEMON & DIAGNOSTIK:
+DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
   waapi logs [<id>]                            Pantau log service systemd (journalctl)
-  waapi update                                 Pasang ulang binary terbaru & restart service waapi
+  waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
+  waapi update | waapi update:latest           Update ke versi terbaru (otomatis backup versi lama)
+  waapi update <versi> | waapi update:v1.0.0   Pasang versi spesifik dari GitHub Releases
+  waapi rollback [<versi>]                     Kembalikan ke versi sebelumnya atau ke versi tertentu
+  waapi versions                               Lihat daftar rilis GitHub & backup lokal
   waapi uninstall [--purge]                    Hapus service & binary (--purge untuk hapus data)
   waapi serve                                  Jalankan background daemon (dipakai oleh systemd)
   waapi version                                Tampilkan versi binary

@@ -7,3 +7,4 @@
 *.md text eol=lf
 Makefile text eol=lf
 Dockerfile text eol=lf
+

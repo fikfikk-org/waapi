@@ -283,13 +283,35 @@ MANAJEMEN WEBHOOK:
   waapi webhook unset <id>                     Hapus URL webhook dari instance
   waapi webhook test <id>                      Kirim event uji coba ke webhook
 
-DAEMON & DIAGNOSTIK:
+DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
   waapi logs [<id>]                            Pantau log service systemd (journalctl)
-  waapi update                                 Pasang ulang binary terbaru & restart service
-  waapi uninstall [--purge]                    Hapus service & binary (--purge untuk hapus data)
+  waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
+  sudo waapi update | sudo waapi update:latest Update ke versi terbaru (otomatis backup versi lama)
+  sudo waapi update v1.0.0                     Pasang/downgrade ke versi spesifik
+  sudo waapi rollback [v1.0.0]                 Kembalikan ke backup lokal terakhir atau versi tertentu
+  waapi versions                               Lihat daftar rilis GitHub & backup lokal
+  sudo waapi uninstall [--purge]               Hapus service & binary (--purge untuk hapus data)
   waapi serve                                  Jalankan background daemon
   waapi version                                Tampilkan versi binary
+```
+
+### Contoh Cek Update & Rollback
+
+Session WhatsApp (`wa.db`) dan API key (`app.db`) **tidak pernah terhapus** saat update maupun rollback:
+
+```bash
+# 1. Cek apakah ada versi baru di GitHub Releases
+waapi update --check
+
+# 2. Lihat daftar versi di GitHub & backup lokal yang tersimpan di /var/lib/waapi/backups
+waapi versions
+
+# 3. Update ke versi terbaru (otomatis mem-backup binary lama & verifikasi SHA-256)
+sudo waapi update:latest
+
+# 4. Rollback instan ke versi sebelumnya (atau sebutkan versi: sudo waapi rollback v1.0.0)
+sudo waapi rollback
 ```
 
 ---
