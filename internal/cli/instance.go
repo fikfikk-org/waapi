@@ -126,8 +126,8 @@ func runInstanceEdit(ctx context.Context, ctrl *control.Client, args []string) e
 	}
 	id := args[0]
 	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
-	rate := fs.Int("rate", -1, "batas kirim per menit")
-	webhookURL := fs.String("webhook", "\x00", "url webhook")
+	rate := fs.Int("rate", 0, "batas kirim per menit")
+	webhookURL := fs.String("webhook", "", "url webhook (isi \"\" untuk menghapus)")
 	eventsCSV := fs.String("events", "", "daftar event dipisah koma")
 	autoStart := fs.String("autostart", "", "true atau false")
 	rotateSecret := fs.Bool("rotate-secret", false, "putar ulang secret HMAC webhook")
@@ -135,17 +135,25 @@ func runInstanceEdit(ctx context.Context, ctrl *control.Client, args []string) e
 		return err
 	}
 
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+
 	payload := map[string]any{}
-	if *rate > 0 {
+	if setFlags["rate"] {
+		if *rate <= 0 {
+			return errors.New("--rate harus lebih besar dari 0")
+		}
 		payload["rate_per_min"] = *rate
 	}
-	if *webhookURL != "\x00" {
+	if setFlags["webhook"] {
 		payload["webhook_url"] = strings.TrimSpace(*webhookURL)
 	}
-	if *eventsCSV != "" {
+	if setFlags["events"] {
 		payload["webhook_events"] = strings.TrimSpace(*eventsCSV)
 	}
-	if *autoStart != "" {
+	if setFlags["autostart"] {
 		val := strings.EqualFold(*autoStart, "true") || *autoStart == "1"
 		payload["auto_start"] = val
 	}
@@ -191,7 +199,7 @@ func runInstancePair(ctx context.Context, ctrl *control.Client, args []string) e
 		fmt.Printf("Meminta kode pairing 8 digit untuk nomor %s...\n", *phone)
 	}
 
-	return control.ReadPairStream(resp, func(ev wa.PairEvent) error {
+	err = control.ReadPairStream(resp, func(ev wa.PairEvent) error {
 		switch ev.Type {
 		case "qr":
 			fmt.Println()
@@ -208,6 +216,11 @@ func runInstancePair(ctx context.Context, ctrl *control.Client, args []string) e
 		}
 		return nil
 	})
+	if ctx.Err() != nil {
+		fmt.Println("\nPairing dibatalkan.")
+		return nil
+	}
+	return err
 }
 
 func runInstanceRestart(ctx context.Context, ctrl *control.Client, args []string) error {
