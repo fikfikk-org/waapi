@@ -199,20 +199,34 @@ func runInstancePair(ctx context.Context, ctrl *control.Client, args []string) e
 		fmt.Printf("Meminta kode pairing 8 digit untuk nomor %s...\n", *phone)
 	}
 
-	err = control.ReadPairStream(resp, func(ev wa.PairEvent) error {
-		switch ev.Type {
-		case "qr":
-			fmt.Println()
-			renderQR(ev.Code)
-			fmt.Println("Menunggu scan QR... (tekan Ctrl+C untuk membatalkan)")
-		case "code":
-			fmt.Printf("\nMasukkan kode berikut di HP (Perangkat tertaut > Tautkan dengan nomor telepon):\n\n    %s\n\n", ev.Code)
-		case "connected":
-			fmt.Printf("✔ Terhubung sebagai %s\n", ev.JID)
-		case "timeout":
+	lastQR := ""
+	err = control.ReadPairStream(resp, func(snap wa.PairSnapshot) error {
+		switch snap.State {
+		case wa.PairQRRefreshed:
+			if snap.QRRaw != nil && *snap.QRRaw != lastQR {
+				lastQR = *snap.QRRaw
+				fmt.Println()
+				renderQR(*snap.QRRaw)
+				fmt.Println("Menunggu scan QR... (tekan Ctrl+C untuk membatalkan)")
+			}
+		case wa.PairCodeGenerated:
+			if snap.PairingCode != nil {
+				fmt.Printf("\nMasukkan kode berikut di HP (Perangkat tertaut > Tautkan dengan nomor telepon):\n\n    %s\n\n", *snap.PairingCode)
+			}
+		case wa.PairConnected:
+			jid := ""
+			if snap.JID != nil {
+				jid = *snap.JID
+			}
+			fmt.Printf("✔ Terhubung sebagai %s\n", jid)
+		case wa.PairTimeout:
 			return errors.New("waktu pairing habis")
-		case "error":
-			return errors.New(ev.Message)
+		case wa.PairError:
+			msg := "pairing gagal"
+			if snap.Error != nil {
+				msg = *snap.Error
+			}
+			return errors.New(msg)
 		}
 		return nil
 	})

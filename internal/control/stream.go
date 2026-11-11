@@ -12,7 +12,7 @@ type pairReq struct {
 	Phone string `json:"phone"`
 }
 
-// handlePairInstance mengalirkan event pairing (QR code / 8-digit code / connected) sebagai NDJSON.
+// handlePairInstance mengalirkan snapshot pairing sebagai NDJSON ke CLI.
 func (s *Server) handlePairInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, ok := s.wa.Get(id)
@@ -23,6 +23,12 @@ func (s *Server) handlePairInstance(w http.ResponseWriter, r *http.Request) {
 
 	var req pairReq
 	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	sess, err := inst.StartPairing(req.Phone)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -35,31 +41,41 @@ func (s *Server) handlePairInstance(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	enc := json.NewEncoder(w)
-	emit := func(ev wa.PairEvent) {
-		_ = enc.Encode(ev)
-		flusher.Flush()
-	}
+	events, unsubscribe := sess.Subscribe()
+	defer unsubscribe()
 
-	_ = inst.Pair(r.Context(), req.Phone, emit)
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case <-r.Context().Done():
+			// Operator menekan Ctrl+C: CLI adalah pemilik sesi, batalkan pairing
+			sess.Cancel()
+			return
+		case snap, ok := <-events:
+			if !ok {
+				return
+			}
+			_ = enc.Encode(snap)
+			flusher.Flush()
+		}
+	}
 }
 
 // ReadPairStream membaca aliran NDJSON dari response pairing dan memanggil onEvent untuk setiap baris.
-func ReadPairStream(r *http.Response, onEvent func(wa.PairEvent) error) error {
+func ReadPairStream(r *http.Response, onEvent func(wa.PairSnapshot) error) error {
 	sc := bufio.NewScanner(r.Body)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
 			continue
 		}
-		var ev wa.PairEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
+		var snap wa.PairSnapshot
+		if err := json.Unmarshal(line, &snap); err != nil {
 			return err
 		}
-		if err := onEvent(ev); err != nil {
+		if err := onEvent(snap); err != nil {
 			return err
 		}
 	}
 	return sc.Err()
 }
-

@@ -49,7 +49,7 @@ func (s *Store) CreateInstance(ctx context.Context, in Instance) error {
 		in.Status = StatusCreated
 	}
 	if in.WebhookEvents == "" {
-		in.WebhookEvents = "message,receipt,connection"
+		in.WebhookEvents = "message,receipt,connection,pairing"
 	}
 	if in.RatePerMin <= 0 {
 		in.RatePerMin = 20

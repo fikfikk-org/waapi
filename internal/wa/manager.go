@@ -135,7 +135,7 @@ func (m *Manager) Create(ctx context.Context, id string, ratePerMin int, autoSta
 		ID:            id,
 		Status:        store.StatusCreated,
 		WebhookSecret: secret,
-		WebhookEvents: "message,receipt,connection",
+		WebhookEvents: "message,receipt,connection,pairing",
 		RatePerMin:    ratePerMin,
 		AutoStart:     autoStart,
 	}
@@ -265,6 +265,7 @@ func (m *Manager) Logout(ctx context.Context, id string) (*InstanceStatus, error
 func (m *Manager) Delete(ctx context.Context, id string) error {
 	inst, ok := m.Get(id)
 	if ok {
+		_, _ = inst.CancelPairing()
 		_ = inst.Logout(ctx)
 		inst.Close()
 	}

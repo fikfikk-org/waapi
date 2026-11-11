@@ -1519,3 +1519,4 @@ systemctl show waapi -p MemoryPeak
 | Pairing ulang saat instance `connected` | `409 already_paired`; jalankan `waapi logout <id>` dulu |
 | `resolveOrCreateDevice` menghapus device lama | Hanya dipanggil setelah cek `IsConnected()` false; instance `logged_out` memang perlu device baru |
 | Reverse proxy (Nginx) timeout < 15 detik | Set `proxy_read_timeout 30s` untuk path `/v1/instances/*/pair` |
+

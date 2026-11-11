@@ -209,6 +209,34 @@ curl http://127.0.0.1:8080/v1/instances/sales \
   -H "X-API-Key: wak_..."
 ```
 
+### F. Pairing via REST API (Integrasi Dashboard Web / Laravel)
+
+Selain lewat terminal (`waapi pair`), proses pairing juga dapat dipicu dan dipantau lewat REST API per-instance (lihat panduan lengkap & contoh Controller Laravel di [docs/PAIRING-API-SPEC.md](docs/PAIRING-API-SPEC.md)):
+
+```bash
+# 1. Mulai pairing mode QR Code (body kosong)
+curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..."
+
+# 2. Atau mulai pairing mode 8-Digit Code (isi nomor internasional tanpa +)
+curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..." \
+  -H "Content-Type: application/json" \
+  -d '{"phone": "6281234567890"}'
+
+# 3. Ambil gambar QR PNG langsung (untuk di-proxy ke <img src="..."> dashboard)
+curl http://127.0.0.1:8080/v1/instances/sales/qr.png?scale=6 \
+  -H "X-API-Key: wak_..." -o qr.png
+
+# 4. Polling status pairing terkini
+curl http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..."
+
+# 5. Batalkan sesi pairing aktif
+curl -X DELETE http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..."
+```
+
 ---
 
 ## 4. Menerima Pesan Masuk via Webhook
@@ -399,6 +427,34 @@ curl -X POST http://127.0.0.1:8080/v1/instances/sales/contacts/check \
 
 ```bash
 curl http://127.0.0.1:8080/v1/instances/sales \
+  -H "X-API-Key: wak_..."
+```
+
+### F. Pairing via REST API (Integrasi Dashboard Web / Laravel)
+
+Selain lewat terminal (`waapi pair`), proses pairing juga dapat dipicu dan dipantau lewat REST API per-instance (lihat panduan lengkap & contoh Controller Laravel di [docs/PAIRING-API-SPEC.md](docs/PAIRING-API-SPEC.md)):
+
+```bash
+# 1. Mulai pairing mode QR Code (body kosong)
+curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..."
+
+# 2. Atau mulai pairing mode 8-Digit Code (isi nomor internasional tanpa +)
+curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..." \
+  -H "Content-Type: application/json" \
+  -d '{"phone": "6281234567890"}'
+
+# 3. Ambil gambar QR PNG langsung (untuk di-proxy ke <img src="..."> dashboard)
+curl http://127.0.0.1:8080/v1/instances/sales/qr.png?scale=6 \
+  -H "X-API-Key: wak_..." -o qr.png
+
+# 4. Polling status pairing terkini
+curl http://127.0.0.1:8080/v1/instances/sales/pair \
+  -H "X-API-Key: wak_..."
+
+# 5. Batalkan sesi pairing aktif
+curl -X DELETE http://127.0.0.1:8080/v1/instances/sales/pair \
   -H "X-API-Key: wak_..."
 ```
 

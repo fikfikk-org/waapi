@@ -52,6 +52,54 @@
 | Response | 200 id, status, jid, push_name, queue_depth, rate_per_min, connected_since · 403 · 404 |
 | Notes | - |
 
+## POST /v1/instances/{id}/pair
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v1/instances/{id}/pair |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key, Content-Type: application/json (opsional) |
+| Query Params | - |
+| Request Body | phone (string, opsional, 8-15 digit tanpa awalan 0 untuk mode kode 8-digit; kosongkan untuk mode QR) |
+| Response | 200 instance, method, state, pairing_code, qr_raw, qr_image_url, expires_in, session_expires_in · 400 · 409 · 504 |
+| Notes | Idempoten untuk method+phone yang sama; sesi berjalan di latar belakang dengan TTL 170 detik |
+
+## GET /v1/instances/{id}/pair
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v1/instances/{id}/pair |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 snapshot sesi pairing terakhir (state: starting, qr_refreshed, code_generated, connected, timeout, cancelled, error) · 404 |
+| Notes | Digunakan oleh dashboard web untuk polling status pairing tiap 2-3 detik |
+
+## DELETE /v1/instances/{id}/pair
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | DELETE /v1/instances/{id}/pair |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 snapshot dengan state `cancelled` · 404 jika tidak ada sesi aktif |
+| Notes | Memutus koneksi websocket pairing sementara dan melepas semaphore |
+
+## GET /v1/instances/{id}/qr.png
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v1/instances/{id}/qr.png |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key |
+| Query Params | scale (integer, opsional, default 6, rentang 2-16) |
+| Request Body | - |
+| Response | 200 binary `image/png` (`Cache-Control: no-store`, header `X-QR-Expires-In`) · 404 jika QR tidak aktif |
+| Notes | Wajib di-proxy oleh backend dashboard (seperti Laravel) agar X-API-Key tidak bocor ke browser |
+
 ## POST /v1/instances/{id}/messages/text
 
 | Field | Detail |

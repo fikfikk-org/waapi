@@ -15,7 +15,7 @@ import (
 )
 
 // Version diisi saat build melalui -ldflags "-X github.com/fikfikk-org/waapi/internal/cli.Version=..."
-var Version = "1.0.1"
+var Version = "1.0.2"
 
 // Execute mengeksekusi argumen baris perintah waapi.
 func Execute(args []string) error {

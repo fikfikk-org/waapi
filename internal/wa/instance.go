@@ -22,14 +22,6 @@ import (
 // ErrInvalidRecipient dikembalikan jika format nomor atau JID tujuan tidak valid.
 var ErrInvalidRecipient = errors.New("nomor telepon atau JID tidak valid")
 
-// PairEvent dikirim secara streaming (NDJSON) ke CLI selama proses pairing berlangsung.
-type PairEvent struct {
-	Type    string `json:"type"`              // qr | code | connected | timeout | error
-	Code    string `json:"code,omitempty"`    // string QR atau kode 8 digit
-	JID     string `json:"jid,omitempty"`     // JID setelah terhubung
-	Message string `json:"message,omitempty"` // keterangan tambahan atau pesan error
-}
-
 // InstanceStatus adalah representasi status runtime + database sebuah instance.
 type InstanceStatus struct {
 	ID             string `json:"id"`
@@ -74,6 +66,10 @@ type Instance struct {
 
 	checkMu    sync.Mutex
 	checkCache map[string]cachedCheck
+
+	pairMu        sync.Mutex
+	pairing       *PairSession
+	driverFactory func(*Instance, context.Context) (pairDriver, error)
 }
 
 func newInstance(m *Manager, meta store.Instance) *Instance {
@@ -204,84 +200,84 @@ func (i *Instance) ConnectExisting(ctx context.Context) error {
 	return nil
 }
 
-// Pair menjalankan proses penautan perangkat via QR code atau 8-digit pairing code.
-func (i *Instance) Pair(ctx context.Context, phone string, emit func(PairEvent)) error {
-	// Semaphore global = 1 agar hanya satu proses pairing berjalan pada satu waktu
-	if err := i.mgr.pairingSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("proses pairing lain sedang berlangsung: %w", err)
-	}
-	defer i.mgr.pairingSem.Release(1)
-
-	dev, err := i.resolveOrCreateDevice(ctx)
-	if err != nil {
-		return err
-	}
-	cli := i.attachClient(dev)
-	i.setStatus(store.StatusPairing, "")
-	_ = i.mgr.store.UpdateInstanceStatus(ctx, i.id, store.StatusPairing, "")
-
-	qrChan, err := cli.GetQRChannel(ctx)
-	if err != nil {
-		return fmt.Errorf("buka qr channel: %w", err)
-	}
-	if err := cli.Connect(); err != nil {
-		return fmt.Errorf("connect untuk pairing: %w", err)
-	}
-
-	cleanPhone := digitsOnly(phone)
-	pairedWithCode := false
-
-	for {
-		select {
-		case <-ctx.Done():
-			cli.Disconnect()
-			i.restoreStatusAfterAbort(context.Background())
-			return ctx.Err()
-		case item, ok := <-qrChan:
-			if !ok {
-				return nil
-			}
-			switch item.Event {
-			case "code":
-				if cleanPhone != "" {
-					if !pairedWithCode {
-						code, err := cli.PairPhone(ctx, cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-						if err != nil {
-							cli.Disconnect()
-							i.restoreStatusAfterAbort(context.Background())
-							emit(PairEvent{Type: "error", Message: err.Error()})
-							return err
-						}
-						pairedWithCode = true
-						emit(PairEvent{Type: "code", Code: code})
-					}
-				} else {
-					emit(PairEvent{Type: "qr", Code: item.Code})
-				}
-			case "success":
-				var jidStr string
-				if cli.Store != nil && cli.Store.ID != nil {
-					jidStr = cli.Store.ID.String()
-				}
-				i.setStatus(store.StatusConnected, jidStr)
-				_ = i.mgr.store.UpdateInstanceStatus(context.Background(), i.id, store.StatusConnected, jidStr)
-				emit(PairEvent{Type: "connected", JID: jidStr})
-				return nil
-			case "timeout":
-				cli.Disconnect()
-				i.restoreStatusAfterAbort(context.Background())
-				emit(PairEvent{Type: "timeout", Message: "waktu pairing habis"})
-				return errors.New("waktu pairing habis")
-			default:
-				if strings.HasPrefix(item.Event, "err-") {
-					cli.Disconnect()
-					i.restoreStatusAfterAbort(context.Background())
-					emit(PairEvent{Type: "error", Message: item.Event})
-					return fmt.Errorf("pairing gagal: %s", item.Event)
-				}
-			}
+// StartPairing memulai sesi pairing baru atau mengembalikan sesi identik yang sedang berjalan.
+func (i *Instance) StartPairing(rawPhone string) (*PairSession, error) {
+	method, phone := PairMethodQR, ""
+	if strings.TrimSpace(rawPhone) != "" {
+		p, err := normalizePairPhone(rawPhone)
+		if err != nil {
+			return nil, err
 		}
+		method, phone = PairMethodCode, p
 	}
+
+	if i.IsConnected() {
+		return nil, ErrAlreadyPaired
+	}
+	i.mu.RLock()
+	st := i.status
+	i.mu.RUnlock()
+	if st == store.StatusConnected {
+		return nil, ErrAlreadyPaired
+	}
+
+	i.pairMu.Lock()
+	defer i.pairMu.Unlock()
+
+	if cur := i.pairing; cur != nil && cur.Active() {
+		if cur.method == method && cur.phone == phone {
+			return cur, nil
+		}
+		return nil, ErrPairingInProgress
+	}
+
+	// Tolak cepat alih-alih menunggu agar request HTTP tidak menggantung
+	if !i.mgr.pairingSem.TryAcquire(1) {
+		return nil, ErrPairingBusy
+	}
+
+	sess := newPairSession(i, method, phone)
+	i.pairing = sess
+	go sess.run()
+	return sess, nil
+}
+
+// PairingSnapshot mengembalikan snapshot sesi terakhir (aktif maupun terminal).
+func (i *Instance) PairingSnapshot() (PairSnapshot, error) {
+	i.pairMu.Lock()
+	sess := i.pairing
+	i.pairMu.Unlock()
+	if sess == nil {
+		return PairSnapshot{}, ErrNoPairingSession
+	}
+	return sess.Snapshot(), nil
+}
+
+// PairingQRPNG mengembalikan PNG QR dari sesi aktif.
+func (i *Instance) PairingQRPNG(scale int) ([]byte, int, error) {
+	i.pairMu.Lock()
+	sess := i.pairing
+	i.pairMu.Unlock()
+	if sess == nil || !sess.Active() {
+		return nil, 0, ErrQRNotAvailable
+	}
+	return sess.PNG(scale)
+}
+
+// CancelPairing membatalkan sesi aktif dan menunggu goroutine sesi selesai (maks 5 detik).
+func (i *Instance) CancelPairing() (PairSnapshot, error) {
+	i.pairMu.Lock()
+	sess := i.pairing
+	i.pairMu.Unlock()
+	if sess == nil || !sess.Active() {
+		return PairSnapshot{}, ErrNoActivePairing
+	}
+	sess.Cancel()
+	select {
+	case <-sess.done:
+	case <-time.After(5 * time.Second):
+	}
+	return sess.Snapshot(), nil
 }
 
 func (i *Instance) resolveOrCreateDevice(ctx context.Context) (*waStore.Device, error) {
@@ -307,7 +303,9 @@ func (i *Instance) restoreStatusAfterAbort(ctx context.Context) {
 		next = store.StatusLoggedOut
 	}
 	i.setStatus(next, jid)
-	_ = i.mgr.store.UpdateInstanceStatus(ctx, i.id, next, jid)
+	if i.mgr != nil && i.mgr.store != nil {
+		_ = i.mgr.store.UpdateInstanceStatus(ctx, i.id, next, jid)
+	}
 }
 
 // Disconnect memutus koneksi WebSocket tanpa menghapus sesi kriptografi.
@@ -321,8 +319,15 @@ func (i *Instance) Disconnect() {
 	}
 }
 
-// Close menghentikan goroutine pengirim dan memutus koneksi WhatsApp.
+// Close menghentikan sesi pairing, goroutine pengirim, dan koneksi WhatsApp.
 func (i *Instance) Close() {
+	i.pairMu.Lock()
+	sess := i.pairing
+	i.pairMu.Unlock()
+	if sess != nil && sess.Active() {
+		sess.Cancel()
+		<-sess.done
+	}
 	if i.cancel != nil {
 		i.cancel()
 	}
@@ -331,6 +336,7 @@ func (i *Instance) Close() {
 
 // Logout melepas tautan perangkat dari WhatsApp dan menghapus device dari wa.db.
 func (i *Instance) Logout(ctx context.Context) error {
+	_, _ = i.CancelPairing()
 	cli := i.getClient()
 	if cli != nil {
 		if err := cli.Logout(ctx); err != nil {

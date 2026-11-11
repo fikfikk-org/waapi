@@ -79,7 +79,7 @@ flowchart TD
 |---|---|
 | Tanpa riwayat chat | Pesan masuk hanya diteruskan ke webhook, tidak disimpan |
 | Tanpa penyimpanan media | Media hanya transit di file sementara lalu dihapus |
-| Pairing serial | Hanya satu instance boleh pairing dalam satu waktu |
+| Pairing serial | Hanya satu instance boleh pairing dalam satu waktu (via CLI maupun REST API `/pair`, TTL otomatis 170 detik) |
 | Batas kirim | Per instance sesuai rate_per_min, dengan jeda acak |
 | Antrian kirim penuh | Request ditolak, klien diminta mencoba lagi |
 | Instance tidak tersambung | Request kirim ditolak |
