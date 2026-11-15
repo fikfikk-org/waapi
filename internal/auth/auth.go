@@ -185,12 +185,12 @@ func (m *Manager) FlushOnce(ctx context.Context) error {
 	return m.store.FlushKeyLastUsed(flushCtx, batch)
 }
 
-// GenerateSecret membuat secret acak hex 32 byte untuk penandatanganan HMAC webhook.
+// GenerateSecret membuat secret acak 32 byte ber-encoding base64 untuk penandatanganan HMAC webhook v1 maupun Standard Webhooks.
 func GenerateSecret() (string, error) {
-	var b [24]byte
+	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("buat webhook secret: %w", err)
 	}
-	return "whsec_" + hex.EncodeToString(b[:]), nil
+	return "whsec_" + base64.StdEncoding.EncodeToString(b[:]), nil
 }
 

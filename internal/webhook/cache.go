@@ -9,10 +9,26 @@ import (
 
 // Target menyimpan konfigurasi pengiriman webhook ter-cache untuk satu instance.
 type Target struct {
-	URL       string
-	Secret    string
-	EventsCSV string
-	Format    string
+	URL         string
+	Secret      string
+	EventsCSV   string
+	Format      string
+	Lanes       int
+	MaxAttempts int
+	Paused      string
+}
+
+func normalizeTarget(t Target) Target {
+	if t.Lanes <= 0 {
+		t.Lanes = 4
+	}
+	if t.MaxAttempts <= 0 {
+		t.MaxAttempts = 12
+	}
+	if t.Format == "" {
+		t.Format = "waapi"
+	}
+	return t
 }
 
 // TargetCache menyediakan lookup target webhook di memori agar hot path bebas query app.db.
@@ -40,12 +56,15 @@ func (tc *TargetCache) Load(ctx context.Context, st *store.Store) error {
 	next := make(map[string]Target, len(list))
 	for i := range list {
 		inst := list[i]
-		next[inst.ID] = Target{
-			URL:       inst.WebhookURL,
-			Secret:    inst.WebhookSecret,
-			EventsCSV: inst.WebhookEvents,
-			Format:    inst.Settings.WebhookFormat,
-		}
+		next[inst.ID] = normalizeTarget(Target{
+			URL:         inst.WebhookURL,
+			Secret:      inst.WebhookSecret,
+			EventsCSV:   inst.WebhookEvents,
+			Format:      inst.Settings.WebhookFormat,
+			Lanes:       inst.Settings.WebhookLanes,
+			MaxAttempts: inst.Settings.WebhookMaxAttempts,
+			Paused:      inst.Settings.WebhookPaused,
+		})
 	}
 	tc.mu.Lock()
 	tc.targets = next
@@ -69,6 +88,7 @@ func (tc *TargetCache) Set(instanceID string, t Target) {
 	if tc == nil || instanceID == "" {
 		return
 	}
+	t = normalizeTarget(t)
 	tc.mu.Lock()
 	if tc.targets == nil {
 		tc.targets = make(map[string]Target)
@@ -83,11 +103,27 @@ func (tc *TargetCache) SetFromInstance(inst *store.Instance) {
 		return
 	}
 	tc.Set(inst.ID, Target{
-		URL:       inst.WebhookURL,
-		Secret:    inst.WebhookSecret,
-		EventsCSV: inst.WebhookEvents,
-		Format:    inst.Settings.WebhookFormat,
+		URL:         inst.WebhookURL,
+		Secret:      inst.WebhookSecret,
+		EventsCSV:   inst.WebhookEvents,
+		Format:      inst.Settings.WebhookFormat,
+		Lanes:       inst.Settings.WebhookLanes,
+		MaxAttempts: inst.Settings.WebhookMaxAttempts,
+		Paused:      inst.Settings.WebhookPaused,
 	})
+}
+
+// SetPaused memperbarui status pause target di cache memori bila instance sudah ada.
+func (tc *TargetCache) SetPaused(instanceID, reason string) {
+	if tc == nil || instanceID == "" {
+		return
+	}
+	tc.mu.Lock()
+	if t, ok := tc.targets[instanceID]; ok {
+		t.Paused = reason
+		tc.targets[instanceID] = t
+	}
+	tc.mu.Unlock()
 }
 
 // Delete menghapus konfigurasi target webhook sebuah instance dari cache.

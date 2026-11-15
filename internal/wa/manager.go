@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,13 @@ func WithTargetCache(tc *webhook.TargetCache) ManagerOption {
 	}
 }
 
+// WithWebhookService memasang service webhook v2 agar perubahan konfigurasi target langsung me-restart deliverer.
+func WithWebhookService(ws *webhook.Service) ManagerOption {
+	return func(m *Manager) {
+		m.webhookSvc = ws
+	}
+}
+
 // Manager mengelola siklus hidup seluruh instance WhatsApp di dalam satu proses daemon.
 type Manager struct {
 	cfg         *config.Config
@@ -51,6 +59,7 @@ type Manager struct {
 	waDB        *sql.DB
 	container   *sqlstore.Container
 	webhook     *webhook.Dispatcher
+	webhookSvc  *webhook.Service
 	journal     *journal.Journal
 	targetCache *webhook.TargetCache
 	waLog       waLog.Logger
@@ -315,8 +324,12 @@ func (m *Manager) Recycle(ctx context.Context, id string) (*InstanceStatus, erro
 	return m.Status(ctx, id)
 }
 
-// Update memperbarui konfigurasi instance di DB dan menyinkronkan rate limiter, settings, serta cache target.
+// Update memperbarui konfigurasi instance di DB dan menyinkronkan rate limiter, settings, cursor, serta deliverer webhook.
 func (m *Manager) Update(ctx context.Context, id string, up store.InstanceUpdate) (*InstanceStatus, error) {
+	prev, err := m.store.GetInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	meta, err := m.store.UpdateInstance(ctx, id, up)
 	if err != nil {
 		return nil, err
@@ -327,8 +340,31 @@ func (m *Manager) Update(ctx context.Context, id string, up store.InstanceUpdate
 		}
 		inst.SetSettings(meta.Settings)
 	}
+
+	if m.journal != nil && up.WebhookURL != nil {
+		prevEmpty := strings.TrimSpace(prev.WebhookURL) == ""
+		newEmpty := strings.TrimSpace(meta.WebhookURL) == ""
+		if !newEmpty && (prevEmpty || strings.TrimSpace(up.WebhookFrom) != "") {
+			// Hentikan deliverer aktif sejenak jika sudah menyala sebelum mengatur ulang cursor awal.
+			if m.webhookSvc != nil && m.targetCache != nil && !prevEmpty {
+				m.targetCache.Set(id, webhook.Target{})
+				m.webhookSvc.OnTargetChanged(id)
+			}
+			var startSeq int64
+			if !strings.EqualFold(strings.TrimSpace(up.WebhookFrom), "retained") {
+				if head, hErr := m.journal.HeadSeq(ctx, id); hErr == nil {
+					startSeq = head
+				}
+			}
+			_ = m.journal.ResetConsumerCursors(ctx, "webhook", id, meta.Settings.WebhookLanes, startSeq, true)
+		}
+	}
+
 	if m.targetCache != nil {
 		m.targetCache.SetFromInstance(meta)
+	}
+	if m.webhookSvc != nil {
+		m.webhookSvc.OnTargetChanged(id)
 	}
 	return m.Status(ctx, meta.ID)
 }
@@ -398,6 +434,9 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	m.mu.Unlock()
 	if m.targetCache != nil {
 		m.targetCache.Delete(id)
+	}
+	if m.webhookSvc != nil {
+		m.webhookSvc.OnTargetChanged(id)
 	}
 	return m.store.DeleteInstance(ctx, id)
 }

@@ -169,28 +169,47 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		Interval:     5 * time.Minute,
 	})
 
-	wh := webhook.NewDispatcher(st, func(ctx context.Context, instanceID string) (string, string, string, error) {
-		inst, err := st.GetInstance(ctx, instanceID)
-		if err != nil {
-			return "", "", "", err
-		}
-		return inst.WebhookURL, inst.WebhookSecret, inst.WebhookEvents, nil
-	}, cfg.WebhookWorkers)
-	wh.SetTargetCache(tc)
-	wh.Start(ctx)
+	if migrated, mErr := webhook.MigrateLegacyOutbox(ctx, st, j); mErr != nil {
+		slog.Warn("migrasi webhook_outbox legacy tidak lengkap", "err", mErr)
+	} else if migrated > 0 {
+		slog.Info("migrasi webhook_outbox legacy ke journal selesai", "count", migrated)
+	}
 
-	waMgr, err := wa.NewManager(ctx, cfg, st, wh, wa.WithJournal(j), wa.WithTargetCache(tc))
+	dead := webhook.NewDeadStore(j.DB())
+	whSvc := webhook.NewService(j, tc, dead, nil, nil, webhook.Options{Store: st})
+
+	instances, err := st.ListInstances(ctx)
 	if err != nil {
-		wh.Stop()
+		return fmt.Errorf("muat daftar instance awal: %w", err)
+	}
+	instanceIDs := make([]string, 0, len(instances))
+	for i := range instances {
+		instanceIDs = append(instanceIDs, instances[i].ID)
+	}
+	whSvc.Start(ctx, instanceIDs)
+
+	wh := webhook.NewDispatcher(st, nil, 0)
+	wh.SetTargetCache(tc)
+
+	waMgr, err := wa.NewManager(ctx, cfg, st, wh,
+		wa.WithJournal(j),
+		wa.WithTargetCache(tc),
+		wa.WithWebhookService(whSvc),
+	)
+	if err != nil {
+		whSvc.Stop()
 		return fmt.Errorf("inisialisasi wa manager: %w", err)
 	}
 
-	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh, control.WithJournal(j))
+	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh,
+		control.WithJournal(j),
+		control.WithWebhookService(whSvc, dead),
+	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
 	if err != nil {
 		_ = waMgr.Close()
-		wh.Stop()
+		whSvc.Stop()
 		return err
 	}
 	defer func() {
@@ -206,14 +225,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	rawPubLn, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		_ = waMgr.Close()
-		wh.Stop()
+		whSvc.Stop()
 		return fmt.Errorf("listen HTTP publik %s: %w", cfg.HTTPAddr, err)
 	}
 	pubLn := httpapi.LimitListener(rawPubLn, cfg.MaxConns)
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithGovernor(governor.AlwaysGreen)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -231,7 +250,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		if err != nil {
 			_ = pubLn.Close()
 			_ = waMgr.Close()
-			wh.Stop()
+			whSvc.Stop()
 			return fmt.Errorf("listen metrik %s: %w", addr, err)
 		}
 		metricsHTTP = &http.Server{
@@ -304,6 +323,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	_ = pubHTTP.Shutdown(shutCtx)
 	_ = ctrlHTTP.Shutdown(shutCtx)
 	_ = waMgr.Close()
+	whSvc.Stop()
 	wh.Stop()
 	_ = authMgr.FlushOnce(shutCtx)
 	_ = j.Close()

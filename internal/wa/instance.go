@@ -188,7 +188,7 @@ func (i *Instance) emitter() Emitter {
 		return nil
 	}
 	if i.mgr.journal != nil {
-		return newEmitterJournal(i.mgr.journal, i.mgr, i.mgr.webhook)
+		return newEmitterJournal(i.mgr.journal, i.mgr)
 	}
 	if i.mgr.webhook != nil {
 		return newEmitterV1(i.mgr.webhook)
@@ -740,25 +740,10 @@ func (i *Instance) handleEvent(rawEvt any) {
 	}
 	switch evt := rawEvt.(type) {
 	case *events.Message:
-		if p := extractMessage(evt); p != nil {
-			if i.mgr != nil && i.mgr.webhook != nil {
-				i.mgr.webhook.Enqueue(i.id, "message", p)
-			}
-		}
+		// Di V2 seluruh event pesan mengalir lewat journal.db melalui handleEventV2.
+		_ = extractMessage(evt)
 	case *events.Receipt:
-		ids := make([]string, len(evt.MessageIDs))
-		for idx, id := range evt.MessageIDs {
-			ids[idx] = string(id)
-		}
-		if i.mgr != nil && i.mgr.webhook != nil {
-			i.mgr.webhook.Enqueue(i.id, "receipt", ReceiptPayload{
-				MessageIDs: ids,
-				Chat:       evt.Chat.ToNonAD().String(),
-				Sender:     evt.Sender.ToNonAD().String(),
-				Type:       string(evt.Type),
-				Timestamp:  evt.Timestamp.Unix(),
-			})
-		}
+		// Tidak lagi memakai antrian webhook v1 di RAM; gunakan mode journal.
 	case *events.HistorySync:
 		// Drop seluruh history sync agar tidak memakan RAM maupun disk
 	}
@@ -814,11 +799,6 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 		return false
 	}
 	ev.Seq = res.Seq
-
-	// Dual-write sementara ke webhook v1 hanya untuk event non-duplikat melalui TargetCache memori.
-	if !res.Duplicate && i.mgr != nil && i.mgr.webhook != nil {
-		i.mgr.webhook.EnqueueEvent(*ev)
-	}
 	return true
 }
 

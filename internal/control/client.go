@@ -133,3 +133,32 @@ func (c *Client) OpenPairStream(ctx context.Context, id, phone string) (*http.Re
 	return resp, nil
 }
 
+// OpenEventStream membuka koneksi Server-Sent Events (/control/instances/{id}/events/stream).
+func (c *Client) OpenEventStream(ctx context.Context, path, lastEventID string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control"+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("daemon tidak merespons di %s (pastikan service waapi sedang berjalan): %w", c.sock, err)
+	}
+	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		var errBody struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		if errBody.Error != "" {
+			return nil, errors.New(errBody.Error)
+		}
+		return nil, fmt.Errorf("buka stream event gagal: HTTP %d", resp.StatusCode)
+	}
+	return resp, nil
+}
+

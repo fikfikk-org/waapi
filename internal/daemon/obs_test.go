@@ -18,6 +18,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/control"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
@@ -49,16 +50,30 @@ func TestObservabilityEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth.NewManager gagal: %v", err)
 	}
-	wh := webhook.NewDispatcher(st, func(context.Context, string) (string, string, string, error) {
-		return "", "", "", nil
-	}, 1)
-	waMgr, err := wa.NewManager(ctx, cfg, st, wh)
+	j, err := journal.Open(ctx, filepath.Join(tmpDir, "journal.db"), store.DBOptions{
+		MaxConns:    2,
+		CacheKiB:    512,
+		IdleTimeout: 30 * time.Second,
+		TxLock:      "immediate",
+	})
+	if err != nil {
+		t.Fatalf("journal.Open gagal: %v", err)
+	}
+	defer j.Close()
+
+	tc := webhook.NewTargetCache()
+	dead := webhook.NewDeadStore(j.DB())
+	whSvc := webhook.NewService(j, tc, dead, nil, nil, webhook.Options{Store: st})
+	whSvc.Start(ctx, nil)
+	defer whSvc.Stop()
+
+	waMgr, err := wa.NewManager(ctx, cfg, st, nil, wa.WithJournal(j), wa.WithTargetCache(tc), wa.WithWebhookService(whSvc))
 	if err != nil {
 		t.Fatalf("wa.NewManager gagal: %v", err)
 	}
 	defer waMgr.Close()
 
-	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh)
+	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, nil, control.WithJournal(j), control.WithWebhookService(whSvc, dead))
 	ctrlSrv.SetVersion("2.0.0-test")
 	ctrlHandler := ctrlSrv.Handler()
 

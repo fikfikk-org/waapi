@@ -45,6 +45,7 @@ type InstanceUpdate struct {
 	WebhookURL    *string
 	WebhookSecret *string
 	WebhookEvents *string
+	WebhookFrom   string
 	RatePerMin    *int
 	AutoStart     *bool
 	Settings      *InstanceSettings

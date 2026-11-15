@@ -7,23 +7,20 @@ import (
 	"time"
 
 	"github.com/fikfikk-org/waapi/internal/journal"
-	"github.com/fikfikk-org/waapi/internal/webhook"
 )
 
-// emitterJournal mencatat event non-pesan (connection, pairing, health, call, ...) ke journal.db
-// sambil mempertahankan dual-write sementara ke webhook.Dispatcher v1 sampai Batch 4.
+// emitterJournal mencatat event non-pesan (connection, pairing, health, call, ...) langsung ke journal.db.
 type emitterJournal struct {
 	j   *journal.Journal
 	mgr *Manager
-	wh  *webhook.Dispatcher
 }
 
-func newEmitterJournal(j *journal.Journal, mgr *Manager, wh *webhook.Dispatcher) Emitter {
-	return &emitterJournal{j: j, mgr: mgr, wh: wh}
+func newEmitterJournal(j *journal.Journal, mgr *Manager) Emitter {
+	return &emitterJournal{j: j, mgr: mgr}
 }
 
 func (e *emitterJournal) Emit(ctx context.Context, instanceID, event string, data any) error {
-	if e == nil {
+	if e == nil || e.j == nil {
 		return nil
 	}
 	now := time.Now()
@@ -38,34 +35,21 @@ func (e *emitterJournal) Emit(ctx context.Context, instanceID, event string, dat
 		payload = []byte("{}")
 	}
 
-	var ev *journal.Event
-	if e.j != nil {
-		dedupe := fmt.Sprintf("sys:%s:%s:%d", instanceID, event, now.UnixNano())
-		ev = &journal.Event{
-			InstanceID: instanceID,
-			Type:       event,
-			DedupeKey:  dedupe,
-			TS:         now.Unix(),
-			ReceivedAt: now.UnixMilli(),
-			Payload:    payload,
-		}
-		var hooks []journal.TxHook
-		if e.mgr != nil {
-			hooks = e.mgr.collectHooks(ctx, ev, data)
-		}
-		res, err := e.j.Append(ctx, ev, hooks...)
-		if err != nil {
-			return err
-		}
-		ev.Seq = res.Seq
+	dedupe := fmt.Sprintf("sys:%s:%s:%d", instanceID, event, now.UnixNano())
+	ev := &journal.Event{
+		InstanceID: instanceID,
+		Type:       event,
+		DedupeKey:  dedupe,
+		TS:         now.Unix(),
+		ReceivedAt: now.UnixMilli(),
+		Payload:    payload,
 	}
-
-	if e.wh != nil {
-		if ev != nil && ev.Seq > 0 {
-			e.wh.EnqueueEvent(*ev)
-		} else {
-			e.wh.Enqueue(instanceID, event, data)
-		}
+	var hooks []journal.TxHook
+	if e.mgr != nil {
+		hooks = e.mgr.collectHooks(ctx, ev, data)
+	}
+	if _, err := e.j.Append(ctx, ev, hooks...); err != nil {
+		return err
 	}
 	return nil
 }

@@ -84,3 +84,131 @@ func (j *Journal) MinCursor(ctx context.Context, instanceID string) (int64, erro
 	}
 	return minSeq.Int64, nil
 }
+
+// HeadSeq mengembalikan seq tertinggi pada journal milik suatu instance (0 jika belum ada event).
+func (j *Journal) HeadSeq(ctx context.Context, instanceID string) (int64, error) {
+	if j == nil || j.db == nil {
+		return 0, errors.New("journal belum diinisialisasi")
+	}
+	var head int64
+	if err := j.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM events WHERE instance_id = ?`,
+		instanceID,
+	).Scan(&head); err != nil {
+		return 0, fmt.Errorf("baca head journal %s: %w", instanceID, err)
+	}
+	return head, nil
+}
+
+// ConsumerCursorMin membaca nilai seq minimum di seluruh lane milik satu konsumen serta jumlah lane tercatat.
+func (j *Journal) ConsumerCursorMin(ctx context.Context, consumer, instanceID string) (seq int64, lanes int, err error) {
+	if j == nil || j.db == nil {
+		return 0, 0, errors.New("journal belum diinisialisasi")
+	}
+	var minSeq sql.NullInt64
+	if err := j.db.QueryRowContext(ctx,
+		`SELECT MIN(seq), COUNT(*) FROM cursors WHERE consumer = ? AND instance_id = ?`,
+		consumer, instanceID,
+	).Scan(&minSeq, &lanes); err != nil {
+		return 0, 0, fmt.Errorf("baca min cursor %s/%s: %w", consumer, instanceID, err)
+	}
+	if minSeq.Valid {
+		seq = minSeq.Int64
+	}
+	return seq, lanes, nil
+}
+
+// ResetConsumerCursors mengatur ulang seluruh lane konsumen ke posisi seq tertentu secara atomik dan menghapus lane usang.
+func (j *Journal) ResetConsumerCursors(ctx context.Context, consumer, instanceID string, lanes int, seq int64, enabled bool) error {
+	if j == nil || j.db == nil {
+		return errors.New("journal belum diinisialisasi")
+	}
+	if lanes <= 0 {
+		lanes = 1
+	}
+	en := 0
+	if enabled {
+		en = 1
+	}
+	now := time.Now().UnixMilli()
+
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mulai transaksi reset cursor %s/%s: %w", consumer, instanceID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM cursors WHERE consumer = ? AND instance_id = ?`,
+		consumer, instanceID,
+	); err != nil {
+		return fmt.Errorf("hapus cursor lama %s/%s: %w", consumer, instanceID, err)
+	}
+	for lane := 0; lane < lanes; lane++ {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO cursors (consumer, instance_id, lane, seq, enabled, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			consumer, instanceID, lane, seq, en, now,
+		); err != nil {
+			return fmt.Errorf("sisip cursor %s/%s/%d: %w", consumer, instanceID, lane, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// EnsureConsumerCursors memastikan seluruh lane [0..lanes) memiliki baris aktif di tabel cursors.
+func (j *Journal) EnsureConsumerCursors(ctx context.Context, consumer, instanceID string, lanes int) error {
+	if j == nil || j.db == nil {
+		return errors.New("journal belum diinisialisasi")
+	}
+	if lanes <= 0 {
+		lanes = 1
+	}
+	now := time.Now().UnixMilli()
+
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mulai transaksi ensure cursor %s/%s: %w", consumer, instanceID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for lane := 0; lane < lanes; lane++ {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO cursors (consumer, instance_id, lane, seq, enabled, updated_at)
+			VALUES (?, ?, ?, 0, 1, ?)`,
+			consumer, instanceID, lane, now,
+		); err != nil {
+			return fmt.Errorf("ensure cursor %s/%s/%d: %w", consumer, instanceID, lane, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE cursors SET enabled = 1, updated_at = ?
+		WHERE consumer = ? AND instance_id = ? AND lane < ?`,
+		now, consumer, instanceID, lanes,
+	); err != nil {
+		return fmt.Errorf("aktifkan cursor %s/%s: %w", consumer, instanceID, err)
+	}
+	return tx.Commit()
+}
+
+// OldestUndeliveredAge menghitung umur event tertua yang seq-nya berada di atas minCursor.
+func (j *Journal) OldestUndeliveredAge(ctx context.Context, instanceID string, minCursor int64) (time.Duration, error) {
+	if j == nil || j.db == nil {
+		return 0, errors.New("journal belum diinisialisasi")
+	}
+	var oldestMs sql.NullInt64
+	if err := j.db.QueryRowContext(ctx,
+		`SELECT MIN(received_at) FROM events WHERE instance_id = ? AND seq > ?`,
+		instanceID, minCursor,
+	).Scan(&oldestMs); err != nil {
+		return 0, fmt.Errorf("baca umur event tertua %s: %w", instanceID, err)
+	}
+	if !oldestMs.Valid {
+		return 0, nil
+	}
+	age := time.Since(time.UnixMilli(oldestMs.Int64))
+	if age < 0 {
+		return 0, nil
+	}
+	return age, nil
+}

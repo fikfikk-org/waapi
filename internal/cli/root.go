@@ -170,10 +170,12 @@ MANAJEMEN API KEY:
   waapi key rm <key-id>                        Cabut (revoke) API key
 
 MANAJEMEN WEBHOOK:
-  waapi webhook set <id> <url> [--events ...]  Pasang URL webhook pada instance
+  waapi webhook set <id> <url> [--from ...]    Pasang URL webhook (--from now|retained)
   waapi webhook unset <id>                     Hapus URL webhook dari instance
+  waapi webhook resume <id>                    Lanjutkan webhook setelah pause 410 Gone
+  waapi webhook dlq <id> ls|replay|purge       Kelola antrean dead-letter webhook
   waapi webhook test <id>                      Kirim event uji coba ke webhook
-  waapi events <id> [--after N] [--follow]     Baca/pantau stream event journal masuk instance
+  waapi events <id> [--after N] [--follow]     Baca/pantau stream event journal (SSE --follow)
 
 DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon

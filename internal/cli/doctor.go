@@ -161,6 +161,18 @@ func printDeepDoctor(rep obs.DeepReport) {
 		doc.InstanceCount["logged_out"],
 		doc.InstanceCount["disabled"],
 	)
+	if len(rep.Webhook) > 0 {
+		fmt.Println("\n=== Webhook & Journal ===")
+		for _, w := range rep.Webhook {
+			paused := w.Paused
+			if paused == "" {
+				paused = "-"
+			}
+			fmt.Printf("%-14s lag %d (head %d · cursor %d · tertua %s) · dlq %d · pause %s · dropped %d\n",
+				w.InstanceID, w.Lag, w.HeadSeq, w.MinCursor, formatDuration(w.OldestUndeliveredS),
+				w.DLQ, paused, w.DroppedUndelivered)
+		}
+	}
 }
 
 func totalInstances(counts map[string]int) int {

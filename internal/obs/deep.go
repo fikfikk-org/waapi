@@ -21,17 +21,30 @@ type DBInput struct {
 	Path string
 }
 
+// WebhookInstanceReport merangkum status lag webhook, DLQ, pause, dan event terbuang per instance.
+type WebhookInstanceReport struct {
+	InstanceID         string `json:"instance_id"`
+	HeadSeq            int64  `json:"head_seq"`
+	MinCursor          int64  `json:"min_cursor"`
+	Lag                int64  `json:"lag"`
+	OldestUndeliveredS int64  `json:"oldest_undelivered_sec"`
+	DLQ                int    `json:"dlq"`
+	Paused             string `json:"paused,omitempty"`
+	DroppedUndelivered int64  `json:"dropped_undelivered"`
+}
+
 // DeepReport merangkum anatomi memori lengkap daemon (Go runtime, procfs, cgroup, THP, SQLite per DB, leak).
 type DeepReport struct {
-	Doctor         DoctorReport `json:"doctor"`
-	Runtime        RuntimeStats `json:"runtime"`
-	Proc           ProcMem      `json:"proc"`
-	Smaps          Smaps        `json:"smaps"`
-	Cgroup         *CgroupMem   `json:"cgroup"`
-	THP            string       `json:"thp"`
-	SQLite         []DBStats    `json:"sqlite"`
-	Build          BuildInfo    `json:"build"`
-	GoroutineLeaks int          `json:"goroutine_leaks"`
+	Doctor         DoctorReport            `json:"doctor"`
+	Runtime        RuntimeStats            `json:"runtime"`
+	Proc           ProcMem                 `json:"proc"`
+	Smaps          Smaps                   `json:"smaps"`
+	Cgroup         *CgroupMem              `json:"cgroup"`
+	THP            string                  `json:"thp"`
+	SQLite         []DBStats               `json:"sqlite"`
+	Webhook        []WebhookInstanceReport `json:"webhook,omitempty"`
+	Build          BuildInfo               `json:"build"`
+	GoroutineLeaks int                     `json:"goroutine_leaks"`
 }
 
 // ReadRuntimeMaxProcs mengembalikan jumlah GOMAXPROCS aktif saat ini.

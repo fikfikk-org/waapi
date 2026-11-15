@@ -34,16 +34,28 @@ func WithJournal(j *journal.Journal) ServerOption {
 	}
 }
 
+// WithWebhookService memasang service webhook v2 untuk test, replay DLQ, dan kontrol target.
+func WithWebhookService(ws *webhook.Service, dead *webhook.DeadStore) ServerOption {
+	return func(s *Server) {
+		s.webhookSvc = ws
+		if dead != nil {
+			s.dead = dead
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
-	cfg       *config.Config
-	store     *store.Store
-	auth      *auth.Manager
-	wa        *wa.Manager
-	webhook   *webhook.Dispatcher
-	journal   *journal.Journal
-	startedAt time.Time
-	version   string
+	cfg        *config.Config
+	store      *store.Store
+	auth       *auth.Manager
+	wa         *wa.Manager
+	webhook    *webhook.Dispatcher
+	webhookSvc *webhook.Service
+	dead       *webhook.DeadStore
+	journal    *journal.Journal
+	startedAt  time.Time
+	version    string
 }
 
 // NewServer membangun Server control plane baru.
@@ -64,6 +76,9 @@ func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manag
 	}
 	if s.journal == nil && w != nil {
 		s.journal = w.Journal()
+	}
+	if s.dead == nil && s.journal != nil && s.journal.DB() != nil {
+		s.dead = webhook.NewDeadStore(s.journal.DB())
 	}
 	return s
 }
@@ -109,7 +124,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /control/instances/{id}/logout", s.handleLogoutInstance)
 	mux.HandleFunc("DELETE /control/instances/{id}", s.handleDeleteInstance)
 	mux.HandleFunc("POST /control/instances/{id}/webhook/test", s.handleTestWebhook)
+	mux.HandleFunc("POST /control/instances/{id}/webhook/resume", s.handleResumeWebhook)
+	mux.HandleFunc("GET /control/instances/{id}/webhook/dlq", s.handleListWebhookDLQ)
+	mux.HandleFunc("POST /control/instances/{id}/webhook/dlq/replay", s.handleReplayWebhookDLQ)
+	mux.HandleFunc("DELETE /control/instances/{id}/webhook/dlq", s.handlePurgeWebhookDLQ)
 	mux.HandleFunc("GET /control/instances/{id}/events", s.handleGetEvents)
+	mux.HandleFunc("GET /control/instances/{id}/events/stream", s.handleStreamEvents)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
 	pprofMux := http.NewServeMux()
@@ -137,6 +157,43 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 			dbs = append(dbs, obs.DBInput{Name: "journal.db", DB: s.journal.DB(), Path: s.cfg.JournalDBPath()})
 		}
 		rep := obs.CollectDeep(r.Context(), s.startedAt, s.cfg.AppDBPath(), s.cfg.WADBPath(), outbox, counts, dbs, s.version)
+		if s.journal != nil && s.store != nil {
+			if instances, err := s.store.ListInstances(r.Context()); err == nil {
+				whReports := make([]obs.WebhookInstanceReport, 0, len(instances))
+				for _, inst := range instances {
+					head, _ := s.journal.HeadSeq(r.Context(), inst.ID)
+					minCur, lanes, _ := s.journal.ConsumerCursorMin(r.Context(), "webhook", inst.ID)
+					var lag int64
+					var oldestSec int64
+					if lanes > 0 || strings.TrimSpace(inst.WebhookURL) != "" {
+						activeMin, _ := s.journal.MinCursor(r.Context(), inst.ID)
+						minCur = activeMin
+						if head > activeMin {
+							lag = head - activeMin
+							if age, aErr := s.journal.OldestUndeliveredAge(r.Context(), inst.ID, activeMin); aErr == nil {
+								oldestSec = int64(age.Seconds())
+							}
+						}
+					}
+					var dlqCount int
+					if s.dead != nil {
+						dlqCount, _ = s.dead.Count(r.Context(), inst.ID)
+					}
+					dropped, _ := obs.MetricJournalDroppedUndeliveredTotal.Lookup(inst.ID)
+					whReports = append(whReports, obs.WebhookInstanceReport{
+						InstanceID:         inst.ID,
+						HeadSeq:            head,
+						MinCursor:          minCur,
+						Lag:                lag,
+						OldestUndeliveredS: oldestSec,
+						DLQ:                dlqCount,
+						Paused:             inst.Settings.WebhookPaused,
+						DroppedUndelivered: int64(dropped),
+					})
+				}
+				rep.Webhook = whReports
+			}
+		}
 		writeJSON(w, http.StatusOK, rep)
 		return
 	}
@@ -238,6 +295,7 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 type updateInstanceReq struct {
 	WebhookURL    *string         `json:"webhook_url"`
 	WebhookEvents *string         `json:"webhook_events"`
+	WebhookFrom   string          `json:"webhook_from"`
 	RatePerMin    *int            `json:"rate_per_min"`
 	AutoStart     *bool           `json:"auto_start"`
 	RotateSecret  bool            `json:"rotate_secret"`
@@ -251,9 +309,14 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if req.WebhookFrom != "" && req.WebhookFrom != "now" && req.WebhookFrom != "retained" {
+		writeErr(w, http.StatusBadRequest, errors.New("webhook_from harus 'now' atau 'retained'"))
+		return
+	}
 	up := store.InstanceUpdate{
 		WebhookURL:    req.WebhookURL,
 		WebhookEvents: req.WebhookEvents,
+		WebhookFrom:   req.WebhookFrom,
 		RatePerMin:    req.RatePerMin,
 		AutoStart:     req.AutoStart,
 	}
@@ -333,7 +396,17 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	code, err := s.webhook.SendTest(r.Context(), id)
+	var (
+		code int
+		err  error
+	)
+	if s.webhookSvc != nil {
+		code, err = s.webhookSvc.SendTest(r.Context(), id)
+	} else if s.webhook != nil {
+		code, err = s.webhook.SendTest(r.Context(), id)
+	} else {
+		err = errors.New("service webhook belum aktif")
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return

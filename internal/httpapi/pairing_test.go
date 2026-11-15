@@ -13,6 +13,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
@@ -47,16 +48,26 @@ func TestPairingHTTPHandlers(t *testing.T) {
 		t.Fatalf("auth.NewManager gagal: %v", err)
 	}
 
-	wh := webhook.NewDispatcher(st, func(ctx context.Context, instanceID string) (string, string, string, error) {
-		return "", "", "", nil
-	}, 1)
-	wh.Start(ctx)
+	j, err := journal.Open(ctx, filepath.Join(tmpDir, "journal.db"), store.DBOptions{
+		MaxConns:    2,
+		CacheKiB:    512,
+		IdleTimeout: 30 * time.Second,
+		TxLock:      "immediate",
+	})
+	if err != nil {
+		t.Fatalf("journal.Open gagal: %v", err)
+	}
+	defer j.Close()
+
+	tc := webhook.NewTargetCache()
+	whSvc := webhook.NewService(j, tc, webhook.NewDeadStore(j.DB()), nil, nil, webhook.Options{Store: st})
+	whSvc.Start(ctx, nil)
 	defer func() {
 		cancel()
-		wh.Stop()
+		whSvc.Stop()
 	}()
 
-	waMgr, err := wa.NewManager(ctx, cfg, st, wh)
+	waMgr, err := wa.NewManager(ctx, cfg, st, nil, wa.WithJournal(j), wa.WithTargetCache(tc), wa.WithWebhookService(whSvc))
 	if err != nil {
 		t.Fatalf("wa.NewManager gagal: %v", err)
 	}

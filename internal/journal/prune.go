@@ -125,13 +125,14 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 			err error
 		)
 		if !hasConsumer {
-			// Tanpa konsumen aktif, seluruh event dianggap sudah terkirim
+			// Tanpa konsumen aktif, seluruh event dianggap sudah terkirim (kecuali yang berada di webhook_dead)
 			res, err = j.db.ExecContext(ctx, `
 				DELETE FROM events
 				WHERE seq IN (
-					SELECT seq FROM events
-					WHERE instance_id = ? AND received_at < ?
-					ORDER BY seq ASC LIMIT ?
+					SELECT e.seq FROM events e
+					WHERE e.instance_id = ? AND e.received_at < ?
+						AND NOT EXISTS (SELECT 1 FROM webhook_dead d WHERE d.instance_id = e.instance_id AND d.seq = e.seq)
+					ORDER BY e.seq ASC LIMIT ?
 				)`,
 				inst, replayCutoff, pruneChunkSize,
 			)
@@ -139,9 +140,10 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 			res, err = j.db.ExecContext(ctx, `
 				DELETE FROM events
 				WHERE seq IN (
-					SELECT seq FROM events
-					WHERE instance_id = ? AND seq <= ? AND received_at < ?
-					ORDER BY seq ASC LIMIT ?
+					SELECT e.seq FROM events e
+					WHERE e.instance_id = ? AND e.seq <= ? AND e.received_at < ?
+						AND NOT EXISTS (SELECT 1 FROM webhook_dead d WHERE d.instance_id = e.instance_id AND d.seq = e.seq)
+					ORDER BY e.seq ASC LIMIT ?
 				)`,
 				inst, minSeq.Int64, replayCutoff, pruneChunkSize,
 			)
@@ -156,7 +158,7 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 		}
 	}
 
-	// Langkah 2: hapus event yang melewati WAAPI_JOURNAL_RETENTION (meski belum terkirim)
+	// Langkah 2: hapus event yang melewati WAAPI_JOURNAL_RETENTION (meski belum terkirim), lindungi webhook_dead
 	for {
 		if ctx.Err() != nil {
 			return deleted, dropped, ctx.Err()
@@ -164,9 +166,10 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 		n, chunkDropped, err := j.deleteReturningCount(ctx, `
 			DELETE FROM events
 			WHERE seq IN (
-				SELECT seq FROM events
-				WHERE instance_id = ? AND received_at < ?
-				ORDER BY seq ASC LIMIT ?
+				SELECT e.seq FROM events e
+				WHERE e.instance_id = ? AND e.received_at < ?
+					AND NOT EXISTS (SELECT 1 FROM webhook_dead d WHERE d.instance_id = e.instance_id AND d.seq = e.seq)
+				ORDER BY e.seq ASC LIMIT ?
 			) RETURNING seq`,
 			hasConsumer, minSeq.Int64, inst, retentionCutoff, pruneChunkSize,
 		)
@@ -180,7 +183,7 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 		}
 	}
 
-	// Langkah 3: hapus kelebihan baris di atas WAAPI_JOURNAL_MAX_ROWS (yang tertua lebih dulu)
+	// Langkah 3: hapus kelebihan baris di atas WAAPI_JOURNAL_MAX_ROWS (yang tertua lebih dulu), lindungi webhook_dead
 	var totalRows int
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE instance_id = ?`, inst).Scan(&totalRows); err != nil {
 		return deleted, dropped, fmt.Errorf("hitung baris journal %s: %w", inst, err)
@@ -194,9 +197,10 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 		n, chunkDropped, err := j.deleteReturningCount(ctx, `
 			DELETE FROM events
 			WHERE seq IN (
-				SELECT seq FROM events
-				WHERE instance_id = ?
-				ORDER BY seq ASC LIMIT ?
+				SELECT e.seq FROM events e
+				WHERE e.instance_id = ?
+					AND NOT EXISTS (SELECT 1 FROM webhook_dead d WHERE d.instance_id = e.instance_id AND d.seq = e.seq)
+				ORDER BY e.seq ASC LIMIT ?
 			) RETURNING seq`,
 			hasConsumer, minSeq.Int64, inst, limit,
 		)

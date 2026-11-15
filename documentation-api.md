@@ -13,6 +13,7 @@
 | 404 | instance_not_found | Instance tidak ada |
 | 413 | media_too_large | Media melebihi batas |
 | 429 | queue_full | Antrian kirim penuh (ada `retry_after`) |
+| 429 | sse_limit | Batas koneksi SSE konkuren tercapai (disertai header `Retry-After: 10`) |
 | 503 | not_ready | Daemon tidak siap (DB gagal atau tekanan memori level `Red`) |
 | 503 | instance_not_connected | Instance belum/tidak tersambung |
 | 504 | send_timeout | WhatsApp tidak merespons |
@@ -197,34 +198,49 @@
 | Response | 200 `{ events, next_after, has_more }` (400 jika query tidak valid, 403 jika scope/instance ditolak, 503 jika journal belum aktif) |
 | Notes | Setiap item pada `events` memakai envelope v2 (`v`, `id`, `event`, `instance`, `timestamp`, `data`); `next_after` mengikuti `ScannedTo` agar pagination tetap maju melewati event yang terfilter |
 
+## GET /v2/instances/{id}/events/stream
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/events/stream |
+| Auth Required | Yes (X-API-Key, scope `events:read`) |
+| Headers | X-API-Key, Last-Event-ID (opsional, diprioritaskan di atas query `after`) |
+| Query Params | `after` (int64 >= 0, opsional; bila kosong bersama `Last-Event-ID` mulai dari head seq terkini), `types` (string csv, opsional) |
+| Request Body | - |
+| Response | 200 `text/event-stream` (`id: <seq>`, `event: <type>`, `data: <envelope v2 JSON>`; heartbeat `: ping` tiap 25 detik) · 400 · 403 · 404 · 429 `sse_limit` · 503 |
+| Notes | Kuota koneksi SSE dibatasi `WAAPI_SSE_MAX` (header `Retry-After: 10` saat penuh); write deadline per frame 30 detik via `http.ResponseController` untuk memutus klien lambat tanpa mematikan stream idle |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
 |---|---|
-| Method + Endpoint | POST ke `webhook_url` instance |
-| Headers | X-WA-Event, X-WA-Event-Id (saat berasal dari journal), X-WA-Instance, X-WA-Timestamp, X-WA-Signature (`sha256=` HMAC dari `timestamp.body`) |
-| Body | Mode v1: event, instance, timestamp, data; dual-write journal v2 memakai envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) |
-| Event | message, receipt, undecryptable, connection, pairing |
-| Notes | Retry maks 8 kali dengan backoff; target webhook dibaca dari `TargetCache` memori tanpa query `app.db` di hot path |
+| Method + Endpoint | POST ke `webhook_url` instance (`User-Agent: waapi-webhook/2.0`) |
+| Headers | Mode `waapi`: `X-WA-Event`, `X-WA-Instance`, `X-WA-Timestamp`, `X-WA-Event-Id`, `X-WA-Delivery-Attempt`, `X-WA-Signature` (`sha256=` HMAC `timestamp.body`). Mode `standard`: `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>` Standard Webhooks) |
+| Body | Envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) dibaca bertahap dari `journal.db` |
+| Event | message, receipt, undecryptable, connection, pairing (dan `test` untuk `waapi webhook test`) |
+| Notes | Pengiriman berurutan per `lane = part % webhook_lanes` (default 4 lane). Jadwal retry `0, 5s, 15s, 45s, 2m, 5m, 15m, 30m, 1h...` (±20% jitter) hingga `webhook_max_attempts` (default 12), menghormati `Retry-After` (maks 1h); `410 Gone` mem-pause target (`gone`); `4xx` lainnya maks 3 percobaan lalu dipindah ke `webhook_dead` (DLQ). Target dibaca dari `TargetCache` memori |
 
 ## Control Plane (CLI only, Unix socket)
 
 Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.sock` (perm 0660).
-- `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`).
-- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB termasuk `journal.db`, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
-- `GET /control/instances/{id}/events` mengambil atau long-poll (`?after=N&limit=N&types=csv&wait=N`) event journal v2 per instance via `waapi events <id> [--after N] [--types csv] [--limit N] [--follow] [--json]`.
+- `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`) serta `webhook_from` (`now` atau `retained`, diakses lewat `waapi webhook set <id> <url> [--from now|retained]`).
+- `POST /control/instances/{id}/webhook/resume` menghapus status `webhook_paused` dan menyalakan ulang deliverer dari cursor tersimpan (`waapi webhook resume <id>`).
+- `GET /control/instances/{id}/webhook/dlq` (`?limit=N`), `POST /control/instances/{id}/webhook/dlq/replay` (`{ all, seq, seqs }`), dan `DELETE /control/instances/{id}/webhook/dlq` mengelola dead-letter queue (`waapi webhook dlq <id> <ls|replay|purge>`).
+- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB termasuk `journal.db`, ringkasan per-instance `webhook`: `head_seq`, `min_cursor`, `lag`, `oldest_undelivered_sec`, `dlq`, `paused`, `dropped_undelivered`, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
+- `GET /control/instances/{id}/events` mengambil atau long-poll (`?after=N&limit=N&types=csv&wait=N`), dan `GET /control/instances/{id}/events/stream` melakukan SSE stream event journal v2 per instance via `waapi events <id> [--after N] [--types csv] [--limit N] [--follow] [--json]`.
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
 - `POST /control/instances/{id}/recycle` menghentikan supervisor, melepas client lama, memuat ulang device `sqlstore`, dan menyalakan ulang supervisor (`waapi recycle <id>`). Ditolak HTTP 400 bila belum dipairing.
 
 ## Scheduled Tasks
 
-Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala internal daemon:
+Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala dan daemon loop internal:
 
 | Tugas | Frekuensi | Tujuan | Efek samping |
 |---|---|---|---|
-| Outbox poller | Tiap 5 detik | Kirim ulang webhook gagal | Hapus baris > 8 percobaan / > 24 jam |
+| Migrasi `webhook_outbox` legacy | Sekali saat startup | Pindahkan backlog v1 ke `journal.db` | Kosongkan baris `webhook_outbox` (tabel tetap dipertahankan) |
+| Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
-| Journal pruner | Tiap 5 menit | Pangkas baris `journal.db` sesuai replay window, retensi, dan batas baris | Hapus baris lama & inkremen metrik `dropped_undelivered_total` bila ada event belum terkirim yang kadaluwarsa |
+| Journal pruner | Tiap 5 menit | Pangkas baris `journal.db` sesuai replay window, retensi, dan batas baris | Hapus baris lama kecuali `webhook_dead` & inkremen `dropped_undelivered_total` bila kadaluwarsa |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
 

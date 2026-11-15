@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -35,35 +37,81 @@ func runEvents(ctx context.Context, ctrl *control.Client, args []string) error {
 	if err != nil {
 		return err
 	}
+	if opts.follow {
+		return followEventsSSE(ctx, ctrl, opts)
+	}
 
-	after := opts.after
-	for {
-		waitSec := 0
-		if opts.follow {
-			waitSec = 25
-		}
-		path := buildControlEventsPath(opts.id, after, opts.limit, opts.types, waitSec)
-		var resp eventsPullPayload
-		if err := ctrl.DoJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
-			if opts.follow && ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
+	path := buildControlEventsPath(opts.id, opts.after, opts.limit, opts.types, 0)
+	var resp eventsPullPayload
+	if err := ctrl.DoJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return err
+	}
+	for _, raw := range resp.Events {
+		printCLIEvent(raw, opts.asJSON)
+	}
+	return nil
+}
 
-		for _, raw := range resp.Events {
-			printCLIEvent(raw, opts.asJSON)
-		}
-		if resp.NextAfter > after {
-			after = resp.NextAfter
-		}
-		if !opts.follow {
-			return nil
-		}
+func followEventsSSE(ctx context.Context, ctrl *control.Client, opts eventsCLIOptions) error {
+	q := url.Values{}
+	if opts.after > 0 {
+		q.Set("after", strconv.FormatInt(opts.after, 10))
+	}
+	if strings.TrimSpace(opts.types) != "" {
+		q.Set("types", strings.TrimSpace(opts.types))
+	}
+	path := "/control/instances/" + url.PathEscape(opts.id) + "/events/stream"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+
+	lastID := ""
+	if opts.after > 0 {
+		lastID = strconv.FormatInt(opts.after, 10)
+	}
+	resp, err := ctrl.OpenEventStream(ctx, path, lastID)
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
+		return err
 	}
+	defer resp.Body.Close()
+
+	return consumeCLIEventStream(ctx, resp.Body, opts.asJSON)
+}
+
+func consumeCLIEventStream(ctx context.Context, r io.Reader, asJSON bool) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+
+	var dataBuf strings.Builder
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return nil
+		}
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			if dataBuf.Len() > 0 {
+				printCLIEvent(json.RawMessage(dataBuf.String()), asJSON)
+				dataBuf.Reset()
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	return scanner.Err()
 }
 
 func parseEventsArgs(args []string) (eventsCLIOptions, error) {

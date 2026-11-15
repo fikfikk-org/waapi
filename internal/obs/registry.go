@@ -312,6 +312,19 @@ func (v *CounterVec) withSlow(values []string) *Counter {
 	return c
 }
 
+// Lookup membaca nilai counter untuk label tertentu tanpa membuat seri baru bila belum ada.
+func (v *CounterVec) Lookup(values ...string) (float64, bool) {
+	if snap := v.fast.Load(); snap != nil {
+		entries := *snap
+		for i := range entries {
+			if equalLabels(entries[i].labels, values, len(v.labelNames)) {
+				return entries[i].metric.Value(), true
+			}
+		}
+	}
+	return 0, false
+}
+
 func (v *CounterVec) rebuildFastLocked() {
 	var list []vecEntry[Counter]
 	v.seriesMap.Range(func(_, val any) bool {

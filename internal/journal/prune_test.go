@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fikfikk-org/waapi/internal/obs"
+	"github.com/fikfikk-org/waapi/internal/store"
 )
 
 func readPromCounterVecValue(t *testing.T, metricName, instanceLabel string) float64 {
@@ -108,5 +110,62 @@ func TestJournal_PruneRetensiDanMaxRows(t *testing.T) {
 	}
 	if delta := afterNoCons - beforeNoCons; delta != 0 {
 		t.Fatalf("noconsumer tanpa konsumen aktif tidak boleh menaikkan dropped_undelivered, delta=%v", delta)
+	}
+}
+
+// TestPrune_TidakHapusWebhookDead memastikan pruner journal tidak pernah menghapus seq yang masih tercatat di webhook_dead.
+func TestPrune_TidakHapusWebhookDead(t *testing.T) {
+	ctx := context.Background()
+	j, err := Open(ctx, filepath.Join(t.TempDir(), "journal.db"), store.DBOptions{
+		MaxConns:    2,
+		CacheKiB:    512,
+		IdleTimeout: 30 * time.Second,
+		TxLock:      "immediate",
+	})
+	if err != nil {
+		t.Fatalf("journal.Open gagal: %v", err)
+	}
+	defer j.Close()
+
+	now := time.Unix(1800000000, 0)
+	for i := 1; i <= 4; i++ {
+		if _, err := j.Append(ctx, &Event{
+			InstanceID: "sales",
+			Type:       "message",
+			Chat:       "628111@s.whatsapp.net",
+			TS:         now.Add(-48 * time.Hour).Unix(),
+			Payload:    []byte(fmt.Sprintf(`{"n":%d}`, i)),
+		}); err != nil {
+			t.Fatalf("Append %d gagal: %v", i, err)
+		}
+	}
+	_, _ = j.db.ExecContext(ctx, `UPDATE events SET received_at = ?`, now.Add(-48*time.Hour).UnixMilli())
+
+	// Tandai seq=2 di webhook_dead; seq lain boleh dipangkas karena retensi & max_rows.
+	if _, err := j.db.ExecContext(ctx,
+		`INSERT INTO webhook_dead (instance_id, seq, attempts, last_status, last_error, dead_at) VALUES ('sales', 2, 12, 500, 'err', ?)`,
+		now.UnixMilli(),
+	); err != nil {
+		t.Fatalf("insert webhook_dead gagal: %v", err)
+	}
+
+	deleted, err := j.Prune(ctx, PrunePolicy{
+		Retention:    1 * time.Hour,
+		ReplayWindow: 1 * time.Minute,
+		MaxRows:      1,
+	}, now)
+	if err != nil {
+		t.Fatalf("Prune gagal: %v", err)
+	}
+	if deleted != 3 {
+		t.Fatalf("event yang boleh dihapus diharapkan 3 (seq=2 dilindungi DLQ), didapat %d", deleted)
+	}
+
+	var remainSeq int64
+	if err := j.db.QueryRowContext(ctx, `SELECT seq FROM events WHERE instance_id = 'sales'`).Scan(&remainSeq); err != nil {
+		t.Fatalf("query sisa event gagal: %v", err)
+	}
+	if remainSeq != 2 {
+		t.Fatalf("event yang tersisa harus seq=2 (DLQ), didapat seq=%d", remainSeq)
 	}
 }

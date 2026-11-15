@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,11 +46,20 @@ func WithGovernor(src governor.Source) ServerOption {
 	}
 }
 
-// WithJournal memasang Journal v2 untuk melayani endpoint pull /v2/instances/{id}/events.
+// WithJournal memasang Journal v2 untuk melayani endpoint pull dan stream /v2/instances/{id}/events*.
 func WithJournal(j *journal.Journal) ServerOption {
 	return func(s *Server) {
 		if j != nil {
 			s.journal = j
+		}
+	}
+}
+
+// WithSSEMax menetapkan batas jumlah koneksi SSE konkuren global.
+func WithSSEMax(n int) ServerOption {
+	return func(s *Server) {
+		if n > 0 {
+			s.sseMax = n
 		}
 	}
 }
@@ -60,6 +71,8 @@ type Server struct {
 	appDB   *sql.DB
 	journal *journal.Journal
 	gov     governor.Source
+	sseMax  int
+	sseSem  chan struct{}
 	mux     *http.ServeMux
 	handler http.Handler
 	routes  []RouteInfo
@@ -86,6 +99,17 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	if s.journal == nil && w != nil {
 		s.journal = w.Journal()
 	}
+	if s.sseMax <= 0 {
+		if envMax := strings.TrimSpace(os.Getenv("WAAPI_SSE_MAX")); envMax != "" {
+			if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
+				s.sseMax = n
+			}
+		}
+	}
+	if s.sseMax <= 0 {
+		s.sseMax = 8
+	}
+	s.sseSem = make(chan struct{}, s.sseMax)
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -101,6 +125,7 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("POST /v1/instances/{id}/contacts/check", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleCheckNumbers))
 	s.handle("POST /v1/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleDownloadMedia))
 	s.handle("GET /v2/instances/{id}/events", auth.ScopeEventsRead, s.withInstanceAuth(s.handleGetEvents))
+	s.handle("GET /v2/instances/{id}/events/stream", auth.ScopeEventsRead, s.withInstanceAuth(s.handleEventsStream))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

@@ -41,10 +41,14 @@ flowchart TD
         KA["active"] -->|"key revoke"| KR["revoked"]
     end
     subgraph WebhookEvent
-        E1["dibuat"] -->|"kirim 2xx"| E2["terkirim"]
-        E1 -->|"gagal / antrian penuh"| E3["outbox"]
-        E3 -->|"retry 2xx"| E2
-        E3 -->|"lebih dari 8 percobaan / umur lebih dari 24 jam"| E4["dead-letter (dihapus)"]
+        E1["journal.db (cursor lane)"] -->|"2xx"| E2["cursor commit"]
+        E1 -->|"408/425/429/5xx atau network (<= max_attempts)"| E3["backoff / Retry-After"]
+        E3 --> E1
+        E1 -->|"habis retry / 4xx non-410 (<= 3x)"| E4["webhook_dead (DLQ)"]
+        E4 -->|"webhook dlq replay 2xx"| E2
+        E4 -->|"webhook dlq purge"| E5["dihapus"]
+        E1 -->|"410 Gone"| E6["paused (gone)"]
+        E6 -->|"webhook resume"| E1
     end
 ```
 
@@ -58,10 +62,10 @@ flowchart TD
 | jid | Unik, terisi setelah pairing | Kosong sebelum pairing |
 | status | Salah satu dari 6 status | Lihat tabel transisi |
 | webhook_url | Opsional, wajib https di produksi | |
-| webhook_secret | Dibuat otomatis | Untuk tanda tangan HMAC |
+| webhook_secret | Dibuat otomatis (`whsec_` + base64 32 byte untuk secret baru) | Untuk tanda tangan HMAC mode `waapi` dan `standard` |
 | rate_per_min | Default 20 | Batas kirim per instance |
 | auto_start | Default aktif | Instance dinyalakan saat daemon start |
-| settings | JSON bertipe per instance | Menyimpan konfigurasi lanjutan (timezone, guardian_profile, dll) |
+| settings | JSON bertipe per instance | Menyimpan konfigurasi lanjutan (`webhook_format`, `webhook_lanes`, `webhook_max_attempts`, `webhook_paused`, dll) |
 | paired_at | Unix timestamp opsional | Waktu pairing nomor aktif; di-reset saat ganti nomor atau logout |
 
 ### API Key
@@ -73,13 +77,21 @@ flowchart TD
 | revoked_at | Terisi = key tidak berlaku | Efek instan |
 | last_used_at | Diperbarui berkala (60 detik) | Bukan per request |
 
-### Webhook Outbox
+### Webhook Outbox (Legacy / Migrasi V1 -> V2)
 
 | Field | Rule | Catatan |
 |---|---|---|
-| attempts | Maks 8 | Lebih dari itu dihapus |
-| next_retry_at | Backoff eksponensial 5 detik s/d 30 menit + jitter | |
-| payload | Maks 64 KB | Teks panjang dipotong |
+| tabel `webhook_outbox` | Dipertahankan (tidak dihapus), tidak lagi menerima penulisan baru di V2 | Baris tersisa dimigrasikan ke `journal.db` sekali saat startup lalu dikosongkan |
+
+### Webhook Deliverer v2 & DLQ (`journal.db`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `webhook_lanes` | Default `4` (rentang konfigurasi per instance) | Pembagian partisi `lane = part % lanes` per chat agar FIFO per chat dan tidak saling memblokir antar chat |
+| `webhook_max_attempts` | Default `12` | Jadwal backoff `0, 5s, 15s, 45s, 2m, 5m, 15m, 30m, 1h...` (±20% jitter) atau mengikuti `Retry-After` maks `1h` |
+| `webhook_format` | `waapi` (default) atau `standard` | `waapi` menjaga header v1 + `X-WA-Event-Id`, `X-WA-Delivery-Attempt`; `standard` memakai Standard Webhooks |
+| `webhook_paused` | Kosong atau `"gone"` | Di-set otomatis ke `"gone"` saat endpoint merespons HTTP `410`; dibuka kembali lewat `waapi webhook resume` |
+| `webhook_dead` | Kunci `(instance_id, seq)` | Menyimpan `attempts`, `last_status`, `last_error`, `dead_at`; dikecualikan dari pruner hingga di-replay atau di-purge |
 
 ### Inbound Journal (`journal.db`)
 
@@ -90,7 +102,7 @@ flowchart TD
 | chat | JID chat kanonik (diubah ke `@s.whatsapp.net` jika LID tersedia lokal) | Pembentuk partisi `part = fnv32a(chat) % 64` |
 | payload | JSON normalisasi (`text` maks 16 KiB, `quoted.text` maks 1 KiB, total maks 64 KiB) | Tidak pernah membuang `id`, `chat`, `from`, `type`, `timestamp` |
 | flags | Bitmask `1` (`offline`), `2` (`truncated`) | Menandai pesan offline sync dan pemotongan konten |
-| cursors | Menyimpan posisi `seq` terakhir konsumen per `(consumer, instance_id, lane)` | Menjadi batas aman penghapusan event pada pruner |
+| cursors | Menyimpan posisi `seq` terakhir konsumen per `(consumer, instance_id, lane)` | Menjadi batas aman penghapusan event pada pruner (bersama pengecualian `webhook_dead`) |
 
 ## Transisi Status Instance
 
@@ -104,6 +116,15 @@ flowchart TD
 | connected, disconnected | logged_out | Logout via CLI atau perangkat di-unlink dari HP |
 | semua | disabled | Operator menghentikan instance |
 | logged_out | pairing | Pairing ulang |
+
+## Transisi Status Webhook v2
+
+| Dari | Ke | Pemicu |
+|---|---|---|
+| aktif | paused (`gone`) | Target webhook membalas HTTP `410 Gone`; cursor `webhook` tetap ditandai aktif agar event tidak dipangkas |
+| paused (`gone`) | aktif | Operator menjalankan `waapi webhook resume <id>` sehingga deliverer dimulai ulang dari cursor tersimpan |
+| pengiriman | dead-letter (`webhook_dead`) | Gagal permanen `4xx` (non-410) setelah maks 3 percobaan atau gagal transien melebihi `webhook_max_attempts` |
+| dead-letter (`webhook_dead`) | selesai / dihapus | `waapi webhook dlq <id> replay` berhasil (HTTP `2xx`) atau `waapi webhook dlq <id> purge` |
 
 ## Batasan Bisnis & Trigger
 
@@ -127,5 +148,8 @@ flowchart TD
 | Recycle instance & systemd watchdog | Operator dapat menyegarkan penuh client dan cache `sqlstore` instance terpasang via `waapi recycle <id>`; daemon mengirim `READY=1`, `WATCHDOG=1` berkala bila `SELECT 1 app.db <= 500ms`, dan `STOPPING=1` ke systemd |
 | Inbound journal effectively-once | Ack ke WhatsApp hanya dikirim setelah transaksi `journal.db` (beserta `TxHook` observer) sukses commit (`SynchronousAck`, `EnableDecryptedEventBuffer`, `UseRetryMessageStore`); hot path handler berjalan tanpa query `app.db` maupun I/O jaringan |
 | Cache target & settings di memori | `TargetCache` webhook dan salinan `InstanceSettings` disinkronkan di memori pada `Create`/`Update`/`Delete` sehingga hot path bebas query `app.db` |
-| Retensi & pemangkasan `journal.db` | Pruner menghapus event terkirim melewati `JournalReplayWindow` (1 jam), event belum terkirim melewati `JournalRetention` (72 jam) dengan increment metrik `dropped_undelivered_total`, serta menjaga maksimal `JournalMaxRows` (50.000) baris per instance |
+| Retensi & pemangkasan `journal.db` | Pruner menghapus event terkirim melewati `JournalReplayWindow` (1 jam), event belum terkirim melewati `JournalRetention` (72 jam) dengan increment metrik `dropped_undelivered_total`, menjaga maksimal `JournalMaxRows` (50.000) baris per instance, dan mengecualikan baris yang tercatat di `webhook_dead` |
+| Webhook deliverer v2 (O(1) RAM) | Deliverer membaca batch langsung dari disk (maks 32 event / 256 KiB per query) tanpa antrian di RAM; mode `now` (default saat `webhook set`) mulai dari head `seq`, mode `--from retained` mengirim ulang backlog yang belum dipangkas; pergantian jumlah `webhook_lanes` memindahkan seluruh cursor ke `MIN(seq)` lama dan menghapus cursor usang |
+| Graceful drain webhook saat shutdown | `Service.Stop()` menunggu request HTTP in-flight selesai (maks 10 detik) dan menuliskan commit cursor memakai context baru sebelum koneksi ditutup |
+| Kuota SSE & slow client | Koneksi SSE publik (`GET /v2/instances/{id}/events/stream`) dibatasi kuota global `WAAPI_SSE_MAX` (ditolak `429 sse_limit` + `Retry-After: 10`), dan diputus jika klien macet melewati batas tulis per-frame 30 detik |
 

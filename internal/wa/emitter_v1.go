@@ -12,7 +12,7 @@ type Emitter interface {
 	Emit(ctx context.Context, instanceID, event string, data any) error
 }
 
-// emitterV1 adalah implementasi sementara Emitter yang meneruskan langsung ke webhook.Dispatcher.
+// emitterV1 dipertahankan sebagai stub tanpa-efek bila daemon dijalankan tanpa journal.
 type emitterV1 struct {
 	wh *webhook.Dispatcher
 }
@@ -21,10 +21,6 @@ func newEmitterV1(wh *webhook.Dispatcher) Emitter {
 	return &emitterV1{wh: wh}
 }
 
-func (e *emitterV1) Emit(_ context.Context, instanceID, event string, data any) error {
-	if e == nil || e.wh == nil {
-		return nil
-	}
-	e.wh.Enqueue(instanceID, event, data)
+func (e *emitterV1) Emit(context.Context, string, string, any) error {
 	return nil
 }

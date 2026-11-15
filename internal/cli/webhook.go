@@ -14,7 +14,7 @@ import (
 
 func runWebhookSubcommand(ctx context.Context, ctrl *control.Client, args []string) error {
 	if len(args) == 0 || isHelp(args[0]) {
-		fmt.Println("Penggunaan: waapi webhook <set|unset|test> <instance-id> [url]")
+		fmt.Println("Penggunaan: waapi webhook <set|unset|resume|dlq|test> <instance-id> [opsi]")
 		return nil
 	}
 	sub := args[0]
@@ -24,6 +24,10 @@ func runWebhookSubcommand(ctx context.Context, ctrl *control.Client, args []stri
 		return runWebhookSet(ctx, ctrl, rest)
 	case "unset", "rm":
 		return runWebhookUnset(ctx, ctrl, rest)
+	case "resume":
+		return runWebhookResume(ctx, ctrl, rest)
+	case "dlq":
+		return runWebhookDLQ(ctx, ctrl, rest)
 	case "test":
 		return runWebhookTest(ctx, ctrl, rest)
 	default:
@@ -33,28 +37,53 @@ func runWebhookSubcommand(ctx context.Context, ctrl *control.Client, args []stri
 
 func runWebhookSet(ctx context.Context, ctrl *control.Client, args []string) error {
 	if len(args) < 2 {
-		return errors.New("penggunaan: waapi webhook set <instance-id> <url> [--events message,receipt,connection]")
+		return errors.New("penggunaan: waapi webhook set <instance-id> <url> [--events message,receipt,connection] [--from now|retained]")
 	}
 	id := args[0]
 	url := args[1]
 	fs := flag.NewFlagSet("webhook set", flag.ContinueOnError)
 	events := fs.String("events", "message,receipt,connection", "daftar event dipisah koma")
+	from := fs.String("from", "", "posisi awal cursor saat aktif: now atau retained")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
+	}
+	if *from != "" && *from != "now" && *from != "retained" {
+		return fmt.Errorf("nilai --from harus 'now' atau 'retained', didapat %q", *from)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	var st wa.InstanceStatus
-	err := ctrl.DoJSON(reqCtx, http.MethodPatch, "/control/instances/"+id, map[string]any{
+	body := map[string]any{
 		"webhook_url":    url,
 		"webhook_events": *events,
-	}, &st)
+	}
+	if *from != "" {
+		body["webhook_from"] = *from
+	}
+
+	var st wa.InstanceStatus
+	err := ctrl.DoJSON(reqCtx, http.MethodPatch, "/control/instances/"+id, body, &st)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("✔ Webhook untuk instance %q diset ke %s (events: %s)\n", st.ID, st.WebhookURL, st.WebhookEvents)
+	return nil
+}
+
+func runWebhookResume(ctx context.Context, ctrl *control.Client, args []string) error {
+	if len(args) == 0 {
+		return errors.New("penggunaan: waapi webhook resume <instance-id>")
+	}
+	id := args[0]
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var st wa.InstanceStatus
+	if err := ctrl.DoJSON(reqCtx, http.MethodPost, "/control/instances/"+id+"/webhook/resume", nil, &st); err != nil {
+		return err
+	}
+	fmt.Printf("✔ Webhook untuk instance %q dilanjutkan kembali dari cursor tersimpan.\n", st.ID)
 	return nil
 }
 
