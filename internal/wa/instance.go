@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"go.mau.fi/whatsmeow"
 	waStore "go.mau.fi/whatsmeow/store"
@@ -24,16 +25,18 @@ var ErrInvalidRecipient = errors.New("nomor telepon atau JID tidak valid")
 
 // InstanceStatus adalah representasi status runtime + database sebuah instance.
 type InstanceStatus struct {
-	ID             string `json:"id"`
-	Status         string `json:"status"`
-	JID            string `json:"jid,omitempty"`
-	PushName       string `json:"push_name,omitempty"`
-	QueueDepth     int    `json:"queue_depth"`
-	RatePerMin     int    `json:"rate_per_min"`
-	WebhookURL     string `json:"webhook_url,omitempty"`
-	WebhookEvents  string `json:"webhook_events"`
-	AutoStart      bool   `json:"auto_start"`
-	ConnectedSince int64  `json:"connected_since,omitempty"`
+	ID             string                 `json:"id"`
+	Status         string                 `json:"status"`
+	JID            string                 `json:"jid,omitempty"`
+	PushName       string                 `json:"push_name,omitempty"`
+	QueueDepth     int                    `json:"queue_depth"`
+	RatePerMin     int                    `json:"rate_per_min"`
+	WebhookURL     string                 `json:"webhook_url,omitempty"`
+	WebhookEvents  string                 `json:"webhook_events"`
+	AutoStart      bool                   `json:"auto_start"`
+	Settings       store.InstanceSettings `json:"settings"`
+	PairedAt       int64                  `json:"paired_at,omitempty"`
+	ConnectedSince int64                  `json:"connected_since,omitempty"`
 }
 
 // NumberCheckResult merangkum hasil pemeriksaan satu nomor pada WhatsApp.
@@ -153,17 +156,26 @@ func (i *Instance) Snapshot(meta store.Instance) InstanceStatus {
 		WebhookURL:     meta.WebhookURL,
 		WebhookEvents:  meta.WebhookEvents,
 		AutoStart:      meta.AutoStart,
+		Settings:       meta.Settings,
+		PairedAt:       meta.PairedAt,
 		ConnectedSince: connSince,
 	}
 }
 
 // attachClient memasang whatsmeow.Client baru dan mendaftarkan event handler.
 func (i *Instance) attachClient(dev *waStore.Device) *whatsmeow.Client {
+	var clientLog waLog.Logger
+	if i.mgr != nil && i.mgr.waLog != nil {
+		clientLog = i.mgr.waLog.Sub(i.id)
+	} else {
+		clientLog = logx.WALogger(slog.Default(), "wa", slog.LevelWarn).Sub(i.id)
+	}
+
 	i.mu.Lock()
 	if i.client != nil {
 		i.client.Disconnect()
 	}
-	cli := whatsmeow.NewClient(dev, waLog.Noop)
+	cli := whatsmeow.NewClient(dev, clientLog)
 	cli.EnableAutoReconnect = true
 	cli.ManualHistorySyncDownload = true
 	cli.AddEventHandler(i.handleEvent)

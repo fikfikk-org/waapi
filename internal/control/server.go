@@ -2,6 +2,7 @@
 package control
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,11 +178,12 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateInstanceReq struct {
-	WebhookURL    *string `json:"webhook_url"`
-	WebhookEvents *string `json:"webhook_events"`
-	RatePerMin    *int    `json:"rate_per_min"`
-	AutoStart     *bool   `json:"auto_start"`
-	RotateSecret  bool    `json:"rotate_secret"`
+	WebhookURL    *string         `json:"webhook_url"`
+	WebhookEvents *string         `json:"webhook_events"`
+	RatePerMin    *int            `json:"rate_per_min"`
+	AutoStart     *bool           `json:"auto_start"`
+	RotateSecret  bool            `json:"rotate_secret"`
+	Settings      json.RawMessage `json:"settings"`
 }
 
 func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
@@ -196,6 +198,19 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 		WebhookEvents: req.WebhookEvents,
 		RatePerMin:    req.RatePerMin,
 		AutoStart:     req.AutoStart,
+	}
+	if len(bytes.TrimSpace(req.Settings)) > 0 {
+		cur, err := s.store.GetInstance(r.Context(), id)
+		if err != nil {
+			writeStatusErr(w, err)
+			return
+		}
+		merged, err := cur.Settings.Merge(req.Settings)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		up.Settings = &merged
 	}
 	if req.RotateSecret {
 		sec, err := auth.GenerateSecret()

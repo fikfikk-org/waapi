@@ -42,6 +42,8 @@ flowchart TD
 | webhook_secret | Dibuat otomatis | Untuk tanda tangan HMAC |
 | rate_per_min | Default 20 | Batas kirim per instance |
 | auto_start | Default aktif | Instance dinyalakan saat daemon start |
+| settings | JSON bertipe per instance | Menyimpan konfigurasi lanjutan (timezone, guardian_profile, dll) |
+| paired_at | Unix timestamp opsional | Waktu pairing nomor aktif; di-reset saat ganti nomor atau logout |
 
 ### API Key
 
@@ -87,4 +89,5 @@ flowchart TD
 | Check number | Maks 20 nomor per request, hasil di-cache 24 jam |
 | Admin | Hanya lewat terminal server (CLI), tidak ada panel web |
 | Kapasitas | 3–6 instance aktif per proses agar RAM di bawah 100 MB |
+| Upgrade skema v1 ke v2 | Backup `app.db` dan `wa.db` dibuat sekali ke folder `backups/pre-v2-*` sebelum migrasi dijalankan |
 

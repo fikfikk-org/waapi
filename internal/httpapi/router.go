@@ -15,31 +15,67 @@ type ctxKey int
 
 const keyMetaCtx ctxKey = 1
 
+// RouteInfo mendeskripsikan pola HTTP dan scope yang dibutuhkan oleh sebuah endpoint API.
+type RouteInfo struct {
+	Pattern string
+	Scope   auth.Scope
+}
+
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
 type Server struct {
-	auth *auth.Manager
-	wa   *wa.Manager
+	auth    *auth.Manager
+	wa      *wa.Manager
+	mux     *http.ServeMux
+	handler http.Handler
+	routes  []RouteInfo
+}
+
+// NewServer membangun Server HTTP publik dengan pencatatan scope per route.
+func NewServer(a *auth.Manager, w *wa.Manager) *Server {
+	s := &Server{
+		auth: a,
+		wa:   w,
+		mux:  http.NewServeMux(),
+	}
+
+	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+	s.handle("GET /v1/instances", auth.ScopeInstancesRead, s.withAuth(s.handleListInstances))
+	s.handle("GET /v1/instances/{id}", auth.ScopeInstancesRead, s.withInstanceAuth(s.handleGetInstance))
+	s.handle("POST /v1/instances/{id}/pair", auth.ScopePair, s.withInstanceAuth(s.handleStartPair))
+	s.handle("GET /v1/instances/{id}/pair", auth.ScopePair, s.withInstanceAuth(s.handleGetPair))
+	s.handle("DELETE /v1/instances/{id}/pair", auth.ScopePair, s.withInstanceAuth(s.handleCancelPair))
+	s.handle("GET /v1/instances/{id}/qr.png", auth.ScopePair, s.withInstanceAuth(s.handleQRPNG))
+	s.handle("POST /v1/instances/{id}/messages/text", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleSendText))
+	s.handle("POST /v1/instances/{id}/messages/media", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleSendMedia))
+	s.handle("POST /v1/instances/{id}/messages/media-url", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleSendMediaURL))
+	s.handle("POST /v1/instances/{id}/contacts/check", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleCheckNumbers))
+	s.handle("POST /v1/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleDownloadMedia))
+
+	s.handler = recoverMiddleware(s.mux)
+	return s
 }
 
 // NewHandler membangun http.Handler untuk seluruh endpoint publik (/healthz dan /v1/*).
 func NewHandler(a *auth.Manager, w *wa.Manager) http.Handler {
-	s := &Server{auth: a, wa: w}
-	mux := http.NewServeMux()
+	return NewServer(a, w)
+}
 
-	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.HandleFunc("GET /v1/instances", s.withAuth(s.handleListInstances))
-	mux.HandleFunc("GET /v1/instances/{id}", s.withInstanceAuth(s.handleGetInstance))
-	mux.HandleFunc("POST /v1/instances/{id}/pair", s.withInstanceAuth(s.handleStartPair))
-	mux.HandleFunc("GET /v1/instances/{id}/pair", s.withInstanceAuth(s.handleGetPair))
-	mux.HandleFunc("DELETE /v1/instances/{id}/pair", s.withInstanceAuth(s.handleCancelPair))
-	mux.HandleFunc("GET /v1/instances/{id}/qr.png", s.withInstanceAuth(s.handleQRPNG))
-	mux.HandleFunc("POST /v1/instances/{id}/messages/text", s.withInstanceAuth(s.handleSendText))
-	mux.HandleFunc("POST /v1/instances/{id}/messages/media", s.withInstanceAuth(s.handleSendMedia))
-	mux.HandleFunc("POST /v1/instances/{id}/messages/media-url", s.withInstanceAuth(s.handleSendMediaURL))
-	mux.HandleFunc("POST /v1/instances/{id}/contacts/check", s.withInstanceAuth(s.handleCheckNumbers))
-	mux.HandleFunc("POST /v1/instances/{id}/media/download", s.withInstanceAuth(s.handleDownloadMedia))
+// ServeHTTP meneruskan permintaan HTTP ke router publik yang sudah dibungkus middleware.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
 
-	return recoverMiddleware(mux)
+// Routes mengembalikan daftar route terdaftar beserta scope-nya untuk inspeksi dan pengujian.
+func (s *Server) Routes() []RouteInfo {
+	out := make([]RouteInfo, len(s.routes))
+	copy(out, s.routes)
+	return out
+}
+
+// handle mendaftarkan handler pada mux sekaligus mencatat scope endpoint (penegakan aktif mulai Batch 11).
+func (s *Server) handle(pattern string, scope auth.Scope, h http.HandlerFunc) {
+	s.routes = append(s.routes, RouteInfo{Pattern: pattern, Scope: scope})
+	s.mux.HandleFunc(pattern, h)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

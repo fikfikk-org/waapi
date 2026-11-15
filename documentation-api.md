@@ -49,7 +49,7 @@
 | Headers | X-API-Key |
 | Query Params | - |
 | Request Body | - |
-| Response | 200 id, status, jid, push_name, queue_depth, rate_per_min, connected_since · 403 · 404 |
+| Response | 200 id, status, jid, push_name, queue_depth, rate_per_min, settings, paired_at, connected_since · 403 · 404 |
 | Notes | - |
 
 ## POST /v1/instances/{id}/pair
@@ -172,7 +172,8 @@
 
 ## Control Plane (CLI only, Unix socket)
 
-Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.sock` (perm 0600).
+Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.sock` (perm 0660).
+- `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`).
 
 ## Scheduled Tasks
 

@@ -3,15 +3,20 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/fikfikk-org/waapi/internal/control"
+	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
 
@@ -120,9 +125,82 @@ func runInstanceStatus(ctx context.Context, ctrl *control.Client, args []string)
 	return nil
 }
 
+type stringSliceFlag []string
+
+func (f *stringSliceFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *stringSliceFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
+// parseEditSetFlags mengonversi argumen --set key=value menjadi patch JSON bertipe untuk InstanceSettings.
+func parseEditSetFlags(items []string) (json.RawMessage, error) {
+	patch := make(map[string]any, len(items))
+	for _, raw := range items {
+		k, v, ok := strings.Cut(raw, "=")
+		if !ok {
+			return nil, fmt.Errorf("format --set harus key=value, didapat %q", raw)
+		}
+		key := strings.TrimSpace(k)
+		if key == "" {
+			return nil, fmt.Errorf("nama field pada --set %q tidak boleh kosong", raw)
+		}
+		kind, known := store.SettingsFieldKind(key)
+		if !known {
+			return nil, fmt.Errorf("field settings tidak dikenal: %q", key)
+		}
+
+		trimmed := strings.TrimSpace(v)
+		switch kind {
+		case "bool":
+			b, err := strconv.ParseBool(trimmed)
+			if err != nil {
+				return nil, fmt.Errorf("nilai %s harus boolean (true/false), didapat %q", key, v)
+			}
+			patch[key] = b
+		case "int":
+			n, err := strconv.ParseInt(trimmed, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("nilai %s harus bilangan bulat, didapat %q", key, v)
+			}
+			patch[key] = n
+		case "duration":
+			d, err := time.ParseDuration(trimmed)
+			if err != nil || d <= 0 {
+				return nil, fmt.Errorf("nilai %s harus durasi positif valid (mis. 120s, 24h), didapat %q", key, v)
+			}
+			patch[key] = trimmed
+		case "string":
+			patch[key] = v
+		case "list":
+			if trimmed == "" {
+				patch[key] = []string{}
+				continue
+			}
+			parts := strings.Split(v, ",")
+			list := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if item := strings.TrimSpace(p); item != "" {
+					list = append(list, item)
+				}
+			}
+			patch[key] = list
+		}
+	}
+
+	b, err := json.Marshal(patch)
+	if err != nil {
+		return nil, fmt.Errorf("encode patch settings: %w", err)
+	}
+	return json.RawMessage(b), nil
+}
+
 func runInstanceEdit(ctx context.Context, ctrl *control.Client, args []string) error {
 	if len(args) == 0 {
-		return errors.New("penggunaan: waapi edit <id> [--rate N] [--webhook URL] [--events CSV] [--autostart true|false] [--rotate-secret]")
+		return errors.New("penggunaan: waapi edit <id> [--rate N] [--webhook URL] [--events CSV] [--autostart true|false] [--rotate-secret] [--set key=value]")
 	}
 	id := args[0]
 	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
@@ -131,6 +209,8 @@ func runInstanceEdit(ctx context.Context, ctrl *control.Client, args []string) e
 	eventsCSV := fs.String("events", "", "daftar event dipisah koma")
 	autoStart := fs.String("autostart", "", "true atau false")
 	rotateSecret := fs.Bool("rotate-secret", false, "putar ulang secret HMAC webhook")
+	var setList stringSliceFlag
+	fs.Var(&setList, "set", "ubah settings instance dalam format key=value (boleh berulang)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -160,8 +240,15 @@ func runInstanceEdit(ctx context.Context, ctrl *control.Client, args []string) e
 	if *rotateSecret {
 		payload["rotate_secret"] = true
 	}
+	if len(setList) > 0 {
+		rawSettings, err := parseEditSetFlags(setList)
+		if err != nil {
+			return err
+		}
+		payload["settings"] = rawSettings
+	}
 	if len(payload) == 0 {
-		return errors.New("tidak ada perubahan yang diberikan (gunakan --rate, --webhook, --events, --autostart, atau --rotate-secret)")
+		return errors.New("tidak ada perubahan yang diberikan (gunakan --rate, --webhook, --events, --autostart, --rotate-secret, atau --set)")
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -335,5 +422,71 @@ func printInstanceDetail(st wa.InstanceStatus) {
 	fmt.Printf("Webhook URL     %s\n", wh)
 	fmt.Printf("Webhook Events  %s\n", st.WebhookEvents)
 	fmt.Printf("Connected Since %s\n", formatTime(st.ConnectedSince))
+	if nonDef := nonDefaultSettings(st.Settings); len(nonDef) > 0 {
+		fmt.Println("Settings        (non-default)")
+		for _, kv := range nonDef {
+			fmt.Printf("  %-22s %s\n", kv[0], kv[1])
+		}
+	}
+}
+
+func nonDefaultSettings(s store.InstanceSettings) [][2]string {
+	if reflect.ValueOf(s).IsZero() {
+		return nil
+	}
+	defMap, err := settingsToMap(store.Defaults())
+	if err != nil {
+		return nil
+	}
+	curMap, err := settingsToMap(s)
+	if err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(curMap))
+	for k := range curMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var diff [][2]string
+	for _, k := range keys {
+		curVal := curMap[k]
+		defVal := defMap[k]
+		if reflect.DeepEqual(curVal, defVal) {
+			continue
+		}
+		diff = append(diff, [2]string{k, formatSettingValue(curVal)})
+	}
+	return diff
+}
+
+func settingsToMap(s store.InstanceSettings) (map[string]any, error) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func formatSettingValue(v any) string {
+	switch t := v.(type) {
+	case []any:
+		parts := make([]string, 0, len(t))
+		for _, item := range t {
+			parts = append(parts, fmt.Sprint(item))
+		}
+		return strings.Join(parts, ",")
+	case float64:
+		if t == float64(int64(t)) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return fmt.Sprint(t)
+	}
 }
 

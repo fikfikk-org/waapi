@@ -12,6 +12,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/webhook"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -28,6 +29,7 @@ type Manager struct {
 	waDB       *sql.DB
 	container  *sqlstore.Container
 	webhook    *webhook.Dispatcher
+	waLog      waLog.Logger
 	pairingSem *semaphore.Weighted
 	mediaSem   *semaphore.Weighted
 
@@ -37,13 +39,20 @@ type Manager struct {
 
 // NewManager membuka wa.db, menjalankan migrasi sqlstore, dan menyiapkan registry instance.
 func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *webhook.Dispatcher) (*Manager, error) {
+	cfg.Normalize()
 	ConfigureDeviceProps()
 
-	waDB, err := store.OpenDB(ctx, cfg.WADBPath(), 3)
+	waLogger := logx.WALogger(slog.Default(), "wa", logx.ParseLevel(cfg.WALogLevel))
+
+	waDB, err := store.OpenDB(ctx, cfg.WADBPath(), store.DBOptions{
+		MaxConns:    3,
+		CacheKiB:    cfg.WACacheKiB,
+		IdleTimeout: 5 * time.Minute,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("buka wa.db: %w", err)
 	}
-	container := sqlstore.NewWithDB(waDB, "sqlite3", waLog.Noop)
+	container := sqlstore.NewWithDB(waDB, "sqlite3", waLogger.Sub("sqlstore"))
 	if err := container.Upgrade(ctx); err != nil {
 		_ = waDB.Close()
 		return nil, fmt.Errorf("migrasi wa.db: %w", err)
@@ -55,6 +64,7 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		waDB:       waDB,
 		container:  container,
 		webhook:    wh,
+		waLog:      waLogger,
 		pairingSem: semaphore.NewWeighted(1), // maksimal 1 proses pairing dalam satu waktu
 		mediaSem:   semaphore.NewWeighted(2), // maksimal 2 stream media aktif bersamaan
 		instances:  make(map[string]*Instance),
@@ -135,7 +145,7 @@ func (m *Manager) Create(ctx context.Context, id string, ratePerMin int, autoSta
 		ID:            id,
 		Status:        store.StatusCreated,
 		WebhookSecret: secret,
-		WebhookEvents: "message,receipt,connection,pairing",
+		WebhookEvents: store.DefaultWebhookEvents,
 		RatePerMin:    ratePerMin,
 		AutoStart:     autoStart,
 	}

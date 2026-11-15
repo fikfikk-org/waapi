@@ -3,11 +3,16 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 )
+
+// DefaultWebhookEvents adalah daftar event bawaan saat instance baru dibuat.
+const DefaultWebhookEvents = "message,receipt,connection,pairing"
 
 // Status instance yang diizinkan di database.
 const (
@@ -21,25 +26,28 @@ const (
 
 // Instance merepresentasikan satu nomor/sesi WhatsApp yang dikelola daemon.
 type Instance struct {
-	ID            string `json:"id"`
-	JID           string `json:"jid,omitempty"`
-	Status        string `json:"status"`
-	WebhookURL    string `json:"webhook_url,omitempty"`
-	WebhookSecret string `json:"-"`
-	WebhookEvents string `json:"webhook_events"`
-	RatePerMin    int    `json:"rate_per_min"`
-	AutoStart     bool   `json:"auto_start"`
-	CreatedAt     int64  `json:"created_at"`
-	UpdatedAt     int64  `json:"updated_at"`
+	ID            string           `json:"id"`
+	JID           string           `json:"jid,omitempty"`
+	Status        string           `json:"status"`
+	WebhookURL    string           `json:"webhook_url,omitempty"`
+	WebhookSecret string           `json:"-"`
+	WebhookEvents string           `json:"webhook_events"`
+	RatePerMin    int              `json:"rate_per_min"`
+	AutoStart     bool             `json:"auto_start"`
+	Settings      InstanceSettings `json:"settings"`
+	PairedAt      int64            `json:"paired_at,omitempty"`
+	CreatedAt     int64            `json:"created_at"`
+	UpdatedAt     int64            `json:"updated_at"`
 }
 
-// InstanceUpdate membawa perubahan parsial untuk operasi edit instance via CLI.
+// InstanceUpdate membawa perubahan parsial untuk operasi edit instance via CLI atau control API.
 type InstanceUpdate struct {
 	WebhookURL    *string
 	WebhookSecret *string
 	WebhookEvents *string
 	RatePerMin    *int
 	AutoStart     *bool
+	Settings      *InstanceSettings
 }
 
 // CreateInstance menyimpan instance baru ke app.db.
@@ -49,7 +57,7 @@ func (s *Store) CreateInstance(ctx context.Context, in Instance) error {
 		in.Status = StatusCreated
 	}
 	if in.WebhookEvents == "" {
-		in.WebhookEvents = "message,receipt,connection,pairing"
+		in.WebhookEvents = DefaultWebhookEvents
 	}
 	if in.RatePerMin <= 0 {
 		in.RatePerMin = 20
@@ -58,11 +66,31 @@ func (s *Store) CreateInstance(ctx context.Context, in Instance) error {
 	if !in.AutoStart {
 		auto = 0
 	}
+
+	settingsJSON := "{}"
+	if !reflect.ValueOf(in.Settings).IsZero() {
+		if err := in.Settings.Validate(); err != nil {
+			return fmt.Errorf("validasi settings instance %s: %w", in.ID, err)
+		}
+		raw, err := json.Marshal(in.Settings)
+		if err != nil {
+			return fmt.Errorf("marshal settings instance %s: %w", in.ID, err)
+		}
+		settingsJSON = string(raw)
+	}
+
+	var pairedAt int64
+	if in.PairedAt > 0 {
+		pairedAt = in.PairedAt
+	} else if in.JID != "" {
+		pairedAt = now
+	}
+
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO instances (id, jid, status, webhook_url, webhook_secret, webhook_events, rate_per_min, auto_start, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO instances (id, jid, status, webhook_url, webhook_secret, webhook_events, rate_per_min, auto_start, settings, paired_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		in.ID, nullString(in.JID), in.Status, nullString(in.WebhookURL), in.WebhookSecret,
-		in.WebhookEvents, in.RatePerMin, auto, now, now,
+		in.WebhookEvents, in.RatePerMin, auto, settingsJSON, nullInt64(pairedAt), now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("simpan instance %s: %w", in.ID, err)
@@ -73,7 +101,7 @@ func (s *Store) CreateInstance(ctx context.Context, in Instance) error {
 // GetInstance mengambil satu instance berdasarkan ID.
 func (s *Store) GetInstance(ctx context.Context, id string) (*Instance, error) {
 	row := s.DB.QueryRowContext(ctx, `
-		SELECT id, jid, status, webhook_url, webhook_secret, webhook_events, rate_per_min, auto_start, created_at, updated_at
+		SELECT id, jid, status, webhook_url, webhook_secret, webhook_events, rate_per_min, auto_start, settings, paired_at, created_at, updated_at
 		FROM instances WHERE id = ?`, id)
 	return scanInstance(row)
 }
@@ -81,7 +109,7 @@ func (s *Store) GetInstance(ctx context.Context, id string) (*Instance, error) {
 // ListInstances mengembalikan seluruh instance terurut berdasarkan waktu pembuatan.
 func (s *Store) ListInstances(ctx context.Context) ([]Instance, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, jid, status, webhook_url, webhook_secret, webhook_events, rate_per_min, auto_start, created_at, updated_at
+		SELECT id, jid, status, webhook_url, webhook_secret, webhook_events, rate_per_min, auto_start, settings, paired_at, created_at, updated_at
 		FROM instances ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("ambil daftar instance: %w", err)
@@ -99,7 +127,7 @@ func (s *Store) ListInstances(ctx context.Context) ([]Instance, error) {
 	return out, rows.Err()
 }
 
-// UpdateInstanceStatus memperbarui status dan opsional JID suatu instance.
+// UpdateInstanceStatus memperbarui status dan opsional JID suatu instance serta mereset paired_at bila JID berubah.
 func (s *Store) UpdateInstanceStatus(ctx context.Context, id, status, jid string) error {
 	now := time.Now().Unix()
 	var (
@@ -107,9 +135,14 @@ func (s *Store) UpdateInstanceStatus(ctx context.Context, id, status, jid string
 		err error
 	)
 	if jid != "" {
-		res, err = s.DB.ExecContext(ctx,
-			`UPDATE instances SET status = ?, jid = ?, updated_at = ? WHERE id = ?`,
-			status, jid, now, id)
+		res, err = s.DB.ExecContext(ctx, `
+			UPDATE instances
+			SET status = ?,
+			    paired_at = CASE WHEN jid IS NULL OR jid != ? OR paired_at IS NULL THEN ? ELSE paired_at END,
+			    jid = ?,
+			    updated_at = ?
+			WHERE id = ?`,
+			status, jid, now, jid, now, id)
 	} else {
 		res, err = s.DB.ExecContext(ctx,
 			`UPDATE instances SET status = ?, updated_at = ? WHERE id = ?`,
@@ -125,10 +158,10 @@ func (s *Store) UpdateInstanceStatus(ctx context.Context, id, status, jid string
 	return nil
 }
 
-// ClearInstanceJID mengosongkan JID saat perangkat logout dan menetapkan status baru.
+// ClearInstanceJID mengosongkan JID dan paired_at saat perangkat logout dan menetapkan status baru.
 func (s *Store) ClearInstanceJID(ctx context.Context, id, status string) error {
 	res, err := s.DB.ExecContext(ctx,
-		`UPDATE instances SET jid = NULL, status = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE instances SET jid = NULL, paired_at = NULL, status = ?, updated_at = ? WHERE id = ?`,
 		status, time.Now().Unix(), id)
 	if err != nil {
 		return fmt.Errorf("reset jid instance %s: %w", id, err)
@@ -169,6 +202,17 @@ func (s *Store) UpdateInstance(ctx context.Context, id string, up InstanceUpdate
 		sets = append(sets, "auto_start = ?")
 		args = append(args, auto)
 	}
+	if up.Settings != nil {
+		if err := up.Settings.Validate(); err != nil {
+			return nil, fmt.Errorf("validasi settings instance %s: %w", id, err)
+		}
+		raw, err := json.Marshal(*up.Settings)
+		if err != nil {
+			return nil, fmt.Errorf("marshal settings instance %s: %w", id, err)
+		}
+		sets = append(sets, "settings = ?")
+		args = append(args, string(raw))
+	}
 	if len(sets) == 0 {
 		return s.GetInstance(ctx, id)
 	}
@@ -204,13 +248,14 @@ type rowScanner interface {
 
 func scanInstance(r rowScanner) (*Instance, error) {
 	var (
-		inst       Instance
-		jid, whURL sql.NullString
-		auto       int
+		inst                 Instance
+		jid, whURL, settings sql.NullString
+		pairedAt             sql.NullInt64
+		auto                 int
 	)
 	err := r.Scan(
 		&inst.ID, &jid, &inst.Status, &whURL, &inst.WebhookSecret,
-		&inst.WebhookEvents, &inst.RatePerMin, &auto, &inst.CreatedAt, &inst.UpdatedAt,
+		&inst.WebhookEvents, &inst.RatePerMin, &auto, &settings, &pairedAt, &inst.CreatedAt, &inst.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -221,5 +266,14 @@ func scanInstance(r rowScanner) (*Instance, error) {
 	inst.JID = jid.String
 	inst.WebhookURL = whURL.String
 	inst.AutoStart = auto == 1
+	inst.PairedAt = pairedAt.Int64
+
+	inst.Settings = Defaults()
+	rawSettings := strings.TrimSpace(settings.String)
+	if rawSettings != "" && rawSettings != "{}" {
+		if err := json.Unmarshal([]byte(rawSettings), &inst.Settings); err != nil {
+			return nil, fmt.Errorf("parse settings instance %s: %w", inst.ID, err)
+		}
+	}
 	return &inst, nil
 }
