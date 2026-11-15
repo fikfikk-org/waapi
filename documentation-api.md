@@ -7,16 +7,20 @@
 
 | HTTP | code | Arti |
 |---|---|---|
-| 400 | invalid_request / invalid_number | Payload atau nomor tidak valid |
+| 400 | invalid_request / invalid_number / invalid_spec | Payload, nomor, atau spesifikasi pesan outbox tidak valid |
 | 401 | unauthorized | Key tidak ada, salah, atau dicabut |
 | 403 | forbidden_instance | Key tidak punya akses ke instance |
-| 404 | instance_not_found | Instance tidak ada |
+| 404 | instance_not_found / message_not_found | Instance atau pesan outbox tidak ditemukan |
+| 409 | instance_not_paired / message_not_cancellable | Instance belum di-pairing atau status pesan bukan `queued` saat pembatalan |
+| 410 | media_gone | Media referensi outbox sudah kedaluwarsa |
 | 413 | media_too_large | Media melebihi batas |
-| 429 | queue_full | Antrian kirim penuh (ada `retry_after`) |
+| 422 | idempotency_key_reused | Header `Idempotency-Key` dipakai ulang untuk tujuan atau isi pesan berbeda |
+| 429 | queue_full | Antrian kirim penuh (ada `retry_after` & header `Retry-After`) |
 | 429 | sse_limit | Batas koneksi SSE konkuren tercapai (disertai header `Retry-After: 10`) |
+| 502 | send_failed | Pengiriman gagal permanen (`failed`/`expired`/`cancelled`) saat `wait=sent` |
 | 503 | not_ready | Daemon tidak siap (DB gagal atau tekanan memori level `Red`) |
 | 503 | instance_not_connected | Instance belum/tidak tersambung |
-| 504 | send_timeout | WhatsApp tidak merespons |
+| 504 | send_timeout | WhatsApp tidak merespons dalam batas tunggu (v2 menyertakan `details: { id, status_url }`) |
 
 ## GET /healthz
 
@@ -132,11 +136,11 @@
 |---|---|
 | Method + Endpoint | POST /v1/instances/{id}/messages/text |
 | Auth Required | Yes (X-API-Key) |
-| Headers | X-API-Key, Content-Type: application/json |
+| Headers | X-API-Key, Content-Type: application/json, Idempotency-Key (opsional) |
 | Query Params | - |
 | Request Body | to (string, wajib, nomor E.164 tanpa + atau JID) · text (string, wajib) · typing (bool, opsional) · reply_to (string, opsional, message id) |
-| Response | 200 message_id, to, timestamp · 429 · 503 · 504 |
-| Notes | Body maks 64 KB; dikirim lewat antrian ber-rate-limit per instance |
+| Response | 200 message_id, to, timestamp (Unix detik) · 422 · 429 · 502 · 503 · 504 |
+| Notes | Body maks 64 KB; dikirim sinkron via Durable Outbox (menunggu status `sent` hingga 60 detik atau `504 send_timeout`) dan mendukung `Idempotency-Key` |
 
 ## POST /v1/instances/{id}/messages/media
 
@@ -210,6 +214,42 @@
 | Response | 200 `text/event-stream` (`id: <seq>`, `event: <type>`, `data: <envelope v2 JSON>`; heartbeat `: ping` tiap 25 detik) · 400 · 403 · 404 · 429 `sse_limit` · 503 |
 | Notes | Kuota koneksi SSE dibatasi `WAAPI_SSE_MAX` (header `Retry-After: 10` saat penuh); write deadline per frame 30 detik via `http.ResponseController` untuk memutus klien lambat tanpa mematikan stream idle |
 
+## POST /v2/instances/{id}/messages
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/messages |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key, Content-Type: application/json, Idempotency-Key (opsional) |
+| Query Params | - |
+| Request Body | to (string, wajib) · type (string, saat ini `text`) · text (string, wajib untuk `text`) · reply_to (`{ id, sender? }`, opsional) · mentions (`[]string`, opsional) · typing (bool, opsional) · send_at (RFC3339, opsional) · priority (`normal` \| `urgent`, default `normal`) · ttl (Go duration, opsional) · wait (`none` \| `sent`, default `none`) |
+| Response | `wait=none`: 202 (baru) / 200 (idempoten hit) `{ id, wa_message_id, status, to, not_before, status_url }` · `wait=sent`: 200 objek detail pesan · 400 · 409 · 422 · 429 · 502 · 504 |
+| Notes | Seluruh timestamp JSON berformat Unix detik. Saat `wait=sent` (batas 30 detik), gagal mengembalikan `502 send_failed` dan timeout mengembalikan `504 send_timeout` berisi `details: { id, status_url }` |
+
+## GET /v2/instances/{id}/messages/{msg_id}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/messages/{msg_id} |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{ id, wa_message_id, instance, to, type, status, origin, attempts, created_at, sent_at, delivered_at, read_at, receipts: { delivered, read }, error }` · 404 `message_not_found` · 503 |
+| Notes | Seluruh timestamp (`created_at`, `sent_at`, `delivered_at`, `read_at`) bernilai Unix detik (`null` bila belum terjadi) |
+
+## DELETE /v2/instances/{id}/messages/{msg_id}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | DELETE /v2/instances/{id}/messages/{msg_id} |
+| Auth Required | Yes (X-API-Key) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 detail pesan berstatus `cancelled` · 404 `message_not_found` · 409 `message_not_cancellable` · 503 |
+| Notes | Hanya dapat membatalkan pesan outbox yang masih berstatus `queued` |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -217,7 +257,7 @@
 | Method + Endpoint | POST ke `webhook_url` instance (`User-Agent: waapi-webhook/2.0`) |
 | Headers | Mode `waapi`: `X-WA-Event`, `X-WA-Instance`, `X-WA-Timestamp`, `X-WA-Event-Id`, `X-WA-Delivery-Attempt`, `X-WA-Signature` (`sha256=` HMAC `timestamp.body`). Mode `standard`: `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>` Standard Webhooks) |
 | Body | Envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) dibaca bertahap dari `journal.db` |
-| Event | message, receipt, undecryptable, connection, pairing (dan `test` untuk `waapi webhook test`) |
+| Event | message, receipt, undecryptable, connection, pairing, outbox (dan `test` untuk `waapi webhook test`). Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik) |
 | Notes | Pengiriman berurutan per `lane = part % webhook_lanes` (default 4 lane). Jadwal retry `0, 5s, 15s, 45s, 2m, 5m, 15m, 30m, 1h...` (±20% jitter) hingga `webhook_max_attempts` (default 12), menghormati `Retry-After` (maks 1h); `410 Gone` mem-pause target (`gone`); `4xx` lainnya maks 3 percobaan lalu dipindah ke `webhook_dead` (DLQ). Target dibaca dari `TargetCache` memori |
 
 ## Control Plane (CLI only, Unix socket)
@@ -226,6 +266,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`) serta `webhook_from` (`now` atau `retained`, diakses lewat `waapi webhook set <id> <url> [--from now|retained]`).
 - `POST /control/instances/{id}/webhook/resume` menghapus status `webhook_paused` dan menyalakan ulang deliverer dari cursor tersimpan (`waapi webhook resume <id>`).
 - `GET /control/instances/{id}/webhook/dlq` (`?limit=N`), `POST /control/instances/{id}/webhook/dlq/replay` (`{ all, seq, seqs }`), dan `DELETE /control/instances/{id}/webhook/dlq` mengelola dead-letter queue (`waapi webhook dlq <id> <ls|replay|purge>`).
+- `POST /control/instances/{id}/messages` mengantrekan pesan teks ke Durable Outbox dari kontrol lokal `{ to, text, reply_to?, typing?, wait?, idem_key? }` (`wait`: `none` atau `sent` maks 30 detik), diakses melalui CLI `waapi send <id> <to> <text> [--wait] [--idem KEY] [--typing] [--json]`.
 - `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB termasuk `journal.db`, ringkasan per-instance `webhook`: `head_seq`, `min_cursor`, `lag`, `oldest_undelivered_sec`, `dlq`, `paused`, `dropped_undelivered`, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
 - `GET /control/instances/{id}/events` mengambil atau long-poll (`?after=N&limit=N&types=csv&wait=N`), dan `GET /control/instances/{id}/events/stream` melakukan SSE stream event journal v2 per instance via `waapi events <id> [--after N] [--types csv] [--limit N] [--follow] [--json]`.
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
@@ -238,9 +279,11 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Tugas | Frekuensi | Tujuan | Efek samping |
 |---|---|---|---|
 | Migrasi `webhook_outbox` legacy | Sekali saat startup | Pindahkan backlog v1 ke `journal.db` | Kosongkan baris `webhook_outbox` (tabel tetap dipertahankan) |
+| Scheduler outbox per instance | Berbasis sinyal & timer `not_before` | Klaim dan kirim pesan teks dari tabel `outbox` sesuai token rate limit saat instance tersambung | Perbarui status `sending`/`sent`/`failed`/`expired`, `wa_message_id`, serta tulis event `outbox` ke `journal.db` |
+| Outbox lease recovery | Saat startup & tiap 60 detik | Kembalikan pekerjaan `sending` yang lease-nya kedaluwarsa (crash/kill) | Ubah status kembali ke `queued` dan bangunkan scheduler instance |
 | Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
-| Journal pruner | Tiap 5 menit | Pangkas baris `journal.db` sesuai replay window, retensi, dan batas baris | Hapus baris lama kecuali `webhook_dead` & inkremen `dropped_undelivered_total` bila kadaluwarsa |
+| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox` tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox` kadaluwarsa, & inkremen `dropped_undelivered_total` |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
 

@@ -22,6 +22,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/obs"
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/sdnotify"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
@@ -162,13 +163,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer func() { _ = j.Close() }()
 
-	go j.RunPruner(ctx, journal.PrunePolicy{
-		Retention:    cfg.JournalRetention,
-		ReplayWindow: cfg.JournalReplayWindow,
-		MaxRows:      cfg.JournalMaxRows,
-		Interval:     5 * time.Minute,
-	})
-
 	if migrated, mErr := webhook.MigrateLegacyOutbox(ctx, st, j); mErr != nil {
 		slog.Warn("migrasi webhook_outbox legacy tidak lengkap", "err", mErr)
 	} else if migrated > 0 {
@@ -201,13 +195,35 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("inisialisasi wa manager: %w", err)
 	}
 
+	outboxGov := outbox.NewTokenBucketGovernor(waMgr.RatePerMin)
+	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, outboxGov, nil, outbox.Options{
+		DefaultTTL: cfg.OutboxTTL,
+		MaxQueued:  cfg.OutboxMaxQueued,
+	})
+	waMgr.AttachOutbox(outboxSvc, outboxGov)
+	outboxSvc.StartLeaseRecovery(ctx)
+
+	go j.RunPruner(ctx, journal.PrunePolicy{
+		Retention:    cfg.JournalRetention,
+		ReplayWindow: cfg.JournalReplayWindow,
+		MaxRows:      cfg.JournalMaxRows,
+		Interval:     5 * time.Minute,
+		HourlyTask: func(pCtx context.Context) {
+			if _, pErr := outboxSvc.PruneOutbox(pCtx, time.Now(), 7*24*time.Hour, 1000); pErr != nil && ctx.Err() == nil {
+				slog.Warn("pruner outbox gagal", "err", pErr)
+			}
+		},
+	})
+
 	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh,
 		control.WithJournal(j),
 		control.WithWebhookService(whSvc, dead),
+		control.WithOutbox(outboxSvc),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
 	if err != nil {
+		outboxSvc.Stop()
 		_ = waMgr.Close()
 		whSvc.Stop()
 		return err
@@ -224,6 +240,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	rawPubLn, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
+		outboxSvc.Stop()
 		_ = waMgr.Close()
 		whSvc.Stop()
 		return fmt.Errorf("listen HTTP publik %s: %w", cfg.HTTPAddr, err)
@@ -232,7 +249,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -249,6 +266,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		metricsLn, err = net.Listen("tcp", addr)
 		if err != nil {
 			_ = pubLn.Close()
+			outboxSvc.Stop()
 			_ = waMgr.Close()
 			whSvc.Stop()
 			return fmt.Errorf("listen metrik %s: %w", addr, err)
@@ -322,6 +340,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	_ = pubHTTP.Shutdown(shutCtx)
 	_ = ctrlHTTP.Shutdown(shutCtx)
+	outboxSvc.Stop()
 	_ = waMgr.Close()
 	whSvc.Stop()
 	wh.Stop()

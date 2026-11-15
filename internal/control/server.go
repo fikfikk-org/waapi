@@ -17,6 +17,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
@@ -44,6 +45,15 @@ func WithWebhookService(ws *webhook.Service, dead *webhook.DeadStore) ServerOpti
 	}
 }
 
+// WithOutbox memasang service durable outbox untuk pengiriman pesan melalui CLI control plane.
+func WithOutbox(svc *outbox.Service) ServerOption {
+	return func(s *Server) {
+		if svc != nil {
+			s.outbox = svc
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -54,6 +64,7 @@ type Server struct {
 	webhookSvc *webhook.Service
 	dead       *webhook.DeadStore
 	journal    *journal.Journal
+	outbox     *outbox.Service
 	startedAt  time.Time
 	version    string
 }
@@ -130,6 +141,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /control/instances/{id}/webhook/dlq", s.handlePurgeWebhookDLQ)
 	mux.HandleFunc("GET /control/instances/{id}/events", s.handleGetEvents)
 	mux.HandleFunc("GET /control/instances/{id}/events/stream", s.handleStreamEvents)
+	mux.HandleFunc("POST /control/instances/{id}/messages", s.handleSendMessage)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
 	pprofMux := http.NewServeMux()

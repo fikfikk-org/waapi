@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"go.mau.fi/whatsmeow"
 	"rsc.io/qr"
@@ -518,7 +519,7 @@ func secondsUntil(now, t time.Time) int {
 
 // normalizePairPhone memvalidasi nomor untuk mode pairing code (8-15 digit, tanpa awalan 0).
 func normalizePairPhone(raw string) (string, error) {
-	p := digitsOnly(raw)
+	p := jid.DigitsOnly(raw)
 	if len(p) < 8 || len(p) > 15 || strings.HasPrefix(p, "0") {
 		return "", ErrInvalidPhone
 	}

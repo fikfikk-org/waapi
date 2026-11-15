@@ -14,6 +14,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
 
@@ -64,18 +65,37 @@ func WithSSEMax(n int) ServerOption {
 	}
 }
 
+// WithOutbox memasang Service durable outbox untuk endpoint pesan v2 serta kompatibilitas v1.
+func WithOutbox(svc *outbox.Service) ServerOption {
+	return func(s *Server) {
+		if svc != nil {
+			s.outbox = svc
+		}
+	}
+}
+
+func withV1WaitTimeout(d time.Duration) ServerOption {
+	return func(s *Server) {
+		if d > 0 {
+			s.v1WaitTimeout = d
+		}
+	}
+}
+
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
 type Server struct {
-	auth    *auth.Manager
-	wa      *wa.Manager
-	appDB   *sql.DB
-	journal *journal.Journal
-	gov     governor.Source
-	sseMax  int
-	sseSem  chan struct{}
-	mux     *http.ServeMux
-	handler http.Handler
-	routes  []RouteInfo
+	auth          *auth.Manager
+	wa            *wa.Manager
+	appDB         *sql.DB
+	journal       *journal.Journal
+	outbox        *outbox.Service
+	gov           governor.Source
+	sseMax        int
+	sseSem        chan struct{}
+	v1WaitTimeout time.Duration
+	mux           *http.ServeMux
+	handler       http.Handler
+	routes        []RouteInfo
 }
 
 // NewServer membangun Server HTTP publik dengan pencatatan scope per route.
@@ -126,6 +146,9 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("POST /v1/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleDownloadMedia))
 	s.handle("GET /v2/instances/{id}/events", auth.ScopeEventsRead, s.withInstanceAuth(s.handleGetEvents))
 	s.handle("GET /v2/instances/{id}/events/stream", auth.ScopeEventsRead, s.withInstanceAuth(s.handleEventsStream))
+	s.handle("POST /v2/instances/{id}/messages", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2SendMessage))
+	s.handle("GET /v2/instances/{id}/messages/{msg_id}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetMessage))
+	s.handle("DELETE /v2/instances/{id}/messages/{msg_id}", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2CancelMessage))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

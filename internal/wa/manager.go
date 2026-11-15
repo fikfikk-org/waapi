@@ -16,6 +16,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/webhook"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -52,6 +53,14 @@ func WithWebhookService(ws *webhook.Service) ManagerOption {
 	}
 }
 
+// WithOutbox memasang Service durable outbox beserta observer receipt ke Manager.
+func WithOutbox(svc *outbox.Service, gov *outbox.TokenBucketGovernor) ManagerOption {
+	return func(m *Manager) {
+		m.outbox = svc
+		m.outboxGov = gov
+	}
+}
+
 // Manager mengelola siklus hidup seluruh instance WhatsApp di dalam satu proses daemon.
 type Manager struct {
 	cfg         *config.Config
@@ -62,6 +71,8 @@ type Manager struct {
 	webhookSvc  *webhook.Service
 	journal     *journal.Journal
 	targetCache *webhook.TargetCache
+	outbox      *outbox.Service
+	outboxGov   *outbox.TokenBucketGovernor
 	waLog       waLog.Logger
 	pairingSem  *semaphore.Weighted
 	mediaSem    *semaphore.Weighted
@@ -110,6 +121,9 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 			opt(m)
 		}
 	}
+	if m.outbox != nil {
+		m.AddInboundObserver(NewReceiptObserver(m.outbox))
+	}
 
 	rows, err := st.ListInstances(ctx)
 	if err != nil {
@@ -140,8 +154,48 @@ func (m *Manager) AddInboundObserver(fn InboundObserver) {
 	m.obsMu.Unlock()
 }
 
+// AttachOutbox menghubungkan service outbox setelah konstruksi Manager, mendaftarkan observer receipt, dan menyalakan scheduler instance aktif.
+func (m *Manager) AttachOutbox(svc *outbox.Service, gov *outbox.TokenBucketGovernor) {
+	if m == nil {
+		return
+	}
+	m.outbox = svc
+	m.outboxGov = gov
+	if svc != nil {
+		m.AddInboundObserver(NewReceiptObserver(svc))
+		m.mu.RLock()
+		for _, inst := range m.instances {
+			if inst.getSupervisor() != nil || inst.IsConnected() {
+				inst.startOutboxScheduler()
+				if inst.IsConnected() {
+					svc.NotifyReady(inst.id)
+				}
+			}
+		}
+		m.mu.RUnlock()
+	}
+}
+
+// RatePerMin mengembalikan batas kirim per menit untuk instance tertentu (default 20).
+func (m *Manager) RatePerMin(instanceID string) int {
+	if m == nil {
+		return 20
+	}
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return 20
+	}
+	inst.mu.RLock()
+	rpm := inst.ratePerMin
+	inst.mu.RUnlock()
+	if rpm <= 0 {
+		return 20
+	}
+	return rpm
+}
+
 func (m *Manager) collectHooks(ctx context.Context, ev *journal.Event, raw any) []journal.TxHook {
-	if m == nil || ev == nil {
+	if m == nil {
 		return nil
 	}
 	m.obsMu.RLock()
@@ -337,6 +391,9 @@ func (m *Manager) Update(ctx context.Context, id string, up store.InstanceUpdate
 	if inst, ok := m.Get(id); ok {
 		if up.RatePerMin != nil {
 			inst.SetRatePerMin(*up.RatePerMin)
+			if m.outboxGov != nil {
+				m.outboxGov.SetRate(id, *up.RatePerMin)
+			}
 		}
 		inst.SetSettings(meta.Settings)
 	}
@@ -398,6 +455,7 @@ func (m *Manager) Stop(ctx context.Context, id string) (*InstanceStatus, error) 
 		return nil, store.ErrNotFound
 	}
 	inst.Disconnect()
+	inst.stopOutboxScheduler()
 	inst.setStatus(store.StatusDisabled, "")
 	auto := false
 	if _, err := m.store.UpdateInstance(ctx, id, store.InstanceUpdate{AutoStart: &auto}); err != nil {
@@ -428,6 +486,9 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 		_, _ = inst.CancelPairing()
 		_ = inst.Logout(ctx)
 		inst.Close()
+	}
+	if m.outbox != nil {
+		m.outbox.StopScheduler(id)
 	}
 	m.mu.Lock()
 	delete(m.instances, id)

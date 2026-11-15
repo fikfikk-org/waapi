@@ -79,6 +79,8 @@ func Execute(args []string) error {
 		return runWebhookSubcommand(ctx, ctrl, rest)
 	case "events":
 		return runEvents(ctx, ctrl, rest)
+	case "send":
+		return runSend(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
 	case "update", "self-update":
@@ -176,6 +178,7 @@ MANAJEMEN WEBHOOK:
   waapi webhook dlq <id> ls|replay|purge       Kelola antrean dead-letter webhook
   waapi webhook test <id>                      Kirim event uji coba ke webhook
   waapi events <id> [--after N] [--follow]     Baca/pantau stream event journal (SSE --follow)
+  waapi send <id> <to> <text> [--wait] [--idem KEY]  Kirim pesan teks lewat durable outbox
 
 DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon

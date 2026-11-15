@@ -186,22 +186,8 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 	if j == nil || j.db == nil {
 		return AppendResult{}, errors.New("journal belum diinisialisasi")
 	}
-	if ev == nil || ev.InstanceID == "" || ev.Type == "" {
-		return AppendResult{}, errors.New("event journal tidak valid: instance_id dan type wajib diisi")
-	}
-
-	if ev.ReceivedAt == 0 {
-		ev.ReceivedAt = time.Now().UnixMilli()
-	}
-	if ev.TS == 0 {
-		ev.TS = ev.ReceivedAt / 1000
-	}
-	if ev.Part == 0 && ev.Chat != "" {
-		ev.Part = PartForChat(ev.Chat)
-	}
-	payload := ev.Payload
-	if len(payload) == 0 {
-		payload = []byte("{}")
+	if err := prepareEventForInsert(ev); err != nil {
+		return AppendResult{}, err
 	}
 
 	tx, err := j.db.BeginTx(ctx, nil)
@@ -215,9 +201,72 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 		}
 	}()
 
-	var seq int64
 	stmt := tx.StmtContext(ctx, j.insertStmt)
-	err = stmt.QueryRowContext(
+	res, err := insertEventInTx(ctx, tx, ev, stmt.QueryRowContext)
+	if err != nil {
+		return AppendResult{}, err
+	}
+	if res.Duplicate {
+		if err := tx.Commit(); err != nil {
+			return AppendResult{}, fmt.Errorf("commit transaksi duplikat journal: %w", err)
+		}
+		committed = true
+		return res, nil
+	}
+
+	for _, hook := range hooks {
+		if hook == nil {
+			continue
+		}
+		if err := hook(ctx, tx, res.Seq); err != nil {
+			return AppendResult{}, fmt.Errorf("jalankan hook journal: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return AppendResult{}, fmt.Errorf("commit transaksi append journal: %w", err)
+	}
+	committed = true
+
+	j.notify(ev.InstanceID)
+	return res, nil
+}
+
+// InsertTx menyisipkan event ke tabel events di dalam transaksi SQLite aktif tanpa memanggil commit atau notify.
+func InsertTx(ctx context.Context, tx *sql.Tx, ev *Event) (AppendResult, error) {
+	if tx == nil {
+		return AppendResult{}, errors.New("transaksi journal tidak boleh nil")
+	}
+	if err := prepareEventForInsert(ev); err != nil {
+		return AppendResult{}, err
+	}
+	return insertEventInTx(ctx, tx, ev, func(c context.Context, args ...any) *sql.Row {
+		return tx.QueryRowContext(c, insertEventSQL, args...)
+	})
+}
+
+func prepareEventForInsert(ev *Event) error {
+	if ev == nil || ev.InstanceID == "" || ev.Type == "" {
+		return errors.New("event journal tidak valid: instance_id dan type wajib diisi")
+	}
+	if ev.ReceivedAt == 0 {
+		ev.ReceivedAt = time.Now().UnixMilli()
+	}
+	if ev.TS == 0 {
+		ev.TS = ev.ReceivedAt / 1000
+	}
+	if ev.Part == 0 && ev.Chat != "" {
+		ev.Part = PartForChat(ev.Chat)
+	}
+	if len(ev.Payload) == 0 {
+		ev.Payload = []byte("{}")
+	}
+	return nil
+}
+
+func insertEventInTx(ctx context.Context, tx *sql.Tx, ev *Event, queryRow func(context.Context, ...any) *sql.Row) (AppendResult, error) {
+	var seq int64
+	err := queryRow(
 		ctx,
 		ev.InstanceID,
 		ev.Type,
@@ -229,11 +278,11 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 		ev.ReceivedAt,
 		ev.Part,
 		ev.Flags,
-		payload,
+		ev.Payload,
 	).Scan(&seq)
 
 	if errors.Is(err, sql.ErrNoRows) {
-		// Bentrok natural key -> ambil seq lama dalam transaksi ini tanpa mengeksekusi TxHook
+		// Bentrok natural key -> ambil seq lama dalam transaksi ini tanpa mengeksekusi hook.
 		if selErr := tx.QueryRowContext(
 			ctx,
 			`SELECT seq FROM events WHERE instance_id = ? AND dedupe_key = ?`,
@@ -241,33 +290,13 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 		).Scan(&seq); selErr != nil {
 			return AppendResult{}, fmt.Errorf("ambil seq duplikat journal: %w", selErr)
 		}
-		if err := tx.Commit(); err != nil {
-			return AppendResult{}, fmt.Errorf("commit transaksi duplikat journal: %w", err)
-		}
-		committed = true
 		ev.Seq = seq
 		return AppendResult{Seq: seq, Duplicate: true}, nil
 	}
 	if err != nil {
 		return AppendResult{}, fmt.Errorf("insert event journal: %w", err)
 	}
-
-	for _, hook := range hooks {
-		if hook == nil {
-			continue
-		}
-		if err := hook(ctx, tx, seq); err != nil {
-			return AppendResult{}, fmt.Errorf("jalankan hook journal: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return AppendResult{}, fmt.Errorf("commit transaksi append journal: %w", err)
-	}
-	committed = true
 	ev.Seq = seq
-
-	j.notify(ev.InstanceID)
 	return AppendResult{Seq: seq, Duplicate: false}, nil
 }
 
@@ -515,6 +544,14 @@ func (j *Journal) Subscribe(instanceID string) (<-chan struct{}, func()) {
 			j.subMu.Unlock()
 		})
 	}
+}
+
+// Notify membangunkan seluruh subscriber SSE atau webhook untuk instance tertentu.
+func (j *Journal) Notify(instanceID string) {
+	if j == nil || instanceID == "" {
+		return
+	}
+	j.notify(instanceID)
 }
 
 func (j *Journal) notify(instanceID string) {

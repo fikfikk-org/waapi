@@ -1,11 +1,13 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
 
@@ -34,6 +36,53 @@ func (s *Server) handleSendText(w http.ResponseWriter, r *http.Request, inst *wa
 	}
 	if strings.TrimSpace(req.To) == "" || strings.TrimSpace(req.Text) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "field to dan text wajib diisi", 0)
+		return
+	}
+
+	if s.outbox != nil {
+		instID := r.PathValue("id")
+		if !s.outbox.Ready(instID) {
+			writeError(w, http.StatusServiceUnavailable, "instance_not_connected", "instance sedang tidak tersambung", 0)
+			return
+		}
+		var reply *outbox.ReplyRef
+		if strings.TrimSpace(req.ReplyTo) != "" {
+			reply = &outbox.ReplyRef{ID: strings.TrimSpace(req.ReplyTo)}
+		}
+
+		job, _, err := s.outbox.Enqueue(r.Context(), outbox.EnqueueRequest{
+			InstanceID: instID,
+			IdemKey:    strings.TrimSpace(r.Header.Get("Idempotency-Key")),
+			Spec: outbox.Spec{
+				Type:    "text",
+				To:      req.To,
+				Text:    req.Text,
+				ReplyTo: reply,
+				Typing:  req.Typing,
+			},
+			Origin: outboxOriginFromContext(r.Context(), "v1"),
+		})
+		if err != nil {
+			writeMappedError(w, err)
+			return
+		}
+
+		waitDur := s.v1WaitTimeout
+		if waitDur <= 0 {
+			waitDur = defaultV1WaitTimeout
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), waitDur)
+		defer cancel()
+		doneJob, waitErr := s.outbox.Wait(waitCtx, instID, job.ID, outbox.StatusSent)
+		if waitErr != nil {
+			writeOutboxWaitError(w, r.Context(), instID, job, doneJob, waitErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, wa.SendResult{
+			MessageID: doneJob.WAID,
+			To:        doneJob.ToJID,
+			Timestamp: doneJob.SentAt / 1000,
+		})
 		return
 	}
 

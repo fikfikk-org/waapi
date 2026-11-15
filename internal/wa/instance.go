@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
+	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/store"
@@ -23,7 +23,7 @@ import (
 )
 
 // ErrInvalidRecipient dikembalikan jika format nomor atau JID tujuan tidak valid.
-var ErrInvalidRecipient = errors.New("nomor telepon atau JID tidak valid")
+var ErrInvalidRecipient = jid.ErrInvalidRecipient
 
 // InstanceStatus adalah representasi status runtime + database sebuah instance.
 type InstanceStatus struct {
@@ -59,11 +59,11 @@ type cachedCheck struct {
 	expiresAt time.Time
 }
 
-// Instance membungkus satu whatsmeow.Client beserta antrian kirim, supervisor koneksi, dan rate limiter-nya.
+// Instance membungkus satu whatsmeow.Client beserta supervisor koneksi dan rate limiter-nya.
 type Instance struct {
-	id     string
-	mgr    *Manager
-	sendCh chan sendRequest
+	id      string
+	mgr     *Manager
+	baseCtx context.Context
 
 	mu             sync.RWMutex
 	client         *whatsmeow.Client
@@ -96,7 +96,7 @@ func newInstance(m *Manager, meta store.Instance) *Instance {
 	inst := &Instance{
 		id:         meta.ID,
 		mgr:        m,
-		sendCh:     make(chan sendRequest, 256),
+		baseCtx:    ctx,
 		limiter:    newLimiter(meta.RatePerMin),
 		ratePerMin: meta.RatePerMin,
 		status:     meta.Status,
@@ -105,7 +105,6 @@ func newInstance(m *Manager, meta store.Instance) *Instance {
 		cancel:     cancel,
 		checkCache: make(map[string]cachedCheck),
 	}
-	go inst.senderLoop(ctx)
 	return inst
 }
 
@@ -224,13 +223,22 @@ func (i *Instance) Snapshot(meta store.Instance) InstanceStatus {
 		}
 	}
 
+	queueDepth := 0
+	if i.mgr != nil && i.mgr.outbox != nil {
+		qCtx, qCancel := context.WithTimeout(context.Background(), time.Second)
+		if n, err := i.mgr.outbox.CountQueued(qCtx, i.id); err == nil {
+			queueDepth = n
+		}
+		qCancel()
+	}
+
 	out := InstanceStatus{
 		ID:             i.id,
 		Status:         status,
 		State:          string(defaultConnStateForStatus(status)),
 		JID:            jid,
 		PushName:       pushName,
-		QueueDepth:     len(i.sendCh),
+		QueueDepth:     queueDepth,
 		RatePerMin:     rpm,
 		WebhookURL:     meta.WebhookURL,
 		WebhookEvents:  meta.WebhookEvents,
@@ -397,6 +405,21 @@ func (i *Instance) startSupervisor() {
 	if sup != nil {
 		sup.Start(supCtx)
 	}
+	i.startOutboxScheduler()
+}
+
+func (i *Instance) startOutboxScheduler() {
+	if i == nil || i.mgr == nil || i.mgr.outbox == nil || i.baseCtx == nil {
+		return
+	}
+	i.mgr.outbox.StartScheduler(i.baseCtx, i.id)
+}
+
+func (i *Instance) stopOutboxScheduler() {
+	if i == nil || i.mgr == nil || i.mgr.outbox == nil {
+		return
+	}
+	i.mgr.outbox.StopScheduler(i.id)
 }
 
 func (i *Instance) stopSupervisor() {
@@ -424,6 +447,10 @@ func (i *Instance) adoptAfterPairing() {
 			sup.setJID(jid)
 		}
 		sup.Adopt()
+	}
+	i.startOutboxScheduler()
+	if i.mgr != nil && i.mgr.outbox != nil {
+		i.mgr.outbox.NotifyReady(i.id)
 	}
 }
 
@@ -592,7 +619,7 @@ func (i *Instance) Disconnect() {
 	}
 }
 
-// Close menghentikan sesi pairing, supervisor, goroutine pengirim, dan koneksi WhatsApp.
+// Close menghentikan sesi pairing, supervisor, scheduler outbox, dan koneksi WhatsApp.
 func (i *Instance) Close() {
 	i.pairMu.Lock()
 	sess := i.pairing
@@ -605,6 +632,7 @@ func (i *Instance) Close() {
 	if i.cancel != nil {
 		i.cancel()
 	}
+	i.stopOutboxScheduler()
 	i.mu.Lock()
 	cli := i.client
 	i.connectedSince = 0
@@ -618,6 +646,7 @@ func (i *Instance) Close() {
 func (i *Instance) Logout(ctx context.Context) error {
 	_, _ = i.CancelPairing()
 	i.stopSupervisor()
+	i.stopOutboxScheduler()
 	cli := i.getClient()
 	if cli != nil {
 		if err := cli.Logout(ctx); err != nil {
@@ -651,7 +680,7 @@ func (i *Instance) CheckNumbers(ctx context.Context, numbers []string) ([]Number
 
 	i.checkMu.Lock()
 	for idx, raw := range numbers {
-		clean := digitsOnly(raw)
+		clean := jid.DigitsOnly(raw)
 		if len(clean) < 7 || len(clean) > 16 {
 			i.checkMu.Unlock()
 			return nil, fmt.Errorf("nomor tidak valid: %s", raw)
@@ -674,7 +703,7 @@ func (i *Instance) CheckNumbers(ctx context.Context, numbers []string) ([]Number
 		}
 		byPhone := make(map[string]types.IsOnWhatsAppResponse, len(resp))
 		for _, item := range resp {
-			byPhone[digitsOnly(item.Query)] = item
+			byPhone[jid.DigitsOnly(item.Query)] = item
 		}
 
 		i.checkMu.Lock()
@@ -781,8 +810,19 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 		Receipts: i.cachedSettings().JournalReceipts,
 		LID:      i.lidResolver(),
 	}
+	obsCtx := withObserverInstanceID(ctx, i.id)
 	ev, ok := NormalizeEvent(ctx, i.id, rawEvt, nc)
 	if !ok {
+		// Tetap jalankan InboundObserver pada event non-journal seperti receipt grup sebelum ack ke WhatsApp.
+		if i.mgr != nil && j != nil {
+			if hooks := i.mgr.collectHooks(obsCtx, nil, rawEvt); len(hooks) > 0 {
+				if err := j.RunTx(ctx, hooks...); err != nil {
+					slog.Warn("gagal menjalankan hook non-journal", "instance", i.id, "err", err)
+					return false
+				}
+				j.Notify(i.id)
+			}
+		}
 		return true
 	}
 	if j == nil {
@@ -791,7 +831,7 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 
 	var hooks []journal.TxHook
 	if i.mgr != nil {
-		hooks = i.mgr.collectHooks(ctx, ev, rawEvt)
+		hooks = i.mgr.collectHooks(obsCtx, ev, rawEvt)
 	}
 	res, err := j.Append(ctx, ev, hooks...)
 	if err != nil {
@@ -852,15 +892,18 @@ func (i *Instance) syncSupervisorState(snap StateSnapshot) {
 	}
 	i.mu.Unlock()
 
-	if !changed || i.mgr == nil || i.mgr.store == nil {
-		return
+	if changed && i.mgr != nil && i.mgr.store != nil {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if clearJID {
+			_ = i.mgr.store.ClearInstanceJID(dbCtx, i.id, store.StatusLoggedOut)
+		} else {
+			_ = i.mgr.store.UpdateInstanceStatus(dbCtx, i.id, nextV1, jid)
+		}
+		cancel()
 	}
-	dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if clearJID {
-		_ = i.mgr.store.ClearInstanceJID(dbCtx, i.id, store.StatusLoggedOut)
-	} else {
-		_ = i.mgr.store.UpdateInstanceStatus(dbCtx, i.id, nextV1, jid)
+
+	if snap.State == StateOnline && i.mgr != nil && i.mgr.outbox != nil {
+		i.mgr.outbox.NotifyReady(i.id)
 	}
 }
 
@@ -888,31 +931,5 @@ func (i *Instance) setStatus(status, jid string) {
 
 // ParseRecipient mengubah string nomor telepon atau JID menjadi types.JID WhatsApp.
 func ParseRecipient(raw string) (types.JID, error) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return types.JID{}, ErrInvalidRecipient
-	}
-	if strings.Contains(s, "@") {
-		jid, err := types.ParseJID(s)
-		if err != nil || jid.User == "" {
-			return types.JID{}, ErrInvalidRecipient
-		}
-		return jid, nil
-	}
-	digits := digitsOnly(s)
-	if len(digits) < 7 || len(digits) > 16 {
-		return types.JID{}, ErrInvalidRecipient
-	}
-	return types.NewJID(digits, types.DefaultUserServer), nil
-}
-
-func digitsOnly(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		if unicode.IsDigit(r) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
+	return jid.ParseRecipient(raw)
 }

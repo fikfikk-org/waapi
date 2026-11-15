@@ -6,64 +6,78 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
-	"google.golang.org/protobuf/proto"
 )
 
-// ErrQueueFull dikembalikan jika antrian kirim (256 pesan) pada sebuah instance sedang penuh.
+// ErrQueueFull dikembalikan jika antrian kirim pada sebuah instance sedang penuh.
 var ErrQueueFull = errors.New("antrian kirim instance penuh")
 
 // ErrNotConnected dikembalikan saat instance belum tersambung ke WhatsApp.
 var ErrNotConnected = errors.New("instance sedang tidak tersambung")
 
-// SendResult berisi ID pesan dan timestamp dari server WhatsApp.
+// SendResult berisi ID pesan dan timestamp dari server WhatsApp untuk respons kompatibilitas v1.
 type SendResult struct {
 	MessageID string `json:"message_id"`
 	To        string `json:"to"`
 	Timestamp int64  `json:"timestamp"`
 }
 
-type sendRequest struct {
-	ctx    context.Context
-	to     types.JID
-	msg    *waE2E.Message
-	typing bool
-	textLen int
-	reply  chan sendOutcome
-}
-
-type sendOutcome struct {
-	res SendResult
-	err error
-}
-
-// EnqueueText memasukkan pesan teks ke dalam antrian ber-rate-limit milik instance.
+// EnqueueText mengirim pesan teks secara langsung atau lewat durable outbox bila tersedia.
 func (i *Instance) EnqueueText(ctx context.Context, toRaw, text, replyTo string, typing bool) (SendResult, error) {
+	if i.mgr != nil && i.mgr.outbox != nil {
+		if !i.IsConnected() {
+			return SendResult{}, ErrNotConnected
+		}
+		var reply *outbox.ReplyRef
+		if replyTo != "" {
+			reply = &outbox.ReplyRef{ID: replyTo}
+		}
+		job, _, err := i.mgr.outbox.Enqueue(ctx, outbox.EnqueueRequest{
+			InstanceID: i.id,
+			Spec: outbox.Spec{
+				Type:    "text",
+				To:      toRaw,
+				Text:    text,
+				ReplyTo: reply,
+				Typing:  typing,
+			},
+			Origin: outbox.Origin{Kind: "v1"},
+		})
+		if err != nil {
+			return SendResult{}, err
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		sent, err := i.mgr.outbox.Wait(waitCtx, i.id, job.ID, outbox.StatusSent)
+		if err != nil {
+			return SendResult{}, err
+		}
+		return SendResult{
+			MessageID: sent.WAID,
+			To:        sent.ToJID,
+			Timestamp: sent.SentAt / 1000,
+		}, nil
+	}
+
 	toJID, err := ParseRecipient(toRaw)
 	if err != nil {
 		return SendResult{}, err
 	}
-	var msg *waE2E.Message
+	var reply *outbox.ReplyRef
 	if replyTo != "" {
-		msg = &waE2E.Message{
-			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-				Text: proto.String(text),
-				ContextInfo: &waE2E.ContextInfo{
-					StanzaID: proto.String(replyTo),
-				},
-			},
-		}
-	} else {
-		msg = &waE2E.Message{
-			Conversation: proto.String(text),
-		}
+		reply = &outbox.ReplyRef{ID: replyTo}
 	}
-	return i.enqueueMessage(ctx, toJID, msg, typing, len(text))
+	msg := composeTextMessage(outbox.Spec{Text: text, ReplyTo: reply})
+	return i.sendDirect(ctx, toJID, msg, typing, len(text))
 }
 
-// EnqueueMedia mengunggah stream media ke CDN WhatsApp lalu menjadwalkan pengiriman pesannya.
+// EnqueueMedia mengunggah stream media ke CDN WhatsApp lalu mengirimkannya langsung dengan rate limit dan jitter v1 (dipindah ke outbox di Batch 6).
 func (i *Instance) EnqueueMedia(ctx context.Context, in MediaInput) (SendResult, error) {
+	if !i.IsConnected() {
+		return SendResult{}, ErrNotConnected
+	}
 	toJID, err := ParseRecipient(in.To)
 	if err != nil {
 		return SendResult{}, err
@@ -77,68 +91,25 @@ func (i *Instance) EnqueueMedia(ctx context.Context, in MediaInput) (SendResult,
 		mime = detectedMime
 	}
 	msg := buildMediaE2EMessage(in.MediaType, mime, in.Caption, in.Filename, up)
-	return i.enqueueMessage(ctx, toJID, msg, false, len(in.Caption))
+	return i.sendDirect(ctx, toJID, msg, false, len(in.Caption))
 }
 
-func (i *Instance) enqueueMessage(ctx context.Context, to types.JID, msg *waE2E.Message, typing bool, textLen int) (SendResult, error) {
+func (i *Instance) sendDirect(ctx context.Context, to types.JID, msg *waE2E.Message, typing bool, textLen int) (SendResult, error) {
 	if !i.IsConnected() {
 		return SendResult{}, ErrNotConnected
 	}
-	req := sendRequest{
-		ctx:     ctx,
-		to:      to,
-		msg:     msg,
-		typing:  typing,
-		textLen: textLen,
-		reply:   make(chan sendOutcome, 1),
-	}
-	select {
-	case i.sendCh <- req:
-	default:
-		return SendResult{}, ErrQueueFull
+	if err := i.getLimiter().Wait(ctx); err != nil {
+		return SendResult{}, err
 	}
 
+	// Jitter acak 300-1500 ms (paritas v1) sebelum menghubungi server WhatsApp.
+	jitter := time.Duration(300+rand.IntN(1201)) * time.Millisecond
+	timer := time.NewTimer(jitter)
 	select {
 	case <-ctx.Done():
+		timer.Stop()
 		return SendResult{}, ctx.Err()
-	case out := <-req.reply:
-		return out.res, out.err
-	}
-}
-
-// senderLoop memproses antrian pesan secara serial (1 goroutine per instance) dengan rate limit + jitter.
-func (i *Instance) senderLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-i.sendCh:
-			if !ok {
-				return
-			}
-			res, err := i.processSend(ctx, req)
-			req.reply <- sendOutcome{res: res, err: err}
-		}
-	}
-}
-
-func (i *Instance) processSend(loopCtx context.Context, req sendRequest) (SendResult, error) {
-	if err := req.ctx.Err(); err != nil {
-		return SendResult{}, err
-	}
-	// Tunggu token dari rate limiter instance
-	if err := i.getLimiter().Wait(req.ctx); err != nil {
-		return SendResult{}, err
-	}
-
-	// Jitter acak 300-1500 ms agar pola pengiriman tidak periodik
-	jitter := time.Duration(300+rand.IntN(1200)) * time.Millisecond
-	select {
-	case <-req.ctx.Done():
-		return SendResult{}, req.ctx.Err()
-	case <-loopCtx.Done():
-		return SendResult{}, loopCtx.Err()
-	case <-time.After(jitter):
+	case <-timer.C:
 	}
 
 	cli := i.getClient()
@@ -146,27 +117,21 @@ func (i *Instance) processSend(loopCtx context.Context, req sendRequest) (SendRe
 		return SendResult{}, ErrNotConnected
 	}
 
-	if req.typing {
-		_ = cli.SendChatPresence(req.ctx, req.to, types.ChatPresenceComposing, types.ChatPresenceMediaText)
-		typingWait := time.Duration(min(max(req.textLen*25, 400), 2500)) * time.Millisecond
-		select {
-		case <-req.ctx.Done():
-			return SendResult{}, req.ctx.Err()
-		case <-time.After(typingWait):
+	if typing {
+		if err := sendTypingCadence(ctx, cli, to, textLen); err != nil {
+			return SendResult{}, err
 		}
-		_ = cli.SendChatPresence(req.ctx, req.to, types.ChatPresencePaused, types.ChatPresenceMediaText)
 	}
 
-	sendCtx, cancel := context.WithTimeout(req.ctx, 30*time.Second)
+	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	resp, err := cli.SendMessage(sendCtx, req.to, req.msg)
+	resp, err := cli.SendMessage(sendCtx, to, msg)
 	if err != nil {
 		return SendResult{}, err
 	}
 	return SendResult{
 		MessageID: string(resp.ID),
-		To:        req.to.ToNonAD().String(),
+		To:        to.ToNonAD().String(),
 		Timestamp: resp.Timestamp.Unix(),
 	}, nil
 }
-

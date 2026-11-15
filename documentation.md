@@ -50,6 +50,17 @@ flowchart TD
         E1 -->|"410 Gone"| E6["paused (gone)"]
         E6 -->|"webhook resume"| E1
     end
+    subgraph Outbox
+        O1["queued (outbox)"] -->|"klaim scheduler (ready & token tersedia)"| O2["sending (lease)"]
+        O2 -->|"kirim sukses"| O3["sent"]
+        O2 -->|"gagal transien & belum expired"| O1
+        O2 -->|"gagal permanen / policy ditolak"| O4["failed"]
+        O1 -->|"melewati expire_at"| O5["expired"]
+        O2 -->|"melewati expire_at"| O5
+        O1 -->|"dibatalkan klien"| O6["cancelled"]
+        O3 -->|"receipt delivery (DM)"| O7["delivered"]
+        O7 -->|"receipt read/played (DM)"| O8["read"]
+    end
 ```
 
 ## Aturan per Entitas
@@ -104,6 +115,30 @@ flowchart TD
 | flags | Bitmask `1` (`offline`), `2` (`truncated`) | Menandai pesan offline sync dan pemotongan konten |
 | cursors | Menyimpan posisi `seq` terakhir konsumen per `(consumer, instance_id, lane)` | Menjadi batas aman penghapusan event pada pruner (bersama pengecualian `webhook_dead`) |
 
+### Durable Outbox
+
+| Field | Rule | Catatan |
+|---|---|---|
+| id | ID unik ULID 26 karakter yang monotonik secara waktu | Identitas pesan keluar internal untuk pelacakan & pembatalan |
+| instance_id | Pemilik instance WhatsApp | Antrean, laju kirim, dan kunci idempotensi terisolasi per instance |
+| recipient | Nomor E.164 atau JID kanonik (`@s.whatsapp.net` / `@g.us`) | Awalan `0` otomatis dinormalisasi ke kode negara `62` |
+| type | Jenis pesan keluar (saat ini aktif untuk `text`) | Media masih memakai jalur langsung sebelum integrasi penuh |
+| status | `queued`, `sending`, `sent`, `delivered`, `read`, `failed`, `expired`, `cancelled` | Menggambarkan siklus penuh pesan keluar sampai receipt |
+| priority | Hanya menerima `normal` (`0`) atau `urgent` (`10`) | Pesan `urgent` didahulukan saat scheduler mengklaim antrean |
+| not_before | Batas paling awal pesan boleh diklaim scheduler | Dipakai untuk penjadwalan tunda atau backoff retry |
+| expire_at | Batas waktu hidup pesan (TTL bawaan 24 jam) | Lewat batas ini pesan otomatis berstatus `expired` |
+| idempotency_key | Unik opsional per `(instance_id, idempotency_key)` | Request identik mengembalikan pesan lama; spesifikasi beda ditolak |
+| wa_message_id | ID pesan WhatsApp yang disiapkan sebelum pengiriman pertama | Menjamin tidak ada kirim ganda setelah crash dan memudahkan korelasi receipt |
+| attempts | Penghitung percobaan pengiriman | Gagal sementara memakai backoff bertahap; gagal permanen langsung menutup pesan |
+| delivered_count / read_count | Penghitung receipt pesan grup | Pada pesan grup, status tetap `sent` sementara counter terus bertambah |
+
+### Rate Governor
+
+| Field | Rule | Catatan |
+|---|---|---|
+| token_bucket | Pembatasan laju kirim per instance memakai Token Bucket (kapasitas burst 3 token) | Mengatur kecepatan pengosongan antrean outbox sesuai kuota menit instance |
+| dynamic_rate | Perubahan konfigurasi laju kirim instance diterapkan seketika | Memperbarui kecepatan pengisian token tanpa restart daemon |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -125,6 +160,20 @@ flowchart TD
 | paused (`gone`) | aktif | Operator menjalankan `waapi webhook resume <id>` sehingga deliverer dimulai ulang dari cursor tersimpan |
 | pengiriman | dead-letter (`webhook_dead`) | Gagal permanen `4xx` (non-410) setelah maks 3 percobaan atau gagal transien melebihi `webhook_max_attempts` |
 | dead-letter (`webhook_dead`) | selesai / dihapus | `waapi webhook dlq <id> replay` berhasil (HTTP `2xx`) atau `waapi webhook dlq <id> purge` |
+
+## Transisi Status Durable Outbox
+
+| Dari | Ke | Pemicu |
+|---|---|---|
+| queued | sending | Diklaim scheduler instance saat terhubung, melewati `not_before`, dan token rate limit tersedia |
+| queued | cancelled | Dibatalkan pengguna sebelum sempat diklaim scheduler |
+| queued | expired | Melewati batas `expire_at` sebelum berhasil diklaim |
+| sending | sent | Pengiriman ke server WhatsApp berhasil |
+| sending | queued | Gagal sementara (jaringan, koneksi terputus, atau rate limit WA) dan masih di bawah `expire_at`, atau lease macet dipulihkan |
+| sending | failed | Gagal permanen dari WhatsApp, nomor tidak valid, atau diblokir policy |
+| sending | expired | Gagal sementara terus-menerus hingga melampaui `expire_at` |
+| sent | delivered | Tanda terima delivery diterima dari WhatsApp (chat DM) |
+| sent / delivered | read | Tanda terima dibaca atau diputar diterima dari WhatsApp (chat DM) |
 
 ## Batasan Bisnis & Trigger
 
@@ -152,4 +201,8 @@ flowchart TD
 | Webhook deliverer v2 (O(1) RAM) | Deliverer membaca batch langsung dari disk (maks 32 event / 256 KiB per query) tanpa antrian di RAM; mode `now` (default saat `webhook set`) mulai dari head `seq`, mode `--from retained` mengirim ulang backlog yang belum dipangkas; pergantian jumlah `webhook_lanes` memindahkan seluruh cursor ke `MIN(seq)` lama dan menghapus cursor usang |
 | Graceful drain webhook saat shutdown | `Service.Stop()` menunggu request HTTP in-flight selesai (maks 10 detik) dan menuliskan commit cursor memakai context baru sebelum koneksi ditutup |
 | Kuota SSE & slow client | Koneksi SSE publik (`GET /v2/instances/{id}/events/stream`) dibatasi kuota global `WAAPI_SSE_MAX` (ditolak `429 sse_limit` + `Retry-After: 10`), dan diputus jika klien macet melewati batas tulis per-frame 30 detik |
+| Idempotensi pesan keluar | Kunci idempotensi yang sama dalam satu instance mengembalikan pesan sebelumnya bila target dan isi sama persis, atau menolak jika berbeda |
+| Pemulihan lease outbox | Pengawas latar belakang memeriksa pesan berstatus `sending` yang melewati masa lease tiap 60 detik (dan saat startup) untuk dikembalikan ke `queued` |
+| Monotonik receipt & non-journal grup | Status tanda terima pesan DM hanya bergerak maju (`sent` -> `delivered` -> `read`); receipt chat grup tetap menaikkan counter pengiriman/pembacaan outbox meski mode journal hanya mencatat DM |
+| Pembersihan & batas antrean outbox | Penambahan antrean ditolak jika antrean `queued` instance mencapai batas kuota; tugas pembersihan tiap jam memangkas pesan final outbox yang melewati retensi |
 
