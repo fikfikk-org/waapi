@@ -15,11 +15,24 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
 )
+
+// ServerOption mengatur opsi dependensi tambahan untuk Server control plane.
+type ServerOption func(*Server)
+
+// WithJournal memasang Journal v2 ke control plane untuk inspeksi event dan diagnostik DB.
+func WithJournal(j *journal.Journal) ServerOption {
+	return func(s *Server) {
+		if j != nil {
+			s.journal = j
+		}
+	}
+}
 
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
@@ -28,13 +41,14 @@ type Server struct {
 	auth      *auth.Manager
 	wa        *wa.Manager
 	webhook   *webhook.Dispatcher
+	journal   *journal.Journal
 	startedAt time.Time
 	version   string
 }
 
 // NewServer membangun Server control plane baru.
-func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manager, wh *webhook.Dispatcher) *Server {
-	return &Server{
+func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manager, wh *webhook.Dispatcher, opts ...ServerOption) *Server {
+	s := &Server{
 		cfg:       cfg,
 		store:     st,
 		auth:      a,
@@ -43,6 +57,15 @@ func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manag
 		startedAt: time.Now(),
 		version:   "dev",
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	if s.journal == nil && w != nil {
+		s.journal = w.Journal()
+	}
+	return s
 }
 
 // SetVersion menyetel string versi aplikasi untuk dilaporkan oleh diagnostik.
@@ -86,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /control/instances/{id}/logout", s.handleLogoutInstance)
 	mux.HandleFunc("DELETE /control/instances/{id}", s.handleDeleteInstance)
 	mux.HandleFunc("POST /control/instances/{id}/webhook/test", s.handleTestWebhook)
+	mux.HandleFunc("GET /control/instances/{id}/events", s.handleGetEvents)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
 	pprofMux := http.NewServeMux()
@@ -108,6 +132,9 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		}
 		if waDB := s.wa.WADB(); waDB != nil {
 			dbs = append(dbs, obs.DBInput{Name: "wa.db", DB: waDB, Path: s.cfg.WADBPath()})
+		}
+		if s.journal != nil && s.journal.DB() != nil {
+			dbs = append(dbs, obs.DBInput{Name: "journal.db", DB: s.journal.DB(), Path: s.cfg.JournalDBPath()})
 		}
 		rep := obs.CollectDeep(r.Context(), s.startedAt, s.cfg.AppDBPath(), s.cfg.WADBPath(), outbox, counts, dbs, s.version)
 		writeJSON(w, http.StatusOK, rep)

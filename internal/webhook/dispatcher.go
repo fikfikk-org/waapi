@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/store"
 )
 
@@ -36,6 +37,7 @@ type Envelope struct {
 
 type job struct {
 	outboxID   int64
+	seq        int64
 	instanceID string
 	event      string
 	payload    []byte
@@ -46,10 +48,31 @@ type job struct {
 type Dispatcher struct {
 	store   *store.Store
 	resolve TargetResolver
+	cache   *TargetCache
 	client  *http.Client
 	ch      chan job
 	workers int
 	wg      sync.WaitGroup
+}
+
+// SetTargetCache memasang cache target memori agar hot path webhook tidak melakukan query app.db.
+func (d *Dispatcher) SetTargetCache(tc *TargetCache) {
+	if d == nil {
+		return
+	}
+	d.cache = tc
+}
+
+func (d *Dispatcher) resolveTarget(ctx context.Context, instanceID string) (url, secret, eventsCSV string, err error) {
+	if d.cache != nil {
+		if t, ok := d.cache.Get(instanceID); ok {
+			return t.URL, t.Secret, t.EventsCSV, nil
+		}
+	}
+	if d.resolve == nil {
+		return "", "", "", nil
+	}
+	return d.resolve(ctx, instanceID)
 }
 
 // NewDispatcher membuat Dispatcher dengan antrian memori terikat (512 item).
@@ -109,7 +132,7 @@ func (d *Dispatcher) Enqueue(instanceID, event string, data any) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	url, _, eventsCSV, err := d.resolve(ctx, instanceID)
+	url, _, eventsCSV, err := d.resolveTarget(ctx, instanceID)
 	if err != nil || strings.TrimSpace(url) == "" {
 		return
 	}
@@ -134,25 +157,62 @@ func (d *Dispatcher) Enqueue(instanceID, event string, data any) {
 		raw, _ = json.Marshal(env)
 	}
 
-	j := job{
+	d.enqueueJob(ctx, job{
 		instanceID: instanceID,
 		event:      event,
 		payload:    raw,
 		attempts:   0,
+	})
+}
+
+// EnqueueEvent mengantrikan event journal v2 ke antrian webhook memori tanpa memblokir handler.
+func (d *Dispatcher) EnqueueEvent(ev journal.Event) {
+	if d == nil {
+		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	url, _, eventsCSV, err := d.resolveTarget(ctx, ev.InstanceID)
+	if err != nil || strings.TrimSpace(url) == "" {
+		return
+	}
+	if !eventAllowed(eventsCSV, ev.Type) {
+		return
+	}
+
+	raw, err := ev.MarshalEnvelope()
+	if err != nil {
+		slog.Warn("gagal marshal envelope journal webhook", "instance", ev.InstanceID, "seq", ev.Seq, "err", err)
+		return
+	}
+
+	d.enqueueJob(ctx, job{
+		seq:        ev.Seq,
+		instanceID: ev.InstanceID,
+		event:      ev.Type,
+		payload:    raw,
+		attempts:   0,
+	})
+}
+
+func (d *Dispatcher) enqueueJob(ctx context.Context, j job) {
 	select {
 	case d.ch <- j:
 	default:
 		// Antrian memori penuh -> langsung spill ke outbox disk
-		if err := d.store.EnqueueOutbox(ctx, instanceID, event, raw, 0, time.Now().Unix()); err != nil {
-			slog.Warn("gagal spill webhook ke outbox", "instance", instanceID, "err", err)
+		if d.store == nil {
+			return
+		}
+		if err := d.store.EnqueueOutbox(ctx, j.instanceID, j.event, j.payload, 0, time.Now().Unix()); err != nil {
+			slog.Warn("gagal spill webhook ke outbox", "instance", j.instanceID, "err", err)
 		}
 	}
 }
 
 // SendTest mengirim satu event percobaan secara sinkron untuk perintah CLI webhook test.
 func (d *Dispatcher) SendTest(ctx context.Context, instanceID string) (int, error) {
-	url, secret, _, err := d.resolve(ctx, instanceID)
+	url, secret, _, err := d.resolveTarget(ctx, instanceID)
 	if err != nil {
 		return 0, err
 	}
@@ -169,7 +229,7 @@ func (d *Dispatcher) SendTest(ctx context.Context, instanceID string) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	return d.deliverHTTP(ctx, url, secret, instanceID, "test", now, body)
+	return d.deliverHTTP(ctx, url, secret, instanceID, "test", 0, now, body)
 }
 
 func (d *Dispatcher) workerLoop(ctx context.Context) {
@@ -184,7 +244,7 @@ func (d *Dispatcher) workerLoop(ctx context.Context) {
 }
 
 func (d *Dispatcher) handleJob(ctx context.Context, j job) {
-	url, secret, _, err := d.resolve(ctx, j.instanceID)
+	url, secret, _, err := d.resolveTarget(ctx, j.instanceID)
 	if err != nil || strings.TrimSpace(url) == "" {
 		if j.outboxID != 0 {
 			_ = d.store.DeleteOutbox(ctx, j.outboxID)
@@ -193,9 +253,9 @@ func (d *Dispatcher) handleJob(ctx context.Context, j job) {
 	}
 
 	now := time.Now().Unix()
-	code, err := d.deliverHTTP(ctx, url, secret, j.instanceID, j.event, now, j.payload)
+	code, err := d.deliverHTTP(ctx, url, secret, j.instanceID, j.event, j.seq, now, j.payload)
 	if err == nil && code >= 200 && code < 300 {
-		if j.outboxID != 0 {
+		if j.outboxID != 0 && d.store != nil {
 			_ = d.store.DeleteOutbox(ctx, j.outboxID)
 		}
 		return
@@ -204,12 +264,15 @@ func (d *Dispatcher) handleJob(ctx context.Context, j job) {
 	attempts := j.attempts + 1
 	if attempts >= maxAttempts {
 		slog.Warn("webhook dead-letter setelah batas retry", "instance", j.instanceID, "event", j.event, "status", code, "err", err)
-		if j.outboxID != 0 {
+		if j.outboxID != 0 && d.store != nil {
 			_ = d.store.DeleteOutbox(ctx, j.outboxID)
 		}
 		return
 	}
 
+	if d.store == nil {
+		return
+	}
 	nextRetry := now + backoffSeconds(attempts)
 	if j.outboxID == 0 {
 		_ = d.store.EnqueueOutbox(ctx, j.instanceID, j.event, j.payload, attempts, nextRetry)
@@ -218,7 +281,7 @@ func (d *Dispatcher) handleJob(ctx context.Context, j job) {
 	}
 }
 
-func (d *Dispatcher) deliverHTTP(ctx context.Context, url, secret, instanceID, event string, ts int64, body []byte) (int, error) {
+func (d *Dispatcher) deliverHTTP(ctx context.Context, url, secret, instanceID, event string, seq, ts int64, body []byte) (int, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -231,6 +294,9 @@ func (d *Dispatcher) deliverHTTP(ctx context.Context, url, secret, instanceID, e
 	req.Header.Set("X-WA-Event", event)
 	req.Header.Set("X-WA-Instance", instanceID)
 	req.Header.Set("X-WA-Timestamp", strconv.FormatInt(ts, 10))
+	if seq > 0 {
+		req.Header.Set("X-WA-Event-Id", strconv.FormatInt(seq, 10))
+	}
 	if secret != "" {
 		req.Header.Set("X-WA-Signature", Sign(secret, ts, body))
 	}
@@ -252,6 +318,9 @@ func (d *Dispatcher) pollerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if d.store == nil {
+				continue
+			}
 			now := time.Now().Unix()
 			_ = d.store.PruneOutbox(ctx, maxAttempts, now-retentionSec)
 			items, err := d.store.ClaimDueOutbox(ctx, now, 32)

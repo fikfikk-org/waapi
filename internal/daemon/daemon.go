@@ -19,6 +19,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/control"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/sdnotify"
@@ -144,6 +145,30 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	go authMgr.FlushLoop(ctx)
 
+	tc := webhook.NewTargetCache()
+	if err := tc.Load(ctx, st); err != nil {
+		return fmt.Errorf("muat target cache webhook: %w", err)
+	}
+
+	j, err := journal.Open(ctx, cfg.JournalDBPath(), store.DBOptions{
+		MaxConns:    3,
+		CacheKiB:    cfg.JournalCacheKiB,
+		IdleTimeout: 60 * time.Second,
+		TxLock:      "immediate",
+		Sync:        cfg.JournalSync,
+	})
+	if err != nil {
+		return fmt.Errorf("buka journal.db: %w", err)
+	}
+	defer func() { _ = j.Close() }()
+
+	go j.RunPruner(ctx, journal.PrunePolicy{
+		Retention:    cfg.JournalRetention,
+		ReplayWindow: cfg.JournalReplayWindow,
+		MaxRows:      cfg.JournalMaxRows,
+		Interval:     5 * time.Minute,
+	})
+
 	wh := webhook.NewDispatcher(st, func(ctx context.Context, instanceID string) (string, string, string, error) {
 		inst, err := st.GetInstance(ctx, instanceID)
 		if err != nil {
@@ -151,15 +176,16 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		}
 		return inst.WebhookURL, inst.WebhookSecret, inst.WebhookEvents, nil
 	}, cfg.WebhookWorkers)
+	wh.SetTargetCache(tc)
 	wh.Start(ctx)
 
-	waMgr, err := wa.NewManager(ctx, cfg, st, wh)
+	waMgr, err := wa.NewManager(ctx, cfg, st, wh, wa.WithJournal(j), wa.WithTargetCache(tc))
 	if err != nil {
 		wh.Stop()
 		return fmt.Errorf("inisialisasi wa manager: %w", err)
 	}
 
-	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh)
+	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh, control.WithJournal(j))
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
 	if err != nil {
@@ -187,7 +213,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithGovernor(governor.AlwaysGreen)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithGovernor(governor.AlwaysGreen)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -280,6 +306,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	_ = waMgr.Close()
 	wh.Stop()
 	_ = authMgr.FlushOnce(shutCtx)
+	_ = j.Close()
 
 	slog.Info("daemon waapi berhenti dengan bersih")
 	return nil
@@ -322,6 +349,9 @@ func newMetricsHandler(cfg *config.Config, st *store.Store, waMgr *wa.Manager) h
 		}
 		if waDB := waMgr.WADB(); waDB != nil {
 			dbStats = append(dbStats, obs.CollectDBStats(r.Context(), "wa.db", waDB, cfg.WADBPath()))
+		}
+		if j := waMgr.Journal(); j != nil && j.DB() != nil {
+			dbStats = append(dbStats, obs.CollectDBStats(r.Context(), "journal.db", j.DB(), cfg.JournalDBPath()))
 		}
 		counts := waMgr.CountByStatus(r.Context())
 		obs.RefreshDefaultMetrics(dbStats, counts)

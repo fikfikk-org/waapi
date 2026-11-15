@@ -11,6 +11,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/governor"
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
 
@@ -43,11 +44,21 @@ func WithGovernor(src governor.Source) ServerOption {
 	}
 }
 
+// WithJournal memasang Journal v2 untuk melayani endpoint pull /v2/instances/{id}/events.
+func WithJournal(j *journal.Journal) ServerOption {
+	return func(s *Server) {
+		if j != nil {
+			s.journal = j
+		}
+	}
+}
+
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
 type Server struct {
 	auth    *auth.Manager
 	wa      *wa.Manager
 	appDB   *sql.DB
+	journal *journal.Journal
 	gov     governor.Source
 	mux     *http.ServeMux
 	handler http.Handler
@@ -72,6 +83,9 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 			opt(s)
 		}
 	}
+	if s.journal == nil && w != nil {
+		s.journal = w.Journal()
+	}
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -86,6 +100,7 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("POST /v1/instances/{id}/messages/media-url", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleSendMediaURL))
 	s.handle("POST /v1/instances/{id}/contacts/check", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleCheckNumbers))
 	s.handle("POST /v1/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleDownloadMedia))
+	s.handle("GET /v2/instances/{id}/events", auth.ScopeEventsRead, s.withInstanceAuth(s.handleGetEvents))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

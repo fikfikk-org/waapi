@@ -81,6 +81,17 @@ flowchart TD
 | next_retry_at | Backoff eksponensial 5 detik s/d 30 menit + jitter | |
 | payload | Maks 64 KB | Teks panjang dipotong |
 
+### Inbound Journal (`journal.db`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| seq | Nomor urut monotonik (`AUTOINCREMENT`), tidak dipakai ulang setelah prune | Menjadi `id` string pada envelope v2 |
+| dedupe_key | Unik per `(instance_id, dedupe_key)` memakai alamat wire mentah sebelum kanonikalisasi LID | Idempotensi retry dari WhatsApp |
+| chat | JID chat kanonik (diubah ke `@s.whatsapp.net` jika LID tersedia lokal) | Pembentuk partisi `part = fnv32a(chat) % 64` |
+| payload | JSON normalisasi (`text` maks 16 KiB, `quoted.text` maks 1 KiB, total maks 64 KiB) | Tidak pernah membuang `id`, `chat`, `from`, `type`, `timestamp` |
+| flags | Bitmask `1` (`offline`), `2` (`truncated`) | Menandai pesan offline sync dan pemotongan konten |
+| cursors | Menyimpan posisi `seq` terakhir konsumen per `(consumer, instance_id, lane)` | Menjadi batas aman penghapusan event pada pruner |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -114,4 +125,7 @@ flowchart TD
 | Listener metrik Prometheus | Nonaktif secara default (0 goroutine tambahan); aktif hanya bila `WAAPI_METRICS_ADDR` diisi dan memberi peringatan log jika di-bind ke non-loopback |
 | Supervisor koneksi self-healing | Satu goroutine supervisor per instance aktif pemilik tunggal reconnect (`EnableAutoReconnect=false`, `InitialAutoReconnect=false`), backoff equal jitter + circuit breaker setelah 10 kegagalan beruntun, deteksi socket mati via keepalive (`WAAPI_KEEPALIVE_MAX_FAIL` 75s) & `TCP_USER_TIMEOUT` (`WAAPI_TCP_USER_TIMEOUT` 45s), `AutoStartAll` berjeda 2s + jitter 0-1s, serta `Status`/`ListStatuses` murni read-only tanpa membuat instance |
 | Recycle instance & systemd watchdog | Operator dapat menyegarkan penuh client dan cache `sqlstore` instance terpasang via `waapi recycle <id>`; daemon mengirim `READY=1`, `WATCHDOG=1` berkala bila `SELECT 1 app.db <= 500ms`, dan `STOPPING=1` ke systemd |
+| Inbound journal effectively-once | Ack ke WhatsApp hanya dikirim setelah transaksi `journal.db` (beserta `TxHook` observer) sukses commit (`SynchronousAck`, `EnableDecryptedEventBuffer`, `UseRetryMessageStore`); hot path handler berjalan tanpa query `app.db` maupun I/O jaringan |
+| Cache target & settings di memori | `TargetCache` webhook dan salinan `InstanceSettings` disinkronkan di memori pada `Create`/`Update`/`Delete` sehingga hot path bebas query `app.db` |
+| Retensi & pemangkasan `journal.db` | Pruner menghapus event terkirim melewati `JournalReplayWindow` (1 jam), event belum terkirim melewati `JournalRetention` (72 jam) dengan increment metrik `dropped_undelivered_total`, serta menjaga maksimal `JournalMaxRows` (50.000) baris per instance |
 

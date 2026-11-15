@@ -185,21 +185,34 @@
 | Response | 200 stream biner dengan Content-Type asli |
 | Notes | Media tidak disimpan; diunduh on-demand lalu file sementara dihapus |
 
+## GET /v2/instances/{id}/events
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/events |
+| Auth Required | Yes (X-API-Key, scope `events:read`) |
+| Headers | X-API-Key |
+| Query Params | `after` (int64, opsional, default 0), `limit` (int, opsional, default 100, maks 500), `types` (string csv, opsional, mis. `message,receipt`) |
+| Request Body | - |
+| Response | 200 `{ events, next_after, has_more }` (400 jika query tidak valid, 403 jika scope/instance ditolak, 503 jika journal belum aktif) |
+| Notes | Setiap item pada `events` memakai envelope v2 (`v`, `id`, `event`, `instance`, `timestamp`, `data`); `next_after` mengikuti `ScannedTo` agar pagination tetap maju melewati event yang terfilter |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
 |---|---|
 | Method + Endpoint | POST ke `webhook_url` instance |
-| Headers | X-WA-Event, X-WA-Instance, X-WA-Timestamp, X-WA-Signature (`sha256=` HMAC dari `timestamp.body`) |
-| Body | event, instance, timestamp, data (message/receipt/pairing atau connection aditif: status, state, prev_state, jid, reason, attempt, next_retry_in, circuit, ban) |
-| Event | message, receipt, connection, pairing |
-| Notes | Retry maks 8 kali dengan backoff; penerima wajib membalas 2xx dalam 10 detik dan menolak timestamp lebih dari 5 menit |
+| Headers | X-WA-Event, X-WA-Event-Id (saat berasal dari journal), X-WA-Instance, X-WA-Timestamp, X-WA-Signature (`sha256=` HMAC dari `timestamp.body`) |
+| Body | Mode v1: event, instance, timestamp, data; dual-write journal v2 memakai envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) |
+| Event | message, receipt, undecryptable, connection, pairing |
+| Notes | Retry maks 8 kali dengan backoff; target webhook dibaca dari `TargetCache` memori tanpa query `app.db` di hot path |
 
 ## Control Plane (CLI only, Unix socket)
 
 Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.sock` (perm 0660).
 - `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`).
-- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
+- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB termasuk `journal.db`, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
+- `GET /control/instances/{id}/events` mengambil atau long-poll (`?after=N&limit=N&types=csv&wait=N`) event journal v2 per instance via `waapi events <id> [--after N] [--types csv] [--limit N] [--follow] [--json]`.
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
 - `POST /control/instances/{id}/recycle` menghentikan supervisor, melepas client lama, memuat ulang device `sqlstore`, dan menyalakan ulang supervisor (`waapi recycle <id>`). Ditolak HTTP 400 bila belum dipairing.
 
@@ -211,6 +224,7 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 |---|---|---|---|
 | Outbox poller | Tiap 5 detik | Kirim ulang webhook gagal | Hapus baris > 8 percobaan / > 24 jam |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
+| Journal pruner | Tiap 5 menit | Pangkas baris `journal.db` sesuai replay window, retensi, dan batas baris | Hapus baris lama & inkremen metrik `dropped_undelivered_total` bila ada event belum terkirim yang kadaluwarsa |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
 

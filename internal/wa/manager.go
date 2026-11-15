@@ -13,6 +13,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/webhook"
@@ -23,23 +24,48 @@ import (
 
 var slugRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
+// InboundObserver mendaftarkan hook transaksi journal.db untuk setiap event masuk sebelum ack ke WhatsApp.
+type InboundObserver func(ctx context.Context, ev *journal.Event, raw any) journal.TxHook
+
+// ManagerOption mengonfigurasi opsi tambahan pada konstruksi Manager.
+type ManagerOption func(*Manager)
+
+// WithJournal memasang Journal v2 ke Manager dan seluruh instance yang dikelola.
+func WithJournal(j *journal.Journal) ManagerOption {
+	return func(m *Manager) {
+		m.journal = j
+	}
+}
+
+// WithTargetCache memasang cache target webhook agar operasi CRUD instance langsung menyinkronkan cache.
+func WithTargetCache(tc *webhook.TargetCache) ManagerOption {
+	return func(m *Manager) {
+		m.targetCache = tc
+	}
+}
+
 // Manager mengelola siklus hidup seluruh instance WhatsApp di dalam satu proses daemon.
 type Manager struct {
-	cfg        *config.Config
-	store      *store.Store
-	waDB       *sql.DB
-	container  *sqlstore.Container
-	webhook    *webhook.Dispatcher
-	waLog      waLog.Logger
-	pairingSem *semaphore.Weighted
-	mediaSem   *semaphore.Weighted
+	cfg         *config.Config
+	store       *store.Store
+	waDB        *sql.DB
+	container   *sqlstore.Container
+	webhook     *webhook.Dispatcher
+	journal     *journal.Journal
+	targetCache *webhook.TargetCache
+	waLog       waLog.Logger
+	pairingSem  *semaphore.Weighted
+	mediaSem    *semaphore.Weighted
+
+	obsMu     sync.RWMutex
+	observers []InboundObserver
 
 	mu        sync.RWMutex
 	instances map[string]*Instance
 }
 
 // NewManager membuka wa.db, menjalankan migrasi sqlstore, dan menyiapkan registry instance.
-func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *webhook.Dispatcher) (*Manager, error) {
+func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *webhook.Dispatcher, opts ...ManagerOption) (*Manager, error) {
 	cfg.Normalize()
 	ConfigureDeviceProps()
 
@@ -70,6 +96,11 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		mediaSem:   semaphore.NewWeighted(2), // maksimal 2 stream media aktif bersamaan
 		instances:  make(map[string]*Instance),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(m)
+		}
+	}
 
 	rows, err := st.ListInstances(ctx)
 	if err != nil {
@@ -80,6 +111,46 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		m.instances[row.ID] = newInstance(m, row)
 	}
 	return m, nil
+}
+
+// Journal mengembalikan instance Journal v2 yang terpasang (dapat bernilai nil pada mode kompatibilitas v1).
+func (m *Manager) Journal() *journal.Journal {
+	if m == nil {
+		return nil
+	}
+	return m.journal
+}
+
+// AddInboundObserver mendaftarkan observer yang menghasilkan TxHook saat event masuk disimpan ke journal.db.
+func (m *Manager) AddInboundObserver(fn InboundObserver) {
+	if m == nil || fn == nil {
+		return
+	}
+	m.obsMu.Lock()
+	m.observers = append(m.observers, fn)
+	m.obsMu.Unlock()
+}
+
+func (m *Manager) collectHooks(ctx context.Context, ev *journal.Event, raw any) []journal.TxHook {
+	if m == nil || ev == nil {
+		return nil
+	}
+	m.obsMu.RLock()
+	if len(m.observers) == 0 {
+		m.obsMu.RUnlock()
+		return nil
+	}
+	obs := make([]InboundObserver, len(m.observers))
+	copy(obs, m.observers)
+	m.obsMu.RUnlock()
+
+	var hooks []journal.TxHook
+	for _, fn := range obs {
+		if h := fn(ctx, ev, raw); h != nil {
+			hooks = append(hooks, h)
+		}
+	}
+	return hooks
 }
 
 // Store mengembalikan handle Store (app.db) milik wa Manager.
@@ -168,6 +239,7 @@ func (m *Manager) Create(ctx context.Context, id string, ratePerMin int, autoSta
 		WebhookEvents: store.DefaultWebhookEvents,
 		RatePerMin:    ratePerMin,
 		AutoStart:     autoStart,
+		Settings:      store.Defaults(),
 	}
 	if err := m.store.CreateInstance(ctx, meta); err != nil {
 		return nil, err
@@ -177,6 +249,9 @@ func (m *Manager) Create(ctx context.Context, id string, ratePerMin int, autoSta
 	m.mu.Lock()
 	m.instances[id] = inst
 	m.mu.Unlock()
+	if m.targetCache != nil {
+		m.targetCache.SetFromInstance(&meta)
+	}
 
 	snap := inst.Snapshot(meta)
 	return &snap, nil
@@ -240,14 +315,20 @@ func (m *Manager) Recycle(ctx context.Context, id string) (*InstanceStatus, erro
 	return m.Status(ctx, id)
 }
 
-// Update memperbarui konfigurasi instance di DB dan menyinkronkan rate limiter di memori.
+// Update memperbarui konfigurasi instance di DB dan menyinkronkan rate limiter, settings, serta cache target.
 func (m *Manager) Update(ctx context.Context, id string, up store.InstanceUpdate) (*InstanceStatus, error) {
 	meta, err := m.store.UpdateInstance(ctx, id, up)
 	if err != nil {
 		return nil, err
 	}
-	if inst, ok := m.Get(id); ok && up.RatePerMin != nil {
-		inst.SetRatePerMin(*up.RatePerMin)
+	if inst, ok := m.Get(id); ok {
+		if up.RatePerMin != nil {
+			inst.SetRatePerMin(*up.RatePerMin)
+		}
+		inst.SetSettings(meta.Settings)
+	}
+	if m.targetCache != nil {
+		m.targetCache.SetFromInstance(meta)
 	}
 	return m.Status(ctx, meta.ID)
 }
@@ -315,6 +396,9 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	m.mu.Lock()
 	delete(m.instances, id)
 	m.mu.Unlock()
+	if m.targetCache != nil {
+		m.targetCache.Delete(id)
+	}
 	return m.store.DeleteInstance(ctx, id)
 }
 

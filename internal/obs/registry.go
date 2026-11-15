@@ -636,6 +636,12 @@ var (
 	MetricInstances = Default.NewGaugeVec("instances", "Jumlah instance WhatsApp berdasarkan status", "status")
 	// MetricSupervisorEventsCoalescedTotal mencatat jumlah event non-kritis supervisor yang digabung saat channel penuh.
 	MetricSupervisorEventsCoalescedTotal = Default.NewCounter("supervisor_events_coalesced_total", "Total event non-kritis supervisor yang digabung saat channel penuh")
+	// MetricJournalDroppedUndeliveredTotal mencatat jumlah event belum terkirim yang terhapus oleh pruning journal.
+	MetricJournalDroppedUndeliveredTotal = Default.NewCounterVec("journal_dropped_undelivered_total", "Total event belum terkirim yang terhapus akibat retensi atau batas baris journal", "instance")
+	// MetricJournalAppendSeconds mencatat distribusi latensi transaksi Append ke journal.db dalam detik.
+	MetricJournalAppendSeconds = Default.NewHistogram("journal_append_seconds", "Latensi transaksi append event ke journal.db dalam detik", []float64{0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1})
+	// MetricJournalAppendErrorsTotal mencatat total kegagalan transaksi Append atau hook pada journal.db.
+	MetricJournalAppendErrorsTotal = Default.NewCounter("journal_append_errors_total", "Total kegagalan transaksi append atau hook ke journal.db")
 )
 
 // RefreshDefaultMetrics memperbarui seluruh metrik bawaan pada Default tanpa memakai runtime.ReadMemStats.

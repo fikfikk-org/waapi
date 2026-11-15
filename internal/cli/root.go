@@ -77,6 +77,8 @@ func Execute(args []string) error {
 		return runKeySubcommand(ctx, ctrl, rest)
 	case "webhook":
 		return runWebhookSubcommand(ctx, ctrl, rest)
+	case "events":
+		return runEvents(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
 	case "update", "self-update":
@@ -171,6 +173,7 @@ MANAJEMEN WEBHOOK:
   waapi webhook set <id> <url> [--events ...]  Pasang URL webhook pada instance
   waapi webhook unset <id>                     Hapus URL webhook dari instance
   waapi webhook test <id>                      Kirim event uji coba ke webhook
+  waapi events <id> [--after N] [--follow]     Baca/pantau stream event journal masuk instance
 
 DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon

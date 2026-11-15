@@ -307,8 +307,10 @@ func (s *PairSession) update(fn func()) {
 	s.mu.Unlock()
 
 	s.readyOnce.Do(func() { close(s.ready) })
-	if s.inst.mgr != nil && s.inst.mgr.webhook != nil {
-		s.inst.mgr.webhook.Enqueue(s.inst.id, "pairing", webhookPairingData(snap))
+	if emit := s.inst.emitter(); emit != nil {
+		emitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = emit.Emit(emitCtx, s.inst.id, "pairing", webhookPairingData(snap))
+		cancel()
 	}
 }
 

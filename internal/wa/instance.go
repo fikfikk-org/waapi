@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
+	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"go.mau.fi/whatsmeow"
@@ -72,7 +74,10 @@ type Instance struct {
 	status         string
 	jid            string
 	connectedSince int64
+	settings       store.InstanceSettings
 	cancel         context.CancelFunc
+
+	offline atomic.Bool
 
 	checkMu    sync.Mutex
 	checkCache map[string]cachedCheck
@@ -84,6 +89,10 @@ type Instance struct {
 
 func newInstance(m *Manager, meta store.Instance) *Instance {
 	ctx, cancel := context.WithCancel(context.Background())
+	settings := meta.Settings
+	if settings.JournalReceipts == "" {
+		settings = store.Defaults()
+	}
 	inst := &Instance{
 		id:         meta.ID,
 		mgr:        m,
@@ -92,6 +101,7 @@ func newInstance(m *Manager, meta store.Instance) *Instance {
 		ratePerMin: meta.RatePerMin,
 		status:     meta.Status,
 		jid:        meta.JID,
+		settings:   settings,
 		cancel:     cancel,
 		checkCache: make(map[string]cachedCheck),
 	}
@@ -137,6 +147,53 @@ func (i *Instance) SetRatePerMin(rpm int) {
 	i.ratePerMin = rpm
 	i.limiter = newLimiter(rpm)
 	i.mu.Unlock()
+}
+
+// SetSettings menyinkronkan salinan pengaturan instance di memori agar hot path tidak melakukan query DB.
+func (i *Instance) SetSettings(s store.InstanceSettings) {
+	if i == nil {
+		return
+	}
+	if s.JournalReceipts == "" {
+		s.JournalReceipts = store.Defaults().JournalReceipts
+	}
+	i.mu.Lock()
+	i.settings = s
+	i.mu.Unlock()
+}
+
+func (i *Instance) cachedSettings() store.InstanceSettings {
+	if i == nil {
+		return store.Defaults()
+	}
+	i.mu.RLock()
+	s := i.settings
+	i.mu.RUnlock()
+	if s.JournalReceipts == "" {
+		s.JournalReceipts = store.Defaults().JournalReceipts
+	}
+	return s
+}
+
+func (i *Instance) lidResolver() LIDResolver {
+	cli := i.getClient()
+	if cli == nil || cli.Store == nil || cli.Store.LIDs == nil {
+		return nil
+	}
+	return newStoreLIDResolver(cli.Store.LIDs)
+}
+
+func (i *Instance) emitter() Emitter {
+	if i == nil || i.mgr == nil {
+		return nil
+	}
+	if i.mgr.journal != nil {
+		return newEmitterJournal(i.mgr.journal, i.mgr, i.mgr.webhook)
+	}
+	if i.mgr.webhook != nil {
+		return newEmitterV1(i.mgr.webhook)
+	}
+	return nil
 }
 
 // IsConnected memeriksa apakah client WhatsApp sedang aktif dan tersambung.
@@ -259,9 +316,7 @@ func (i *Instance) attachClient(dev *waStore.Device) *whatsmeow.Client {
 				keepaliveMaxFail = i.mgr.cfg.KeepaliveMaxFail
 			}
 		}
-		if i.mgr.webhook != nil {
-			emit = newEmitterV1(i.mgr.webhook)
-		}
+		emit = i.emitter()
 	}
 	if clientLog == nil {
 		clientLog = logx.WALogger(slog.Default(), "wa", slog.LevelWarn).Sub(i.id)
@@ -278,7 +333,15 @@ func (i *Instance) attachClient(dev *waStore.Device) *whatsmeow.Client {
 	cli.InitialAutoReconnect = false // kegagalan connect awal ditangani Supervisor
 	cli.ManualHistorySyncDownload = true
 	cli.SetWebsocketHTTPClient(newWebsocketHTTPClient(userTimeout))
-	cli.AddEventHandler(i.handleEvent)
+	if i.mgr != nil && i.mgr.journal != nil {
+		// Ack WhatsApp baru dikirim setelah transaksi journal.db berhasil commit.
+		cli.SynchronousAck = true
+		cli.EnableDecryptedEventBuffer = true
+		cli.UseRetryMessageStore = true
+		cli.AddEventHandlerWithSuccessStatus(i.handleEventV2)
+	} else {
+		cli.AddEventHandler(i.handleEvent)
+	}
 
 	sup := newSupervisor(i.id, &whatsmeowConnDriver{cli: cli}, emit, SupervisorConfig{
 		KeepAliveMaxFail: keepaliveMaxFail,
@@ -639,8 +702,7 @@ func (i *Instance) CheckNumbers(ctx context.Context, numbers []string) ([]Number
 	return results, nil
 }
 
-// handleEvent menangani event dari whatsmeow secara non-blocking dan merutekan event koneksi ke Supervisor.
-func (i *Instance) handleEvent(rawEvt any) {
+func (i *Instance) routeSupervisorEvent(rawEvt any) bool {
 	switch evt := rawEvt.(type) {
 	case *events.Connected:
 		var jid string
@@ -653,6 +715,7 @@ func (i *Instance) handleEvent(rawEvt any) {
 			}
 			sup.OnEvent(evt)
 		}
+		return true
 	case *events.Disconnected,
 		*events.LoggedOut,
 		*events.StreamReplaced,
@@ -664,6 +727,18 @@ func (i *Instance) handleEvent(rawEvt any) {
 		if sup := i.getSupervisor(); sup != nil {
 			sup.OnEvent(evt)
 		}
+		return true
+	default:
+		return false
+	}
+}
+
+// handleEvent menangani event dari whatsmeow secara non-blocking untuk mode kompatibilitas v1 tanpa journal.
+func (i *Instance) handleEvent(rawEvt any) {
+	if i.routeSupervisorEvent(rawEvt) {
+		return
+	}
+	switch evt := rawEvt.(type) {
 	case *events.Message:
 		if p := extractMessage(evt); p != nil {
 			if i.mgr != nil && i.mgr.webhook != nil {
@@ -687,6 +762,64 @@ func (i *Instance) handleEvent(rawEvt any) {
 	case *events.HistorySync:
 		// Drop seluruh history sync agar tidak memakan RAM maupun disk
 	}
+}
+
+// handleEventV2 menjalankan pipeline inbound effectively-once di hot path tanpa query app.db atau I/O jaringan.
+func (i *Instance) handleEventV2(rawEvt any) bool {
+	if i.routeSupervisorEvent(rawEvt) {
+		return true
+	}
+
+	switch rawEvt.(type) {
+	case *events.HistorySync:
+		// Drop seluruh history sync agar tidak memakan RAM maupun disk.
+		return true
+	case *events.OfflineSyncPreview:
+		i.offline.Store(true)
+		return true
+	case *events.OfflineSyncCompleted:
+		i.offline.Store(false)
+		return true
+	}
+
+	var j *journal.Journal
+	if i.mgr != nil {
+		j = i.mgr.journal
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	nc := NormalizeContext{
+		Now:      time.Now(),
+		Offline:  i.offline.Load(),
+		Receipts: i.cachedSettings().JournalReceipts,
+		LID:      i.lidResolver(),
+	}
+	ev, ok := NormalizeEvent(ctx, i.id, rawEvt, nc)
+	if !ok {
+		return true
+	}
+	if j == nil {
+		return false
+	}
+
+	var hooks []journal.TxHook
+	if i.mgr != nil {
+		hooks = i.mgr.collectHooks(ctx, ev, rawEvt)
+	}
+	res, err := j.Append(ctx, ev, hooks...)
+	if err != nil {
+		slog.Warn("gagal menyimpan event masuk ke journal", "instance", i.id, "type", ev.Type, "err", err)
+		return false
+	}
+	ev.Seq = res.Seq
+
+	// Dual-write sementara ke webhook v1 hanya untuk event non-duplikat melalui TargetCache memori.
+	if !res.Duplicate && i.mgr != nil && i.mgr.webhook != nil {
+		i.mgr.webhook.EnqueueEvent(*ev)
+	}
+	return true
 }
 
 func (i *Instance) syncSupervisorState(snap StateSnapshot) {
@@ -803,4 +936,3 @@ func digitsOnly(s string) string {
 	}
 	return b.String()
 }
-

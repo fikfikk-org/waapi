@@ -17,6 +17,10 @@ type MediaDescriptor struct {
 	FileLength    uint64 `json:"file_length"`
 	MediaType     string `json:"media_type"` // image | video | audio | document | sticker
 	Filename      string `json:"filename,omitempty"`
+	Width         uint32 `json:"width,omitempty"`
+	Height        uint32 `json:"height,omitempty"`
+	Seconds       uint32 `json:"seconds,omitempty"`
+	PTT           bool   `json:"ptt,omitempty"`
 }
 
 // MessagePayload adalah bentuk ringkas pesan masuk yang dikirim ke webhook.
