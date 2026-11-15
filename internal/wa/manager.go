@@ -81,6 +81,22 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 	return m, nil
 }
 
+// Store mengembalikan handle Store (app.db) milik wa Manager.
+func (m *Manager) Store() *store.Store {
+	if m == nil {
+		return nil
+	}
+	return m.store
+}
+
+// WADB mengembalikan handle *sql.DB milik wa.db.
+func (m *Manager) WADB() *sql.DB {
+	if m == nil {
+		return nil
+	}
+	return m.waDB
+}
+
 // AutoStartAll menyalakan instance dengan auto_start=true secara berurutan (jeda 2 detik) agar tidak memicu spike RAM.
 func (m *Manager) AutoStartAll(ctx context.Context) {
 	rows, err := m.store.ListInstances(ctx)

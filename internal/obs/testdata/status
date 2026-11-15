@@ -1,0 +1,32 @@
+Name:	waapi
+Umask:	0022
+State:	S (sleeping)
+Tgid:	12345
+Ngid:	0
+Pid:	12345
+PPid:	1
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Groups:	1000 
+VmPeak:	  123456 kB
+VmSize:	   98760 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	   21440 kB
+VmRSS:	   20280 kB
+RssAnon:	    5120 kB
+RssFile:	   14080 kB
+RssShmem:	    1080 kB
+VmData:	   40960 kB
+VmStk:	     132 kB
+VmExe:	    8200 kB
+VmLib:	       0 kB
+VmPTE:	     120 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+Threads:	7
+SigQ:	0/3845

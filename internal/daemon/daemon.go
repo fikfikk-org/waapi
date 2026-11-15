@@ -17,12 +17,23 @@ import (
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/control"
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/logx"
+	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
 )
+
+var daemonBuildVersion = "dev"
+
+// SetVersion mencatat string versi aplikasi untuk dilaporkan pada endpoint diagnostik daemon.
+func SetVersion(v string) {
+	if strings.TrimSpace(v) != "" {
+		daemonBuildVersion = strings.TrimSpace(v)
+	}
+}
 
 // BackupPreV2 membuat salinan app.db dan wa.db sebelum migrasi v2 jika app.db v1 (user_version 1 atau 2) terdeteksi.
 func BackupPreV2(ctx context.Context, cfg *config.Config) error {
@@ -148,6 +159,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh)
+	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
 	if err != nil {
 		_ = waMgr.Close()
@@ -174,7 +186,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithGovernor(governor.AlwaysGreen)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -182,7 +194,31 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		MaxHeaderBytes:    8 << 10, // batasi header maksimal 8 KB
 	}
 
-	errCh := make(chan error, 2)
+	var metricsHTTP *http.Server
+	var metricsLn net.Listener
+	if addr := strings.TrimSpace(cfg.MetricsAddr); addr != "" {
+		if !isLoopbackListenAddr(addr) {
+			slog.Warn("listener metrik Prometheus diikat ke alamat non-loopback", "addr", addr)
+		}
+		metricsLn, err = net.Listen("tcp", addr)
+		if err != nil {
+			_ = pubLn.Close()
+			_ = waMgr.Close()
+			wh.Stop()
+			return fmt.Errorf("listen metrik %s: %w", addr, err)
+		}
+		metricsHTTP = &http.Server{
+			Addr:              addr,
+			Handler:           newMetricsHandler(cfg, st, waMgr),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    4 << 10,
+		}
+	}
+
+	errCh := make(chan error, 3)
 	go func() {
 		if err := ctrlHTTP.Serve(ctrlLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("control server: %w", err)
@@ -193,6 +229,13 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			errCh <- fmt.Errorf("public http server: %w", err)
 		}
 	}()
+	if metricsHTTP != nil {
+		go func() {
+			if err := metricsHTTP.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("metrics server: %w", err)
+			}
+		}()
+	}
 
 	// Jalankan auto-start instance secara berurutan di latar belakang
 	go waMgr.AutoStartAll(ctx)
@@ -201,6 +244,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		"http", cfg.HTTPAddr,
 		"control", cfg.ControlSocket(),
 		"data_dir", cfg.DataDir,
+		"metrics", cfg.MetricsAddr,
 	)
 
 	select {
@@ -213,6 +257,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	if metricsHTTP != nil {
+		_ = metricsHTTP.Shutdown(shutCtx)
+	}
 	_ = pubHTTP.Shutdown(shutCtx)
 	_ = ctrlHTTP.Shutdown(shutCtx)
 	_ = waMgr.Close()
@@ -223,3 +270,36 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
+// newMetricsHandler membangun HTTP handler terpisah yang hanya melayani /metrics.
+func newMetricsHandler(cfg *config.Config, st *store.Store, waMgr *wa.Manager) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		dbStats := []obs.DBStats{
+			obs.CollectDBStats(r.Context(), "app.db", st.DB, cfg.AppDBPath()),
+		}
+		if waDB := waMgr.WADB(); waDB != nil {
+			dbStats = append(dbStats, obs.CollectDBStats(r.Context(), "wa.db", waDB, cfg.WADBPath()))
+		}
+		counts := waMgr.CountByStatus(r.Context())
+		obs.RefreshDefaultMetrics(dbStats, counts)
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := obs.Default.WritePrometheus(w); err != nil {
+			slog.Warn("gagal menulis metrik prometheus", "err", err)
+		}
+	})
+	return mux
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}

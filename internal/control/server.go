@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ type Server struct {
 	wa        *wa.Manager
 	webhook   *webhook.Dispatcher
 	startedAt time.Time
+	version   string
 }
 
 // NewServer membangun Server control plane baru.
@@ -39,6 +41,14 @@ func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manag
 		wa:        w,
 		webhook:   wh,
 		startedAt: time.Now(),
+		version:   "dev",
+	}
+}
+
+// SetVersion menyetel string versi aplikasi untuk dilaporkan oleh diagnostik.
+func (s *Server) SetVersion(v string) {
+	if strings.TrimSpace(v) != "" {
+		s.version = strings.TrimSpace(v)
 	}
 }
 
@@ -76,12 +86,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /control/instances/{id}", s.handleDeleteInstance)
 	mux.HandleFunc("POST /control/instances/{id}/webhook/test", s.handleTestWebhook)
 
+	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+	pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/control/debug/pprof/", http.StripPrefix("/control", pprofMux))
+
 	return mux
 }
 
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 	outbox, _ := s.store.CountOutbox(r.Context())
 	counts := s.wa.CountByStatus(r.Context())
+	if r.URL.Query().Get("deep") == "1" {
+		dbs := []obs.DBInput{
+			{Name: "app.db", DB: s.store.DB, Path: s.cfg.AppDBPath()},
+		}
+		if waDB := s.wa.WADB(); waDB != nil {
+			dbs = append(dbs, obs.DBInput{Name: "wa.db", DB: waDB, Path: s.cfg.WADBPath()})
+		}
+		rep := obs.CollectDeep(r.Context(), s.startedAt, s.cfg.AppDBPath(), s.cfg.WADBPath(), outbox, counts, dbs, s.version)
+		writeJSON(w, http.StatusOK, rep)
+		return
+	}
 	rep := obs.Collect(s.startedAt, s.cfg.AppDBPath(), s.cfg.WADBPath(), outbox, counts)
 	writeJSON(w, http.StatusOK, rep)
 }
@@ -291,4 +321,3 @@ func writeStatusErr(w http.ResponseWriter, err error) {
 	}
 	writeErr(w, http.StatusBadRequest, err)
 }
-

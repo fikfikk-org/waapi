@@ -1,16 +1,13 @@
-// Package obs mengumpulkan metrik runtime, memori, dan ukuran database untuk perintah doctor.
+// Package obs mengumpulkan metrik runtime, procfs, cgroup, THP, SQLite, serta mengekspos Registry Prometheus.
 package obs
 
 import (
-	"bufio"
 	"os"
-	"runtime"
 	"strconv"
-	"strings"
 	"time"
 )
 
-// DoctorReport merangkum statistik kesehatan dan memori daemon.
+// DoctorReport merangkum statistik kesehatan dan memori daemon dalam format v1.
 type DoctorReport struct {
 	PID           int               `json:"pid"`
 	UptimeSec     int64             `json:"uptime_sec"`
@@ -30,32 +27,35 @@ type DoctorReport struct {
 	Env           map[string]string `json:"env"`
 }
 
-// Collect mengumpulkan metrik Go runtime, RSS OS (jika tersedia), dan ukuran file DB.
+// Collect mengumpulkan metrik Go runtime dari runtime/metrics (tanpa ReadMemStats), RSS OS, dan ukuran file DB.
 func Collect(startedAt time.Time, appDBPath, waDBPath string, outbox int, instCounts map[string]int) DoctorReport {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
+	rt := ReadRuntime()
 
-	var lastPause uint64
-	if ms.NumGC > 0 {
-		lastPause = ms.PauseNs[(ms.NumGC+255)%256]
+	var rss uint64
+	if pm, err := ReadProcStatus("/proc/self/status"); err == nil && pm.VmRSS > 0 {
+		rss = pm.VmRSS
+	} else {
+		// Fallback di OS non-Linux (mis. Windows dev): gunakan total bytes runtime
+		rss = rt.Total
 	}
 
-	rss := readLinuxRSS()
-	if rss == 0 {
-		// Fallback di OS non-Linux (mis. Windows dev): gunakan Sys dari runtime
-		rss = ms.Sys
+	gomax := os.Getenv("GOMAXPROCS")
+	if gomax == "" {
+		if n := ReadRuntimeMaxProcs(); n > 0 {
+			gomax = strconv.Itoa(n)
+		}
 	}
 
 	return DoctorReport{
 		PID:           os.Getpid(),
 		UptimeSec:     int64(time.Since(startedAt).Seconds()),
 		RSSBytes:      rss,
-		HeapAlloc:     ms.HeapAlloc,
-		HeapSys:       ms.HeapSys,
-		SysBytes:      ms.Sys,
-		Goroutines:    runtime.NumGoroutine(),
-		NumGC:         ms.NumGC,
-		LastGCPauseNs: lastPause,
+		HeapAlloc:     rt.HeapObjects,
+		HeapSys:       rt.Total,
+		SysBytes:      rt.Total,
+		Goroutines:    int(rt.Goroutines),
+		NumGC:         uint32(rt.GCCycles),
+		LastGCPauseNs: rt.GCPauseP99Ns,
 		AppDBBytes:    fileSize(appDBPath),
 		AppWALBytes:   fileSize(appDBPath + "-wal"),
 		WADBBytes:     fileSize(waDBPath),
@@ -63,42 +63,40 @@ func Collect(startedAt time.Time, appDBPath, waDBPath string, outbox int, instCo
 		OutboxPending: outbox,
 		InstanceCount: instCounts,
 		Env: map[string]string{
-			"GOMEMLIMIT": os.Getenv("GOMEMLIMIT"),
-			"GOGC":       os.Getenv("GOGC"),
-			"GOMAXPROCS": strconv.Itoa(runtime.GOMAXPROCS(0)),
+			"GOMEMLIMIT": formatMemoryLimitEnv(rt.MemoryLimit),
+			"GOGC":       formatGOGCEnv(rt.GOGC),
+			"GOMAXPROCS": gomax,
 		},
 	}
 }
 
-// readLinuxRSS membaca VmRSS dari /proc/self/status pada sistem Linux.
-func readLinuxRSS() uint64 {
-	f, err := os.Open("/proc/self/status")
-	if err != nil {
-		return 0
+func formatMemoryLimitEnv(limitBytes uint64) string {
+	if env := os.Getenv("GOMEMLIMIT"); env != "" {
+		return env
 	}
-	defer f.Close()
+	if limitBytes > 0 {
+		return strconv.FormatUint(limitBytes>>20, 10) + "MiB"
+	}
+	return ""
+}
 
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "VmRSS:") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			if kb, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-				return kb * 1024
-			}
-		}
+func formatGOGCEnv(gogc uint64) string {
+	if env := os.Getenv("GOGC"); env != "" {
+		return env
 	}
-	return 0
+	if gogc > 0 {
+		return strconv.FormatUint(gogc, 10)
+	}
+	return ""
 }
 
 func fileSize(p string) int64 {
+	if p == "" {
+		return 0
+	}
 	st, err := os.Stat(p)
 	if err != nil {
 		return 0
 	}
 	return st.Size()
 }
-

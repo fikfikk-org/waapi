@@ -36,6 +36,7 @@ func Execute(args []string) error {
 	rest := args[1:]
 
 	if cmd == "serve" {
+		daemon.SetVersion(Version)
 		return daemon.Run(ctx, cfg)
 	}
 	if cmd == "version" || cmd == "-v" || cmd == "--version" {
@@ -47,7 +48,9 @@ func Execute(args []string) error {
 
 	switch cmd {
 	case "status", "doctor":
-		return runDoctor(ctx, ctrl)
+		return runDoctor(ctx, ctrl, rest)
+	case "debug":
+		return runDebug(ctx, ctrl, rest)
 	case "list", "ls":
 		return runInstanceList(ctx, ctrl)
 	case "add", "create":
@@ -168,6 +171,8 @@ MANAJEMEN WEBHOOK:
 
 DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
+  waapi doctor --deep [--json]                 Cek anatomi memori penuh (procfs, cgroup, THP, SQLite)
+  waapi debug pprof <profil> [-o file]         Ambil profil pprof (heap|goroutine|goroutineleak|profile)
   waapi logs [<id>]                            Pantau log service systemd (journalctl)
   waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
   waapi update | waapi update:latest           Update ke versi terbaru (otomatis backup versi lama)

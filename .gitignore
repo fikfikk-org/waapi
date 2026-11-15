@@ -7,4 +7,5 @@ bin/
 *.sock
 .wa-api/
 tmp/
+bench/.bin/
 

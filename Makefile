@@ -29,9 +29,9 @@ test:
 test-race:
 	go test -v -race ./...
 
-# Pengukuran memori idle/aktif (diisi pada Batch 1)
+# Pengukuran memori idle ke JSON (memerlukan lingkungan Linux /proc)
 memprobe:
-	@echo "memprobe placeholder (diisi di Batch 1)"
+	bash scripts/memprobe.sh HEAD bench/memprobe-baseline.json
 
 # Bersihkan hasil kompilasi
 clean:

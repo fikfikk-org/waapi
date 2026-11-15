@@ -44,6 +44,14 @@ func NewManager(ctx context.Context, st *store.Store) (*Manager, error) {
 	return m, nil
 }
 
+// Store mengembalikan akses database metadata milik auth Manager.
+func (m *Manager) Store() *store.Store {
+	if m == nil {
+		return nil
+	}
+	return m.store
+}
+
 // Reload menyegarkan peta hash -> KeyMeta dari app.db.
 func (m *Manager) Reload(ctx context.Context) error {
 	keys, err := m.store.ListAPIKeys(ctx)

@@ -13,6 +13,7 @@
 | 404 | instance_not_found | Instance tidak ada |
 | 413 | media_too_large | Media melebihi batas |
 | 429 | queue_full | Antrian kirim penuh (ada `retry_after`) |
+| 503 | not_ready | Daemon tidak siap (DB gagal atau tekanan memori level `Red`) |
 | 503 | instance_not_connected | Instance belum/tidak tersambung |
 | 504 | send_timeout | WhatsApp tidak merespons |
 
@@ -27,6 +28,30 @@
 | Request Body | - |
 | Response | 200 `status: ok` |
 | Notes | Tidak membocorkan info instance |
+
+## GET /readyz
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /readyz |
+| Auth Required | No |
+| Headers | - |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{"status":"ready"}` · 503 `not_ready` |
+| Notes | Menguji `SELECT 1` ke `app.db` (timeout 500 ms) dan memastikan `governor.Source.Level() != Red`; error tidak memaparkan detail internal |
+
+## GET /metrics (Listener Terpisah Opsional)
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /metrics (pada `WAAPI_METRICS_ADDR`, mis. `127.0.0.1:9108`) |
+| Auth Required | No (listener terpisah; disarankan loopback) |
+| Headers | Accept: text/plain (opsional) |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `text/plain; version=0.0.4; charset=utf-8` berisi metrik berawalan `waapi_` |
+| Notes | Mati secara default bila `WAAPI_METRICS_ADDR` kosong; memicu log WARN saat start bila alamat bukan loopback; hanya melayani `/metrics` |
 
 ## GET /v1/instances
 
@@ -174,6 +199,8 @@
 
 Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.sock` (perm 0660).
 - `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`).
+- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
+- `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
 
 ## Scheduled Tasks
 

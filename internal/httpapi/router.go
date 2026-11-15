@@ -2,12 +2,15 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/fikfikk-org/waapi/internal/auth"
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
 
@@ -21,24 +24,57 @@ type RouteInfo struct {
 	Scope   auth.Scope
 }
 
+// ServerOption mengatur opsi dependensi opsional untuk Server HTTP publik.
+type ServerOption func(*Server)
+
+// WithDB menyetel koneksi app.db yang dipakai untuk pengecekan kesiapan /readyz.
+func WithDB(db *sql.DB) ServerOption {
+	return func(s *Server) {
+		s.appDB = db
+	}
+}
+
+// WithGovernor menyetel sumber level tekanan memori untuk pengecekan /readyz.
+func WithGovernor(src governor.Source) ServerOption {
+	return func(s *Server) {
+		if src != nil {
+			s.gov = src
+		}
+	}
+}
+
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
 type Server struct {
 	auth    *auth.Manager
 	wa      *wa.Manager
+	appDB   *sql.DB
+	gov     governor.Source
 	mux     *http.ServeMux
 	handler http.Handler
 	routes  []RouteInfo
 }
 
 // NewServer membangun Server HTTP publik dengan pencatatan scope per route.
-func NewServer(a *auth.Manager, w *wa.Manager) *Server {
+func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s := &Server{
 		auth: a,
 		wa:   w,
+		gov:  governor.AlwaysGreen,
 		mux:  http.NewServeMux(),
+	}
+	if a != nil && a.Store() != nil {
+		s.appDB = a.Store().DB
+	} else if w != nil && w.Store() != nil {
+		s.appDB = w.Store().DB
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
 	}
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 	s.handle("GET /v1/instances", auth.ScopeInstancesRead, s.withAuth(s.handleListInstances))
 	s.handle("GET /v1/instances/{id}", auth.ScopeInstancesRead, s.withInstanceAuth(s.handleGetInstance))
 	s.handle("POST /v1/instances/{id}/pair", auth.ScopePair, s.withInstanceAuth(s.handleStartPair))
@@ -55,9 +91,9 @@ func NewServer(a *auth.Manager, w *wa.Manager) *Server {
 	return s
 }
 
-// NewHandler membangun http.Handler untuk seluruh endpoint publik (/healthz dan /v1/*).
-func NewHandler(a *auth.Manager, w *wa.Manager) http.Handler {
-	return NewServer(a, w)
+// NewHandler membangun http.Handler untuk seluruh endpoint publik (/healthz, /readyz, dan /v1/*).
+func NewHandler(a *auth.Manager, w *wa.Manager, opts ...ServerOption) http.Handler {
+	return NewServer(a, w, opts...)
 }
 
 // ServeHTTP meneruskan permintaan HTTP ke router publik yang sudah dibungkus middleware.
@@ -80,6 +116,27 @@ func (s *Server) handle(pattern string, scope auth.Scope, h http.HandlerFunc) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleReadyz memverifikasi kesiapan database dan level governor tanpa autentikasi serta tanpa membocorkan detail error.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.gov != nil && s.gov.Level() == governor.Red {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "not_ready", 0)
+		return
+	}
+	if s.appDB == nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "not_ready", 0)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	var ok int
+	if err := s.appDB.QueryRowContext(ctx, "SELECT 1").Scan(&ok); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "not_ready", 0)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {

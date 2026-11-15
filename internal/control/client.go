@@ -80,6 +80,32 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, in, out any) e
 	return nil
 }
 
+// FetchToWriter mengunduh respons mentah (mis. pprof binary) dari control socket ke dst.
+func (c *Client) FetchToWriter(ctx context.Context, path string, dst io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control"+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("daemon tidak merespons di %s (pastikan service waapi sedang berjalan): %w", c.sock, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg := string(bytes.TrimSpace(body))
+		if msg == "" {
+			return fmt.Errorf("control error: HTTP %d", resp.StatusCode)
+		}
+		return fmt.Errorf("control error (HTTP %d): %s", resp.StatusCode, msg)
+	}
+	if _, err := io.Copy(dst, resp.Body); err != nil {
+		return fmt.Errorf("salin respons control: %w", err)
+	}
+	return nil
+}
+
 // OpenPairStream membuka koneksi streaming NDJSON untuk proses pairing instance.
 func (c *Client) OpenPairStream(ctx context.Context, id, phone string) (*http.Response, error) {
 	b, _ := json.Marshal(pairReq{Phone: phone})

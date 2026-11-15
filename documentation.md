@@ -90,4 +90,7 @@ flowchart TD
 | Admin | Hanya lewat terminal server (CLI), tidak ada panel web |
 | Kapasitas | 3–6 instance aktif per proses agar RAM di bawah 100 MB |
 | Upgrade skema v1 ke v2 | Backup `app.db` dan `wa.db` dibuat sekali ke folder `backups/pre-v2-*` sebelum migrasi dijalankan |
+| Kesiapan layanan (`/readyz`) | Daemon dianggap siap hanya bila `app.db` merespons dalam 500 ms dan level tekanan memori governor bukan `Red` |
+| Observabilitas memori | Pengukuran metrik memakai `runtime/metrics`, `procfs`, cgroup v2 PSI/stat, THP, dan `sqlite.DBStatus` tanpa memicu stop-the-world (`ReadMemStats`); profiling `pprof` hanya dibuka via `control.sock` |
+| Listener metrik Prometheus | Nonaktif secara default (0 goroutine tambahan); aktif hanya bila `WAAPI_METRICS_ADDR` diisi dan memberi peringatan log jika di-bind ke non-loopback |
 
