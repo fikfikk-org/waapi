@@ -108,6 +108,11 @@ func (c *Counter) setMonotonic(v float64) {
 	}
 }
 
+// Value mengembalikan nilai counter saat ini secara atomik tanpa alokasi.
+func (c *Counter) Value() float64 {
+	return c.load()
+}
+
 func (c *Counter) load() float64 {
 	return math.Float64frombits(c.bits.Load())
 }
@@ -629,6 +634,8 @@ var (
 	MetricSQLiteCacheUsedBytes = Default.NewGaugeVec("sqlite_cache_used_bytes", "Memori page cache SQLite yang digunakan per database dalam byte", "db")
 	// MetricInstances mencatat jumlah instance WhatsApp saat ini per status.
 	MetricInstances = Default.NewGaugeVec("instances", "Jumlah instance WhatsApp berdasarkan status", "status")
+	// MetricSupervisorEventsCoalescedTotal mencatat jumlah event non-kritis supervisor yang digabung saat channel penuh.
+	MetricSupervisorEventsCoalescedTotal = Default.NewCounter("supervisor_events_coalesced_total", "Total event non-kritis supervisor yang digabung saat channel penuh")
 )
 
 // RefreshDefaultMetrics memperbarui seluruh metrik bawaan pada Default tanpa memakai runtime.ReadMemStats.

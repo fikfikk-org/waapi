@@ -63,6 +63,8 @@ func Execute(args []string) error {
 		return runInstancePair(ctx, ctrl, rest)
 	case "restart":
 		return runInstanceRestart(ctx, ctrl, rest)
+	case "recycle":
+		return runInstanceRecycle(ctx, ctrl, rest)
 	case "stop":
 		return runInstanceStop(ctx, ctrl, rest)
 	case "logout":
@@ -155,6 +157,7 @@ PERINTAH UTAMA (INSTANCE):
   waapi edit <id> [opsi]                       Ubah rate limit / webhook / autostart instance
   waapi pair <id> [--phone 62812xxx]           Tautkan nomor via QR ASCII atau 8-digit kode
   waapi restart <id>                           Sambungkan ulang instance
+  waapi recycle <id>                           Segarkan penuh client & cache SQLite instance
   waapi stop <id>                              Hentikan koneksi instance dan matikan autostart
   waapi logout <id>                            Unlink perangkat dari WhatsApp
   waapi rm <id> [--yes]                        Logout dan hapus instance beserta datanya

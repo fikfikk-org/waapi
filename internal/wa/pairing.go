@@ -460,6 +460,8 @@ func (s *PairSession) run() {
 				if s.inst.mgr != nil && s.inst.mgr.store != nil {
 					_ = s.inst.mgr.store.UpdateInstanceStatus(context.Background(), s.inst.id, store.StatusConnected, jid)
 				}
+				// Alihkan kepemilikan client dari PairSession ke Supervisor tanpa ConnectContext ulang
+				s.inst.adoptAfterPairing()
 				s.update(func() {
 					s.state = PairConnected
 					s.jid = jid

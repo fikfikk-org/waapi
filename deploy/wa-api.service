@@ -5,7 +5,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+TimeoutStartSec=90
 User=waapi
 Group=waapi
 UMask=0007

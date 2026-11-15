@@ -62,8 +62,8 @@
 | Headers | X-API-Key |
 | Query Params | - |
 | Request Body | - |
-| Response | 200 array instance (id, status, jid, queue_depth, rate_per_min) |
-| Notes | Hanya instance sesuai scope key |
+| Response | 200 array instance (id, status, state, state_since, reconnect_attempts, next_retry_in, ban, jid, queue_depth, rate_per_min) |
+| Notes | Hanya instance sesuai scope key; tidak membuat instance runtime baru di memori |
 
 ## GET /v1/instances/{id}
 
@@ -74,7 +74,7 @@
 | Headers | X-API-Key |
 | Query Params | - |
 | Request Body | - |
-| Response | 200 id, status, jid, push_name, queue_depth, rate_per_min, settings, paired_at, connected_since · 403 · 404 |
+| Response | 200 id, status, state, state_since, reconnect_attempts, next_retry_in, ban, jid, push_name, queue_depth, rate_per_min, settings, paired_at, connected_since · 403 · 404 |
 | Notes | - |
 
 ## POST /v1/instances/{id}/pair
@@ -191,7 +191,7 @@
 |---|---|
 | Method + Endpoint | POST ke `webhook_url` instance |
 | Headers | X-WA-Event, X-WA-Instance, X-WA-Timestamp, X-WA-Signature (`sha256=` HMAC dari `timestamp.body`) |
-| Body | event, instance, timestamp, data (id, from, chat, is_group, push_name, type, text, media) |
+| Body | event, instance, timestamp, data (message/receipt/pairing atau connection aditif: status, state, prev_state, jid, reason, attempt, next_retry_in, circuit, ban) |
 | Event | message, receipt, connection, pairing |
 | Notes | Retry maks 8 kali dengan backoff; penerima wajib membalas 2xx dalam 10 detik dan menolak timestamp lebih dari 5 menit |
 
@@ -201,6 +201,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`).
 - `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
+- `POST /control/instances/{id}/recycle` menghentikan supervisor, melepas client lama, memuat ulang device `sqlstore`, dan menyalakan ulang supervisor (`waapi recycle <id>`). Ditolak HTTP 400 bila belum dipairing.
 
 ## Scheduled Tasks
 
@@ -211,4 +212,5 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Outbox poller | Tiap 5 detik | Kirim ulang webhook gagal | Hapus baris > 8 percobaan / > 24 jam |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
+| Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
 

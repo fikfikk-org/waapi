@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"regexp"
 	"sync"
 	"time"
@@ -97,7 +98,7 @@ func (m *Manager) WADB() *sql.DB {
 	return m.waDB
 }
 
-// AutoStartAll menyalakan instance dengan auto_start=true secara berurutan (jeda 2 detik) agar tidak memicu spike RAM.
+// AutoStartAll menyalakan instance dengan auto_start=true secara berurutan (stagger 2 s + jitter 0-1 s) agar tidak memicu spike RAM.
 func (m *Manager) AutoStartAll(ctx context.Context) {
 	rows, err := m.store.ListInstances(ctx)
 	if err != nil {
@@ -110,10 +111,13 @@ func (m *Manager) AutoStartAll(ctx context.Context) {
 			continue
 		}
 		if !first {
+			jitter := time.Duration(rand.IntN(1000)) * time.Millisecond
+			timer := time.NewTimer(2*time.Second + jitter)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-time.After(2 * time.Second):
+			case <-timer.C:
 			}
 		}
 		first = false
@@ -125,7 +129,7 @@ func (m *Manager) AutoStartAll(ctx context.Context) {
 		if err := inst.ConnectExisting(ctx); err != nil {
 			slog.Warn("auto-start instance gagal", "instance", row.ID, "err", err)
 		} else {
-			slog.Info("instance tersambung saat startup", "instance", row.ID, "jid", row.JID)
+			slog.Info("supervisor instance dimulai saat startup", "instance", row.ID, "jid", row.JID)
 		}
 	}
 }
@@ -186,24 +190,21 @@ func (m *Manager) Get(id string) (*Instance, bool) {
 	return inst, ok
 }
 
-// Status mengambil status gabungan (DB + runtime) untuk satu instance.
+// Status mengambil status gabungan (DB + runtime) untuk satu instance tanpa efek samping membuat instance (R17).
 func (m *Manager) Status(ctx context.Context, id string) (*InstanceStatus, error) {
+	inst, ok := m.Get(id)
+	if !ok {
+		return nil, store.ErrNotFound
+	}
 	meta, err := m.store.GetInstance(ctx, id)
 	if err != nil {
 		return nil, err
-	}
-	inst, ok := m.Get(id)
-	if !ok {
-		inst = newInstance(m, *meta)
-		m.mu.Lock()
-		m.instances[id] = inst
-		m.mu.Unlock()
 	}
 	snap := inst.Snapshot(*meta)
 	return &snap, nil
 }
 
-// ListStatuses mengembalikan daftar status seluruh instance.
+// ListStatuses mengembalikan daftar status seluruh instance tanpa membuat instance/goroutine baru (R17).
 func (m *Manager) ListStatuses(ctx context.Context) ([]InstanceStatus, error) {
 	rows, err := m.store.ListInstances(ctx)
 	if err != nil {
@@ -211,16 +212,32 @@ func (m *Manager) ListStatuses(ctx context.Context) ([]InstanceStatus, error) {
 	}
 	out := make([]InstanceStatus, 0, len(rows))
 	for _, row := range rows {
-		inst, ok := m.Get(row.ID)
-		if !ok {
-			inst = newInstance(m, row)
-			m.mu.Lock()
-			m.instances[row.ID] = inst
-			m.mu.Unlock()
+		if inst, ok := m.Get(row.ID); ok {
+			out = append(out, inst.Snapshot(row))
+			continue
 		}
-		out = append(out, inst.Snapshot(row))
+		out = append(out, snapshotFromMeta(row))
 	}
 	return out, nil
+}
+
+// Recycle menyegarkan penuh whatsmeow.Client dan cache sqlstore milik instance yang sudah tertaut.
+func (m *Manager) Recycle(ctx context.Context, id string) (*InstanceStatus, error) {
+	meta, err := m.store.GetInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	inst, ok := m.Get(id)
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if meta.JID == "" && inst.getJID() == "" {
+		return nil, errors.New("instance belum di-pair")
+	}
+	if err := inst.Recycle(ctx); err != nil {
+		return nil, err
+	}
+	return m.Status(ctx, id)
 }
 
 // Update memperbarui konfigurasi instance di DB dan menyinkronkan rate limiter di memori.

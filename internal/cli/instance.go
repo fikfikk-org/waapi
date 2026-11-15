@@ -40,6 +40,8 @@ func runInstanceSubcommand(ctx context.Context, ctrl *control.Client, args []str
 		return runInstancePair(ctx, ctrl, rest)
 	case "restart":
 		return runInstanceRestart(ctx, ctrl, rest)
+	case "recycle":
+		return runInstanceRecycle(ctx, ctrl, rest)
 	case "stop":
 		return runInstanceStop(ctx, ctrl, rest)
 	case "logout":
@@ -340,6 +342,22 @@ func runInstanceRestart(ctx context.Context, ctrl *control.Client, args []string
 	return nil
 }
 
+func runInstanceRecycle(ctx context.Context, ctrl *control.Client, args []string) error {
+	if len(args) == 0 {
+		return errors.New("penggunaan: waapi recycle <id>")
+	}
+	id := args[0]
+	reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	var st wa.InstanceStatus
+	if err := ctrl.DoJSON(reqCtx, http.MethodPost, "/control/instances/"+id+"/recycle", nil, &st); err != nil {
+		return err
+	}
+	fmt.Printf("✔ Instance %q di-recycle penuh (status: %s, state: %s)\n", st.ID, st.Status, st.State)
+	return nil
+}
+
 func runInstanceStop(ctx context.Context, ctrl *control.Client, args []string) error {
 	if len(args) == 0 {
 		return errors.New("penggunaan: waapi stop <id>")
@@ -412,8 +430,29 @@ func printInstanceDetail(st wa.InstanceStatus) {
 	if wh == "" {
 		wh = "-"
 	}
+	state := st.State
+	if state == "" {
+		state = "-"
+	}
 	fmt.Printf("ID              %s\n", st.ID)
 	fmt.Printf("Status          %s\n", st.Status)
+	fmt.Printf("State           %s\n", state)
+	if st.StateSince > 0 {
+		fmt.Printf("State Since     %s\n", formatTime(st.StateSince))
+	}
+	if st.ReconnectAttempts > 0 {
+		fmt.Printf("Reconnect       %d percobaan\n", st.ReconnectAttempts)
+	}
+	if st.NextRetryIn > 0 {
+		fmt.Printf("Next Retry      %ds\n", st.NextRetryIn)
+	}
+	if st.Ban != nil {
+		if st.Ban.ExpiresAt > 0 {
+			fmt.Printf("Ban             code %d (hingga %s)\n", st.Ban.Code, formatTime(st.Ban.ExpiresAt))
+		} else {
+			fmt.Printf("Ban             code %d\n", st.Ban.Code)
+		}
+	}
 	fmt.Printf("JID             %s\n", jid)
 	fmt.Printf("Push Name       %s\n", st.PushName)
 	fmt.Printf("Rate Limit      %d pesan/menit\n", st.RatePerMin)

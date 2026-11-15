@@ -21,6 +21,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/obs"
+	"github.com/fikfikk-org/waapi/internal/sdnotify"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
@@ -237,6 +238,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		}()
 	}
 
+	// Beri tahu systemd bahwa listener siap melayani lalu mulai watchdog bila aktif
+	if err := sdnotify.Ready(); err != nil {
+		slog.Warn("gagal mengirim sd_notify READY=1", "err", err)
+	}
+	if wdInterval, ok := sdnotify.WatchdogInterval(); ok {
+		go runWatchdogLoop(ctx, st.DB, wdInterval/2)
+	}
+
 	// Jalankan auto-start instance secara berurutan di latar belakang
 	go waMgr.AutoStartAll(ctx)
 
@@ -250,7 +259,13 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	select {
 	case <-ctx.Done():
 		slog.Info("menerima sinyal berhenti, memulai graceful shutdown...")
+		if err := sdnotify.Stopping(); err != nil {
+			slog.Warn("gagal mengirim sd_notify STOPPING=1", "err", err)
+		}
 	case err := <-errCh:
+		if err := sdnotify.Stopping(); err != nil {
+			slog.Warn("gagal mengirim sd_notify STOPPING=1", "err", err)
+		}
 		return err
 	}
 
@@ -268,6 +283,34 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	slog.Info("daemon waapi berhenti dengan bersih")
 	return nil
+}
+
+// runWatchdogLoop mengirim WATCHDOG=1 berkala hanya bila app.db merespons SELECT 1 dalam 500 ms.
+func runWatchdogLoop(ctx context.Context, db *sql.DB, interval time.Duration) {
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			qCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			var ok int
+			err := db.QueryRowContext(qCtx, "SELECT 1").Scan(&ok)
+			cancel()
+			if err != nil {
+				slog.Warn("watchdog melewati heartbeat karena SELECT 1 app.db gagal", "err", err)
+				continue
+			}
+			if err := sdnotify.Watchdog(); err != nil {
+				slog.Warn("gagal mengirim sd_notify WATCHDOG=1", "err", err)
+			}
+		}
+	}
 }
 
 // newMetricsHandler membangun HTTP handler terpisah yang hanya melayani /metrics.

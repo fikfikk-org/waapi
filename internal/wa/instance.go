@@ -25,18 +25,23 @@ var ErrInvalidRecipient = errors.New("nomor telepon atau JID tidak valid")
 
 // InstanceStatus adalah representasi status runtime + database sebuah instance.
 type InstanceStatus struct {
-	ID             string                 `json:"id"`
-	Status         string                 `json:"status"`
-	JID            string                 `json:"jid,omitempty"`
-	PushName       string                 `json:"push_name,omitempty"`
-	QueueDepth     int                    `json:"queue_depth"`
-	RatePerMin     int                    `json:"rate_per_min"`
-	WebhookURL     string                 `json:"webhook_url,omitempty"`
-	WebhookEvents  string                 `json:"webhook_events"`
-	AutoStart      bool                   `json:"auto_start"`
-	Settings       store.InstanceSettings `json:"settings"`
-	PairedAt       int64                  `json:"paired_at,omitempty"`
-	ConnectedSince int64                  `json:"connected_since,omitempty"`
+	ID                string                 `json:"id"`
+	Status            string                 `json:"status"`
+	State             string                 `json:"state"`
+	StateSince        int64                  `json:"state_since,omitempty"`
+	ReconnectAttempts int                    `json:"reconnect_attempts"`
+	NextRetryIn       int                    `json:"next_retry_in"`
+	Ban               *BanInfo               `json:"ban"`
+	JID               string                 `json:"jid,omitempty"`
+	PushName          string                 `json:"push_name,omitempty"`
+	QueueDepth        int                    `json:"queue_depth"`
+	RatePerMin        int                    `json:"rate_per_min"`
+	WebhookURL        string                 `json:"webhook_url,omitempty"`
+	WebhookEvents     string                 `json:"webhook_events"`
+	AutoStart         bool                   `json:"auto_start"`
+	Settings          store.InstanceSettings `json:"settings"`
+	PairedAt          int64                  `json:"paired_at,omitempty"`
+	ConnectedSince    int64                  `json:"connected_since,omitempty"`
 }
 
 // NumberCheckResult merangkum hasil pemeriksaan satu nomor pada WhatsApp.
@@ -52,7 +57,7 @@ type cachedCheck struct {
 	expiresAt time.Time
 }
 
-// Instance membungkus satu whatsmeow.Client beserta antrian kirim dan rate limiter-nya.
+// Instance membungkus satu whatsmeow.Client beserta antrian kirim, supervisor koneksi, dan rate limiter-nya.
 type Instance struct {
 	id     string
 	mgr    *Manager
@@ -60,6 +65,8 @@ type Instance struct {
 
 	mu             sync.RWMutex
 	client         *whatsmeow.Client
+	sup            *Supervisor
+	supCancel      context.CancelFunc
 	limiter        *rate.Limiter
 	ratePerMin     int
 	status         string
@@ -106,6 +113,18 @@ func (i *Instance) getClient() *whatsmeow.Client {
 	return i.client
 }
 
+func (i *Instance) getSupervisor() *Supervisor {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.sup
+}
+
+func (i *Instance) getJID() string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.jid
+}
+
 func (i *Instance) getLimiter() *rate.Limiter {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -130,6 +149,7 @@ func (i *Instance) IsConnected() bool {
 func (i *Instance) Snapshot(meta store.Instance) InstanceStatus {
 	i.mu.RLock()
 	cli := i.client
+	sup := i.sup
 	status := i.status
 	jid := i.jid
 	connSince := i.connectedSince
@@ -146,9 +166,11 @@ func (i *Instance) Snapshot(meta store.Instance) InstanceStatus {
 			jid = cli.Store.ID.String()
 		}
 	}
-	return InstanceStatus{
+
+	out := InstanceStatus{
 		ID:             i.id,
 		Status:         status,
+		State:          string(defaultConnStateForStatus(status)),
 		JID:            jid,
 		PushName:       pushName,
 		QueueDepth:     len(i.sendCh),
@@ -160,31 +182,119 @@ func (i *Instance) Snapshot(meta store.Instance) InstanceStatus {
 		PairedAt:       meta.PairedAt,
 		ConnectedSince: connSince,
 	}
+	if sup != nil {
+		applySupervisorSnapshot(&out, sup.State())
+	}
+	return out
 }
 
-// attachClient memasang whatsmeow.Client baru dan mendaftarkan event handler.
+func defaultConnStateForStatus(status string) ConnState {
+	switch status {
+	case store.StatusConnected:
+		return StateOnline
+	case store.StatusDisabled:
+		return StateStopped
+	case store.StatusLoggedOut:
+		return StateLoggedOut
+	default:
+		return StateIdle
+	}
+}
+
+func snapshotFromMeta(meta store.Instance) InstanceStatus {
+	return InstanceStatus{
+		ID:            meta.ID,
+		Status:        meta.Status,
+		State:         string(defaultConnStateForStatus(meta.Status)),
+		JID:           meta.JID,
+		RatePerMin:    meta.RatePerMin,
+		WebhookURL:    meta.WebhookURL,
+		WebhookEvents: meta.WebhookEvents,
+		AutoStart:     meta.AutoStart,
+		Settings:      meta.Settings,
+		PairedAt:      meta.PairedAt,
+	}
+}
+
+func applySupervisorSnapshot(out *InstanceStatus, st StateSnapshot) {
+	if st.State != "" {
+		out.State = string(st.State)
+	}
+	if !st.Since.IsZero() {
+		out.StateSince = st.Since.Unix()
+	}
+	out.ReconnectAttempts = st.Attempts
+	if !st.NextRetryAt.IsZero() {
+		sec := int(time.Until(st.NextRetryAt).Seconds())
+		if sec > 0 {
+			out.NextRetryIn = sec
+		}
+	}
+	if st.BanCode != 0 || !st.BanUntil.IsZero() {
+		ban := &BanInfo{Code: st.BanCode}
+		if !st.BanUntil.IsZero() {
+			ban.ExpiresAt = st.BanUntil.Unix()
+		}
+		out.Ban = ban
+	}
+}
+
+// attachClient memasang whatsmeow.Client baru, menggantikan auto-reconnect bawaan, dan menyiapkan Supervisor.
 func (i *Instance) attachClient(dev *waStore.Device) *whatsmeow.Client {
-	var clientLog waLog.Logger
-	if i.mgr != nil && i.mgr.waLog != nil {
-		clientLog = i.mgr.waLog.Sub(i.id)
-	} else {
+	var (
+		clientLog        waLog.Logger
+		userTimeout      = 45 * time.Second
+		keepaliveMaxFail = 75 * time.Second
+		emit             Emitter
+	)
+	if i.mgr != nil {
+		if i.mgr.waLog != nil {
+			clientLog = i.mgr.waLog.Sub(i.id)
+		}
+		if i.mgr.cfg != nil {
+			if i.mgr.cfg.TCPUserTimeout > 0 {
+				userTimeout = i.mgr.cfg.TCPUserTimeout
+			}
+			if i.mgr.cfg.KeepaliveMaxFail > 0 {
+				keepaliveMaxFail = i.mgr.cfg.KeepaliveMaxFail
+			}
+		}
+		if i.mgr.webhook != nil {
+			emit = newEmitterV1(i.mgr.webhook)
+		}
+	}
+	if clientLog == nil {
 		clientLog = logx.WALogger(slog.Default(), "wa", slog.LevelWarn).Sub(i.id)
 	}
+
+	i.stopSupervisor()
 
 	i.mu.Lock()
 	if i.client != nil {
 		i.client.Disconnect()
 	}
 	cli := whatsmeow.NewClient(dev, clientLog)
-	cli.EnableAutoReconnect = true
+	cli.EnableAutoReconnect = false  // Supervisor satu-satunya pemilik reconnect
+	cli.InitialAutoReconnect = false // kegagalan connect awal ditangani Supervisor
 	cli.ManualHistorySyncDownload = true
+	cli.SetWebsocketHTTPClient(newWebsocketHTTPClient(userTimeout))
 	cli.AddEventHandler(i.handleEvent)
+
+	sup := newSupervisor(i.id, &whatsmeowConnDriver{cli: cli}, emit, SupervisorConfig{
+		KeepAliveMaxFail: keepaliveMaxFail,
+	}, nil)
+	if i.jid != "" {
+		sup.setJID(i.jid)
+	}
+	sup.setOnChange(i.syncSupervisorState)
+
 	i.client = cli
+	i.sup = sup
 	i.mu.Unlock()
 	return cli
 }
 
-// ConnectExisting menyambungkan kembali instance yang sudah memiliki JID di wa.db.
+// ConnectExisting menyambungkan kembali instance yang sudah memiliki JID di wa.db melalui Supervisor.
 func (i *Instance) ConnectExisting(ctx context.Context) error {
 	i.mu.RLock()
 	rawJID := i.jid
@@ -202,13 +312,100 @@ func (i *Instance) ConnectExisting(ctx context.Context) error {
 	}
 	if dev == nil {
 		_ = i.mgr.store.ClearInstanceJID(ctx, i.id, store.StatusLoggedOut)
-		i.setStatus(store.StatusLoggedOut, "")
+		i.clearJIDAndStatus(store.StatusLoggedOut)
 		return errors.New("device tidak ditemukan di wa.db, silakan pair ulang")
 	}
-	cli := i.attachClient(dev)
-	if err := cli.Connect(); err != nil {
-		return fmt.Errorf("connect whatsapp: %w", err)
+	i.attachClient(dev)
+	i.startSupervisor()
+	return nil
+}
+
+func (i *Instance) startSupervisor() {
+	i.mu.Lock()
+	if i.supCancel != nil {
+		i.supCancel()
 	}
+	// Context hidup instance terpisah dari context HTTP sementara agar koneksi tidak terputus setelah respons kontrol
+	supCtx, supCancel := context.WithCancel(context.Background())
+	i.supCancel = supCancel
+	sup := i.sup
+	i.mu.Unlock()
+
+	if sup != nil {
+		sup.Start(supCtx)
+	}
+}
+
+func (i *Instance) stopSupervisor() {
+	i.mu.Lock()
+	sup := i.sup
+	cancel := i.supCancel
+	i.supCancel = nil
+	i.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if sup != nil {
+		sup.Stop()
+	}
+}
+
+func (i *Instance) adoptAfterPairing() {
+	i.mu.RLock()
+	sup := i.sup
+	jid := i.jid
+	i.mu.RUnlock()
+	if sup != nil {
+		if jid != "" {
+			sup.setJID(jid)
+		}
+		sup.Adopt()
+	}
+}
+
+func (i *Instance) isPairingActive() bool {
+	i.pairMu.Lock()
+	sess := i.pairing
+	i.pairMu.Unlock()
+	return sess != nil && sess.Active()
+}
+
+// Recycle menghentikan supervisor, melepas client lama, memuat ulang device dari wa.db, dan menyalakan ulang supervisor.
+func (i *Instance) Recycle(ctx context.Context) error {
+	if i.isPairingActive() {
+		return ErrPairingInProgress
+	}
+	rawJID := i.getJID()
+	if rawJID == "" {
+		return errors.New("instance belum di-pair (JID kosong)")
+	}
+	parsed, err := types.ParseJID(rawJID)
+	if err != nil {
+		return fmt.Errorf("parse JID %s: %w", rawJID, err)
+	}
+
+	i.stopSupervisor()
+	i.mu.Lock()
+	cli := i.client
+	i.client = nil
+	i.connectedSince = 0
+	i.mu.Unlock()
+	if cli != nil {
+		cli.Disconnect()
+	}
+
+	dev, err := i.mgr.container.GetDevice(ctx, parsed)
+	if err != nil {
+		return fmt.Errorf("ambil device baru dari wa.db: %w", err)
+	}
+	if dev == nil {
+		_ = i.mgr.store.ClearInstanceJID(ctx, i.id, store.StatusLoggedOut)
+		i.clearJIDAndStatus(store.StatusLoggedOut)
+		return errors.New("device tidak ditemukan di wa.db, silakan pair ulang")
+	}
+	i.attachClient(dev)
+	i.startSupervisor()
 	return nil
 }
 
@@ -320,8 +517,9 @@ func (i *Instance) restoreStatusAfterAbort(ctx context.Context) {
 	}
 }
 
-// Disconnect memutus koneksi WebSocket tanpa menghapus sesi kriptografi.
+// Disconnect memutus koneksi WebSocket dan menghentikan supervisor tanpa menghapus sesi kriptografi.
 func (i *Instance) Disconnect() {
+	i.stopSupervisor()
 	i.mu.Lock()
 	cli := i.client
 	i.connectedSince = 0
@@ -331,7 +529,7 @@ func (i *Instance) Disconnect() {
 	}
 }
 
-// Close menghentikan sesi pairing, goroutine pengirim, dan koneksi WhatsApp.
+// Close menghentikan sesi pairing, supervisor, goroutine pengirim, dan koneksi WhatsApp.
 func (i *Instance) Close() {
 	i.pairMu.Lock()
 	sess := i.pairing
@@ -340,15 +538,23 @@ func (i *Instance) Close() {
 		sess.Cancel()
 		<-sess.done
 	}
+	i.stopSupervisor()
 	if i.cancel != nil {
 		i.cancel()
 	}
-	i.Disconnect()
+	i.mu.Lock()
+	cli := i.client
+	i.connectedSince = 0
+	i.mu.Unlock()
+	if cli != nil {
+		cli.Disconnect()
+	}
 }
 
 // Logout melepas tautan perangkat dari WhatsApp dan menghapus device dari wa.db.
 func (i *Instance) Logout(ctx context.Context) error {
 	_, _ = i.CancelPairing()
+	i.stopSupervisor()
 	cli := i.getClient()
 	if cli != nil {
 		if err := cli.Logout(ctx); err != nil {
@@ -358,8 +564,11 @@ func (i *Instance) Logout(ctx context.Context) error {
 			}
 		}
 	}
-	i.setStatus(store.StatusLoggedOut, "")
-	return i.mgr.store.ClearInstanceJID(ctx, i.id, store.StatusLoggedOut)
+	i.clearJIDAndStatus(store.StatusLoggedOut)
+	if i.mgr != nil && i.mgr.store != nil {
+		return i.mgr.store.ClearInstanceJID(ctx, i.id, store.StatusLoggedOut)
+	}
+	return nil
 }
 
 // CheckNumbers memeriksa daftar nomor (maks 20) dengan cache TTL 24 jam.
@@ -430,7 +639,7 @@ func (i *Instance) CheckNumbers(ctx context.Context, numbers []string) ([]Number
 	return results, nil
 }
 
-// handleEvent menangani event dari whatsmeow secara non-blocking.
+// handleEvent menangani event dari whatsmeow secara non-blocking dan merutekan event koneksi ke Supervisor.
 func (i *Instance) handleEvent(rawEvt any) {
 	switch evt := rawEvt.(type) {
 	case *events.Connected:
@@ -438,45 +647,116 @@ func (i *Instance) handleEvent(rawEvt any) {
 		if cli := i.getClient(); cli != nil && cli.Store != nil && cli.Store.ID != nil {
 			jid = cli.Store.ID.String()
 		}
-		i.setStatus(store.StatusConnected, jid)
-		_ = i.mgr.store.UpdateInstanceStatus(context.Background(), i.id, store.StatusConnected, jid)
-		i.mgr.webhook.Enqueue(i.id, "connection", map[string]any{
-			"status": store.StatusConnected,
-			"jid":    jid,
-		})
-	case *events.Disconnected:
-		i.setStatus(store.StatusDisconnected, "")
-		_ = i.mgr.store.UpdateInstanceStatus(context.Background(), i.id, store.StatusDisconnected, "")
-		i.mgr.webhook.Enqueue(i.id, "connection", map[string]any{
-			"status": store.StatusDisconnected,
-		})
-	case *events.LoggedOut:
-		slog.Warn("instance logged out dari perangkat utama", "instance", i.id, "reason", evt.Reason.String())
-		i.setStatus(store.StatusLoggedOut, "")
-		_ = i.mgr.store.ClearInstanceJID(context.Background(), i.id, store.StatusLoggedOut)
-		i.mgr.webhook.Enqueue(i.id, "connection", map[string]any{
-			"status": store.StatusLoggedOut,
-			"reason": evt.Reason.String(),
-		})
+		if sup := i.getSupervisor(); sup != nil {
+			if jid != "" {
+				sup.setJID(jid)
+			}
+			sup.OnEvent(evt)
+		}
+	case *events.Disconnected,
+		*events.LoggedOut,
+		*events.StreamReplaced,
+		*events.TemporaryBan,
+		*events.ClientOutdated,
+		*events.ConnectFailure,
+		*events.KeepAliveTimeout,
+		*events.KeepAliveRestored:
+		if sup := i.getSupervisor(); sup != nil {
+			sup.OnEvent(evt)
+		}
 	case *events.Message:
 		if p := extractMessage(evt); p != nil {
-			i.mgr.webhook.Enqueue(i.id, "message", p)
+			if i.mgr != nil && i.mgr.webhook != nil {
+				i.mgr.webhook.Enqueue(i.id, "message", p)
+			}
 		}
 	case *events.Receipt:
 		ids := make([]string, len(evt.MessageIDs))
 		for idx, id := range evt.MessageIDs {
 			ids[idx] = string(id)
 		}
-		i.mgr.webhook.Enqueue(i.id, "receipt", ReceiptPayload{
-			MessageIDs: ids,
-			Chat:       evt.Chat.ToNonAD().String(),
-			Sender:     evt.Sender.ToNonAD().String(),
-			Type:       string(evt.Type),
-			Timestamp:  evt.Timestamp.Unix(),
-		})
+		if i.mgr != nil && i.mgr.webhook != nil {
+			i.mgr.webhook.Enqueue(i.id, "receipt", ReceiptPayload{
+				MessageIDs: ids,
+				Chat:       evt.Chat.ToNonAD().String(),
+				Sender:     evt.Sender.ToNonAD().String(),
+				Type:       string(evt.Type),
+				Timestamp:  evt.Timestamp.Unix(),
+			})
+		}
 	case *events.HistorySync:
 		// Drop seluruh history sync agar tidak memakan RAM maupun disk
 	}
+}
+
+func (i *Instance) syncSupervisorState(snap StateSnapshot) {
+	var nextV1 string
+	var jid string
+	var clearJID bool
+
+	switch snap.State {
+	case StateOnline:
+		nextV1 = store.StatusConnected
+		if cli := i.getClient(); cli != nil && cli.Store != nil && cli.Store.ID != nil {
+			jid = cli.Store.ID.String()
+		}
+		if jid == "" {
+			jid = i.getJID()
+		}
+	case StateLoggedOut, StateBanned:
+		nextV1 = store.StatusLoggedOut
+		clearJID = true
+	case StateStopped:
+		i.mu.Lock()
+		i.connectedSince = 0
+		i.mu.Unlock()
+		return
+	case StateIdle:
+		return
+	default:
+		nextV1 = store.StatusDisconnected
+	}
+
+	i.mu.Lock()
+	prevV1 := i.status
+	changed := prevV1 != nextV1 || (jid != "" && i.jid != jid) || (clearJID && i.jid != "")
+	if clearJID {
+		i.status = store.StatusLoggedOut
+		i.jid = ""
+		i.connectedSince = 0
+	} else {
+		i.status = nextV1
+		if jid != "" {
+			i.jid = jid
+		}
+		if nextV1 == store.StatusConnected {
+			if i.connectedSince == 0 {
+				i.connectedSince = time.Now().Unix()
+			}
+		} else {
+			i.connectedSince = 0
+		}
+	}
+	i.mu.Unlock()
+
+	if !changed || i.mgr == nil || i.mgr.store == nil {
+		return
+	}
+	dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if clearJID {
+		_ = i.mgr.store.ClearInstanceJID(dbCtx, i.id, store.StatusLoggedOut)
+	} else {
+		_ = i.mgr.store.UpdateInstanceStatus(dbCtx, i.id, nextV1, jid)
+	}
+}
+
+func (i *Instance) clearJIDAndStatus(status string) {
+	i.mu.Lock()
+	i.status = status
+	i.jid = ""
+	i.connectedSince = 0
+	i.mu.Unlock()
 }
 
 func (i *Instance) setStatus(status, jid string) {

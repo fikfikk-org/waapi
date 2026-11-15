@@ -7,7 +7,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
 
-// handleListInstances mengembalikan daftar instance sesuai scope API key.
+// handleListInstances mengembalikan daftar instance beserta field aditif state supervisor sesuai scope API key.
 func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	meta := r.Context().Value(keyMetaCtx).(*auth.KeyMeta)
 	all, err := s.wa.ListStatuses(r.Context())
@@ -24,7 +24,7 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"instances": filtered})
 }
 
-// handleGetInstance mengembalikan status detail satu instance.
+// handleGetInstance mengembalikan status detail satu instance beserta field aditif state, state_since, reconnect_attempts, next_retry_in, dan ban.
 func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request, _ *wa.Instance) {
 	id := r.PathValue("id")
 	st, err := s.wa.Status(r.Context(), id)

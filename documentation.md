@@ -18,6 +18,25 @@ flowchart TD
         CN -->|"instance stop"| DS["disabled"]
         DS -->|"instance restart"| CN
     end
+    subgraph Supervisor
+        SI["idle"] -->|"Start()"| SC["connecting"]
+        PA["PairSession sukses"] -->|"Adopt()"| SO["online"]
+        SC -->|"events.Connected / AlreadyConnected"| SO
+        SC -->|"gagal / ConnectTimeout 30s"| SB["backoff"]
+        SO -->|"KeepAliveTimeout &lt; KeepAliveMaxFail"| SD["degraded"]
+        SD -->|"KeepAliveRestored"| SO
+        SD -->|"KeepAliveTimeout &gt;= KeepAliveMaxFail"| SB
+        SO -->|"events.Disconnected"| SB
+        SB -->|"timer backoff (+ circuit 15m &gt;= 10x)"| SC
+        SO -->|"TemporaryBan"| SBT["banned_temp"]
+        SBT -->|"Expire + jitter 30-120s"| SC
+        SO -->|"StreamReplaced"| SR["replaced"]
+        SO -->|"LoggedOut reason lain"| SLO["logged_out"]
+        SO -->|"LoggedOut 406"| SBN["banned"]
+        SO -->|"ClientOutdated"| SOUT["outdated"]
+        SC -->|"Stop()"| SST["stopped"]
+        SB -->|"Stop()"| SST
+    end
     subgraph ApiKey
         KA["active"] -->|"key revoke"| KR["revoked"]
     end
@@ -93,4 +112,6 @@ flowchart TD
 | Kesiapan layanan (`/readyz`) | Daemon dianggap siap hanya bila `app.db` merespons dalam 500 ms dan level tekanan memori governor bukan `Red` |
 | Observabilitas memori | Pengukuran metrik memakai `runtime/metrics`, `procfs`, cgroup v2 PSI/stat, THP, dan `sqlite.DBStatus` tanpa memicu stop-the-world (`ReadMemStats`); profiling `pprof` hanya dibuka via `control.sock` |
 | Listener metrik Prometheus | Nonaktif secara default (0 goroutine tambahan); aktif hanya bila `WAAPI_METRICS_ADDR` diisi dan memberi peringatan log jika di-bind ke non-loopback |
+| Supervisor koneksi self-healing | Satu goroutine supervisor per instance aktif pemilik tunggal reconnect (`EnableAutoReconnect=false`, `InitialAutoReconnect=false`), backoff equal jitter + circuit breaker setelah 10 kegagalan beruntun, deteksi socket mati via keepalive (`WAAPI_KEEPALIVE_MAX_FAIL` 75s) & `TCP_USER_TIMEOUT` (`WAAPI_TCP_USER_TIMEOUT` 45s), `AutoStartAll` berjeda 2s + jitter 0-1s, serta `Status`/`ListStatuses` murni read-only tanpa membuat instance |
+| Recycle instance & systemd watchdog | Operator dapat menyegarkan penuh client dan cache `sqlstore` instance terpasang via `waapi recycle <id>`; daemon mengirim `READY=1`, `WATCHDOG=1` berkala bila `SELECT 1 app.db <= 500ms`, dan `STOPPING=1` ke systemd |
 

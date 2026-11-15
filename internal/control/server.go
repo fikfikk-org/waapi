@@ -81,6 +81,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /control/instances/{id}", s.handleUpdateInstance)
 	mux.HandleFunc("POST /control/instances/{id}/pair", s.handlePairInstance)
 	mux.HandleFunc("POST /control/instances/{id}/restart", s.handleRestartInstance)
+	mux.HandleFunc("POST /control/instances/{id}/recycle", s.handleRecycleInstance)
 	mux.HandleFunc("POST /control/instances/{id}/stop", s.handleStopInstance)
 	mux.HandleFunc("POST /control/instances/{id}/logout", s.handleLogoutInstance)
 	mux.HandleFunc("DELETE /control/instances/{id}", s.handleDeleteInstance)
@@ -260,6 +261,15 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRestartInstance(w http.ResponseWriter, r *http.Request) {
 	st, err := s.wa.Restart(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleRecycleInstance(w http.ResponseWriter, r *http.Request) {
+	st, err := s.wa.Recycle(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeStatusErr(w, err)
 		return
