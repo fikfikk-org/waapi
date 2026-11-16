@@ -54,8 +54,21 @@ func writeErrorDetails(w http.ResponseWriter, status int, code, msg string, retr
 	})
 }
 
+type httpStructuredError interface {
+	error
+	HTTPStatus() int
+	ErrorCode() string
+	ErrorRetryAfter() int
+	ErrorDetails() map[string]any
+}
+
 // writeMappedError memetakan sentinel error domain ke kode status HTTP yang sesuai.
 func writeMappedError(w http.ResponseWriter, err error) {
+	var se httpStructuredError
+	if errors.As(err, &se) {
+		writeErrorDetails(w, se.HTTPStatus(), se.ErrorCode(), se.Error(), se.ErrorRetryAfter(), se.ErrorDetails())
+		return
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "instance_not_found", "instance tidak ditemukan", 0)

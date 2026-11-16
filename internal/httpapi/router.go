@@ -136,6 +136,39 @@ type chatTransport interface {
 	SubscribePresence(ctx context.Context, instanceID string, target types.JID) error
 }
 
+type groupTransport interface {
+	ListGroups(ctx context.Context, instanceID string) ([]wa.GroupSummary, error)
+	CreateGroup(ctx context.Context, instanceID string, req wa.CreateGroupRequest) (wa.GroupDetail, error)
+	GetGroup(ctx context.Context, instanceID string, groupJID types.JID) (wa.GroupDetail, error)
+	PatchGroup(ctx context.Context, instanceID string, groupJID types.JID, req wa.PatchGroupRequest) (wa.GroupDetail, error)
+	UpdateGroupParticipants(ctx context.Context, instanceID string, groupJID types.JID, req wa.UpdateParticipantsRequest) ([]wa.ParticipantResult, error)
+	GetGroupInviteLink(ctx context.Context, instanceID string, groupJID types.JID, reset bool) (string, error)
+	JoinGroup(ctx context.Context, instanceID string, codeOrLink string) (types.JID, error)
+	LeaveGroup(ctx context.Context, instanceID string, groupJID types.JID) error
+	ListGroupRequests(ctx context.Context, instanceID string, groupJID types.JID) ([]wa.GroupJoinRequestItem, error)
+	HandleGroupRequests(ctx context.Context, instanceID string, groupJID types.JID, req wa.GroupRequestsAction) ([]wa.ParticipantResult, error)
+}
+
+type contactTransport interface {
+	GetContactProfile(ctx context.Context, instanceID, jid string) (wa.ContactProfile, error)
+}
+
+func withGroupDriver(drv groupTransport) ServerOption {
+	return func(s *Server) {
+		if drv != nil {
+			s.groupDriver = drv
+		}
+	}
+}
+
+func withContactDriver(drv contactTransport) ServerOption {
+	return func(s *Server) {
+		if drv != nil {
+			s.contactDriver = drv
+		}
+	}
+}
+
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
 type Server struct {
 	auth          *auth.Manager
@@ -149,6 +182,8 @@ type Server struct {
 	mediaDriver   mediaTransport
 	pollStore     *wa.PollStore
 	chatDriver    chatTransport
+	groupDriver   groupTransport
+	contactDriver contactTransport
 	gov           governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -191,6 +226,12 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	if s.chatDriver == nil && w != nil {
 		s.chatDriver = w
 	}
+	if s.groupDriver == nil && w != nil {
+		s.groupDriver = w
+	}
+	if s.contactDriver == nil && w != nil {
+		s.contactDriver = w
+	}
 	if s.sseMax <= 0 {
 		if envMax := strings.TrimSpace(os.Getenv("WAAPI_SSE_MAX")); envMax != "" {
 			if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
@@ -229,6 +270,17 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("POST /v2/instances/{id}/presence", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2Presence))
 	s.handle("POST /v2/instances/{id}/presence/subscribe", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2SubscribePresence))
 	s.handle("GET /v2/instances/{id}/polls/{wa_id}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetPollTally))
+	s.handle("GET /v2/instances/{id}/groups", auth.ScopeGroupsRead, s.withInstanceAuth(s.handleV2ListGroups))
+	s.handle("POST /v2/instances/{id}/groups", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2CreateGroup))
+	s.handle("GET /v2/instances/{id}/groups/{jid}", auth.ScopeGroupsRead, s.withInstanceAuth(s.handleV2GetGroup))
+	s.handle("PATCH /v2/instances/{id}/groups/{jid}", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2PatchGroup))
+	s.handle("POST /v2/instances/{id}/groups/{jid}/participants", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2GroupParticipants))
+	s.handle("GET /v2/instances/{id}/groups/{jid}/invite-link", auth.ScopeGroupsRead, s.withInstanceAuth(s.handleV2GroupInviteLink))
+	s.handle("POST /v2/instances/{id}/groups/join", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2JoinGroup))
+	s.handle("POST /v2/instances/{id}/groups/{jid}/leave", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2LeaveGroup))
+	s.handle("GET /v2/instances/{id}/groups/{jid}/requests", auth.ScopeGroupsRead, s.withInstanceAuth(s.handleV2ListGroupRequests))
+	s.handle("POST /v2/instances/{id}/groups/{jid}/requests", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2HandleGroupRequests))
+	s.handle("GET /v2/instances/{id}/contacts/{jid}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetContactProfile))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

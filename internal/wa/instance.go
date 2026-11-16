@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 )
 
@@ -54,12 +56,6 @@ type NumberCheckResult struct {
 	JID    string `json:"jid,omitempty"`
 }
 
-type cachedCheck struct {
-	exists    bool
-	jid       string
-	expiresAt time.Time
-}
-
 // Instance membungkus satu whatsmeow.Client beserta supervisor koneksi dan rate limiter-nya.
 type Instance struct {
 	id      string
@@ -80,8 +76,14 @@ type Instance struct {
 
 	offline atomic.Bool
 
-	checkMu    sync.Mutex
-	checkCache map[string]cachedCheck
+	checkLRU     *LRU[string, NumberCheckResult]
+	checkGroup   singleflight.Group
+	contactLRU   *LRU[string, ContactProfile]
+	contactGroup singleflight.Group
+	calls        *callRejectHandler
+	callCli      callClient
+	groupCli     groupClient
+	contactCli   contactClient
 
 	pairMu        sync.Mutex
 	pairing       *PairSession
@@ -107,7 +109,9 @@ func newInstance(m *Manager, meta store.Instance) *Instance {
 		jid:        meta.JID,
 		settings:   settings,
 		cancel:     cancel,
-		checkCache: make(map[string]cachedCheck),
+		checkLRU:   NewLRU[string, NumberCheckResult](checkNumbersCacheCap, checkNumbersCacheTTL),
+		contactLRU: NewLRU[string, ContactProfile](contactProfileCacheCap, contactProfileCacheTTL),
+		calls:      newCallRejectHandler(),
 	}
 	return inst
 }
@@ -667,69 +671,95 @@ func (i *Instance) Logout(ctx context.Context) error {
 	return nil
 }
 
-// CheckNumbers memeriksa daftar nomor (maks 20) dengan cache TTL 24 jam.
+// CheckNumbers memeriksa daftar nomor (maks 20) dengan LRU 2048 entri TTL 24 jam dan singleflight per batch uncached terurut.
 func (i *Instance) CheckNumbers(ctx context.Context, numbers []string) ([]NumberCheckResult, error) {
 	if len(numbers) == 0 || len(numbers) > 20 {
-		return nil, errors.New("jumlah nomor harus antara 1 sampai 20")
-	}
-	cli := i.getClient()
-	if cli == nil || !cli.IsConnected() {
-		return nil, ErrNotConnected
+		return nil, NewGroupError(400, "invalid_request", "jumlah nomor harus antara 1 sampai 20", 0)
 	}
 
-	now := time.Now()
+	cache := i.ensureCheckLRU()
 	results := make([]NumberCheckResult, len(numbers))
-	var toQuery []string
-	var queryIdx []int
+	missSet := make(map[string]struct{})
+	missIndices := make(map[string][]int)
 
-	i.checkMu.Lock()
 	for idx, raw := range numbers {
 		clean := jid.DigitsOnly(raw)
 		if len(clean) < 7 || len(clean) > 16 {
-			i.checkMu.Unlock()
-			return nil, fmt.Errorf("nomor tidak valid: %s", raw)
+			return nil, fmt.Errorf("%w: %s", ErrInvalidRecipient, raw)
 		}
 		results[idx].Number = clean
-		if c, ok := i.checkCache[clean]; ok && now.Before(c.expiresAt) {
-			results[idx].Exists = c.exists
-			results[idx].JID = c.jid
+		if c, ok := cache.Get(clean); ok {
+			results[idx].Exists = c.Exists
+			results[idx].JID = c.JID
 			continue
 		}
-		toQuery = append(toQuery, "+"+clean)
-		queryIdx = append(queryIdx, idx)
+		missSet[clean] = struct{}{}
+		missIndices[clean] = append(missIndices[clean], idx)
 	}
-	i.checkMu.Unlock()
 
-	if len(toQuery) > 0 {
-		resp, err := cli.IsOnWhatsApp(ctx, toQuery)
+	if len(missSet) > 0 {
+		cli, err := i.activeContactClient()
 		if err != nil {
-			return nil, fmt.Errorf("periksa nomor ke WhatsApp: %w", err)
-		}
-		byPhone := make(map[string]types.IsOnWhatsAppResponse, len(resp))
-		for _, item := range resp {
-			byPhone[jid.DigitsOnly(item.Query)] = item
+			return nil, err
 		}
 
-		i.checkMu.Lock()
-		// Jaga batas cache maksimal 1024 entri agar memori tetap terkendali
-		if len(i.checkCache) > 1024 {
-			i.checkCache = make(map[string]cachedCheck)
+		uncached := make([]string, 0, len(missSet))
+		for clean := range missSet {
+			uncached = append(uncached, clean)
 		}
-		for _, idx := range queryIdx {
-			num := results[idx].Number
-			if item, ok := byPhone[num]; ok {
-				results[idx].Exists = item.IsIn
-				if item.IsIn {
-					results[idx].JID = item.JID.ToNonAD().String()
+		slices.Sort(uncached)
+
+		sfKey := strings.Join(uncached, ",")
+		phones := make([]string, len(uncached))
+		for idx, clean := range uncached {
+			phones[idx] = "+" + clean
+		}
+
+		ch := i.checkGroup.DoChan(sfKey, func() (any, error) {
+			sfCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+
+			resp, err := cli.IsOnWhatsApp(sfCtx, phones)
+			if err != nil {
+				return nil, fmt.Errorf("periksa nomor ke WhatsApp: %w", err)
+			}
+
+			byPhone := make(map[string]types.IsOnWhatsAppResponse, len(resp))
+			for _, item := range resp {
+				byPhone[jid.DigitsOnly(item.Query)] = item
+			}
+
+			resolved := make(map[string]NumberCheckResult, len(uncached))
+			for _, num := range uncached {
+				res := NumberCheckResult{Number: num}
+				if item, ok := byPhone[num]; ok {
+					res.Exists = item.IsIn
+					if item.IsIn {
+						res.JID = item.JID.ToNonAD().String()
+					}
 				}
-				i.checkCache[num] = cachedCheck{
-					exists:    results[idx].Exists,
-					jid:       results[idx].JID,
-					expiresAt: now.Add(24 * time.Hour),
+				cache.Set(num, res)
+				resolved[num] = res
+			}
+			return resolved, nil
+		})
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-ch:
+			if res.Err != nil {
+				return nil, res.Err
+			}
+			resolved := res.Val.(map[string]NumberCheckResult)
+			for num, idxs := range missIndices {
+				item := resolved[num]
+				for _, idx := range idxs {
+					results[idx].Exists = item.Exists
+					results[idx].JID = item.JID
 				}
 			}
 		}
-		i.checkMu.Unlock()
 	}
 
 	return results, nil
@@ -866,6 +896,17 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 		return false
 	}
 	ev.Seq = res.Seq
+
+	// Invalidasi ringkasan grup jika ada perubahan metadata/keanggotaan dari server.
+	switch evt := rawEvt.(type) {
+	case *events.GroupInfo, *events.JoinedGroup:
+		if i.mgr != nil {
+			i.mgr.invalidateGroupListCache(i.id)
+		}
+	case *events.CallOffer:
+		// Jalankan RejectCall dan pesan penolakan asinkron di luar hot path handler.
+		i.triggerCallAutoReject(evt, nc.Offline)
+	}
 	return true
 }
 

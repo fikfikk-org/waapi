@@ -72,6 +72,12 @@ flowchart TD
         PL2 -->|"PollUpdateMessage -> DecryptPollVote + SHA-256"| PL3["poll_votes di-upsert + event poll_vote"]
         PL3 -->|"pemilih ubah pilihan / unvote []"| PL3
     end
+    subgraph CallAutoReject
+        CA1["CallOffer masuk"] -->|"hot path journal"| CA2["event call action=offer"]
+        CA1 -->|"auto_reject_calls=true & 1:1 & !offline"| CA3["goroutine RejectCall"]
+        CA3 -->|"sukses"| CA4["event call action=rejected"]
+        CA4 -->|"call_reject_message terisi & lolos LRU 6 jam"| CA5["enqueue pesan outbox (origin=system)"]
+    end
 ```
 
 ## Aturan per Entitas
@@ -175,6 +181,28 @@ flowchart TD
 |---|---|---|
 | `presSubs` | Set target JID di RAM, maksimal `100` JID per instance | Duplikat bersifat idempoten; JID ke-101 ditolak; otomatis di-subscribe ulang saat supervisor kembali `online` |
 
+### Grup, Ringkasan & Permintaan Masuk
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `groupListLRU` | Cache LRU berkapasitas `128` entri dengan TTL `60` detik | Menyimpan hanya ringkasan grup (`jid`, `name`, `size`, `is_admin`, `announce`, `locked`, `created_at`), tidak pernah menyimpan daftar peserta penuh |
+| Pembuatan & mutasi grup | Nama grup `1..25` karakter; peserta create `0..50`; mutasi peserta/requests `1..50` | Divalidasi di memori sebelum `GroupGovernor` atau server WhatsApp; detail grup dibatasi maksimal `1024` peserta dengan penanda `participants_truncated` bila berlebih |
+| Patch grup berurutan | Urutan tetap: `name`, `description`, `announce`, `locked`, `join_approval` | Payload `{}` ditolak; bila gagal di tengah urutan, error menyertakan `details.applied` berisi daftar field yang sudah terlanjur diterapkan |
+
+### Kontak & Pemeriksaan Nomor (`LRU` + `singleflight`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `checkLRU` | Kapasitas maksimal `2048` entri per instance, TTL `24` jam | Permintaan konkuren atas daftar nomor yang belum ter-cache disatukan lewat `singleflight` memakai kunci batch terurut |
+| `contactLRU` | Kapasitas maksimal `256` entri per instance, TTL `1` jam | Input `@lid` diresolusi ke PN lebih dulu lewat `Store.LIDs` sebelum `GetUserInfo`; foto profil yang tersembunyi/kosong (401/404) tetap mengembalikan `picture: null` |
+
+### Auto-Reject Panggilan (`callRejectHandler`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `replyLRU` | Kapasitas maksimal `1024` kunci penelepon, TTL `6` jam | Memakai JID kanonik PN (resolusi `CallCreatorAlt` / `Store.LIDs`, fallback `evt.From`) agar penelepon `@lid` dan PN tidak mendapat pesan balasan ganda dalam 6 jam |
+| Guard panggilan | Lewati bila `!auto_reject_calls`, sinkronisasi `offline=true`, atau panggilan grup | Pesan sopan (`<= 500` karakter) diantrekan ke outbox dengan `origin=system` dan `Idempotency-Key: call:<call_id>` hanya setelah `RejectCall` sukses |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -238,7 +266,7 @@ flowchart TD
 | Antrian kirim penuh | Request ditolak, klien diminta mencoba lagi |
 | Instance tidak tersambung | Request kirim ditolak |
 | Ukuran media | 16 MB (gambar/video/audio), 64 MB (dokumen) |
-| Check number | Maks 20 nomor per request, hasil di-cache 24 jam |
+| Check number | Maks 20 nomor per request, hasil di-cache di `LRU` 2048 entri (TTL 24 jam) dengan `singleflight` batch uncached terurut |
 | Admin | Hanya lewat terminal server (CLI), tidak ada panel web |
 | Kapasitas | 3–6 instance aktif per proses agar RAM di bawah 100 MB |
 | Upgrade skema v1 ke v2 | Backup `app.db` dan `wa.db` dibuat sekali ke folder `backups/pre-v2-*` sebelum migrasi dijalankan |
@@ -265,4 +293,6 @@ flowchart TD
 | Compose murni & quoted reply (R15) | `Compose` menyusun seluruh tipe pesan secara murni terhadap `ComposeDeps`; pesan reply melengkapi `Participant` dan `QuotedMessage` (bila teks kutipan ada) dari lookup `journal.db`; `reaction` tanpa `sender` mencoba lookup pengirim target terlebih dahulu sebelum fallback ke JID sendiri; `revoke` tanpa `sender` memakai JID sendiri; vCard menerapkan escape RFC 6350 dan menuliskan seluruh nomor `phones` |
 | Polling tahan kegagalan & dekripsi suara | Polling keluar ditulis ke `polls` sebelum `SendMessage`; `PollUpdateMessage` didekripsi oleh `DecryptPollVote` lalu dicatat hanya sebagai `event="poll_vote"` (tidak tercatat ganda sebagai `message`); gagal dekripsi mencatat log WARN dan tetap meng-ack WhatsApp |
 | Presence & subscription reconnect | Status `presence` / `chat_presence` masuk dinormalisasi ke `journal.db` tanpa dedupe key (`last_seen` Unix detik); daftar `SubscribePresence` dibatasi maks 100 JID per instance dan disinkronkan ulang saat koneksi mencapai state `online` |
+| API grup & pemetaan IQError | Seluruh cache daftar grup dibatasi LRU tanpa menyimpan daftar peserta penuh; error `*whatsmeow.IQError` dipetakan deterministik ke `403 group_forbidden` (401/403), `404 group_not_found`, `400 invalid_request` (406), `429 rate_limited`, dan `502 upstream_error` lainnya; `GroupGovernor` memeriksa kuota sebelum membuat grup atau menambah peserta |
+| Normalisasi event `group` & `call` | `events.GroupInfo` menggabungkan seluruh perubahan dalam satu event `group` (`changes[]`), `events.JoinedGroup` menghasilkan `action="joined"`, dan `events.CallOffer` / `CallTerminate` / auto-reject memakai dedupe key `c:<call_id>:<action>` tanpa memblokir hot path untuk `RejectCall` |
 

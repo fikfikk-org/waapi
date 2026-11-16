@@ -177,7 +177,7 @@
 | Query Params | - |
 | Request Body | numbers (array string, wajib, maks 20) |
 | Response | 200 results[] (number, exists, jid) |
-| Notes | Hasil di-cache 24 jam untuk mengurangi risiko ban |
+| Notes | Hasil di-cache pada `LRU` 2048 entri (TTL 24 jam) dan request konkuren batch uncached terurut digabung lewat `singleflight` untuk mencegah duplikasi query ke server |
 
 ## POST /v1/instances/{id}/media/download
 
@@ -347,6 +347,138 @@
 | Response | 200 `{ poll_id, chat, name, selectable, options: [{ name, votes, voters }], total_voters }` · 400 `invalid_request` · 404 `message_not_found` |
 | Notes | Daftar `voters` dibatasi maks 100 per opsi; pemilih yang mencabut pilihan (`selected: []`) tidak dihitung di `total_voters` |
 
+## GET /v2/instances/{id}/groups
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/groups |
+| Auth Required | Yes (X-API-Key, scope `groups:read`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{ groups: [{ jid, name, size, is_admin, announce, locked, created_at }] }` · 503 `instance_not_connected` |
+| Notes | Ringkasan grup tanpa daftar peserta di-cache selama 60 detik per instance (`LRU` 128 entri) |
+
+## POST /v2/instances/{id}/groups
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/groups |
+| Auth Required | Yes (X-API-Key, scope `groups:write`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | `name` (string wajib 1..25 karakter), `participants` (array nomor/JID opsional, 0..50 peserta) |
+| Response | 201 detail grup (identik skema `GET /groups/{jid}`) · 400 `invalid_request` · 403/429 dari `GroupGovernor` / WhatsApp |
+| Notes | Grup kosong (0 peserta) diperbolehkan; validasi input dan pengecekan `GroupGovernor.AllowGroupCreate` dijalankan sebelum memanggil WhatsApp |
+
+## GET /v2/instances/{id}/groups/{jid}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/groups/{jid} |
+| Auth Required | Yes (X-API-Key, scope `groups:read`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{ jid, name, description, owner, created_at, announce, locked, join_approval, ephemeral_seconds, participants: [{ jid, pn?, is_admin, is_super_admin }], participants_truncated? }` · 403 `group_forbidden` · 404 `group_not_found` |
+| Notes | `{jid}` wajib berakhiran `@g.us`; bila jumlah anggota > 1024, `participants` dipotong pada 1024 entri dengan `participants_truncated: true` |
+
+## PATCH /v2/instances/{id}/groups/{jid}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | PATCH /v2/instances/{id}/groups/{jid} |
+| Auth Required | Yes (X-API-Key, scope `groups:write`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | Opsional parsial (minimal satu): `name` (1..25 karakter), `description`, `announce` (bool), `locked` (bool), `join_approval` (bool) |
+| Response | 200 detail grup lengkap terbaru (identik `GET /groups/{jid}`) · 400 `invalid_request` (body `{}` / nama invalid) · Error dengan `error.details.applied: [...]` jika gagal di tengah |
+| Notes | Mutasi dijalankan berurutan (`name` -> `description` -> `announce` -> `locked` -> `join_approval`); bila gagal di tengah, `error.details.applied` mencatat field yang sudah sukses tembus ke WhatsApp |
+
+## POST /v2/instances/{id}/groups/{jid}/participants
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/groups/{jid}/participants |
+| Auth Required | Yes (X-API-Key, scope `groups:write`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | `action` (`add\|remove\|promote\|demote`), `participants` (array nomor/JID, 1..50 peserta) |
+| Response | 200 `{ results: [{ jid, status }] }` (`ok\|privacy_requires_invite\|already_member\|not_on_whatsapp\|error_<kode>`) · 400 `invalid_request` · 403/429 dari `GroupGovernor` / IQError |
+| Notes | `GroupGovernor.AllowParticipantAdd` diperiksa khusus saat `action == "add"` sebelum memanggil WhatsApp |
+
+## GET /v2/instances/{id}/groups/{jid}/invite-link
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/groups/{jid}/invite-link |
+| Auth Required | Yes (X-API-Key, scope `groups:read`, atau `groups:write` bila `reset=true` saat penegakan scope aktif) |
+| Headers | X-API-Key |
+| Query Params | `reset` (bool opsional, default `false`) |
+| Request Body | - |
+| Response | 200 `{ link: "https://chat.whatsapp.com/..." }` · 403 `group_forbidden` · 404 `group_not_found` |
+| Notes | Saat `reset=true`, tautan lama dicabut dan tautan undangan baru dibuat oleh server WhatsApp |
+
+## POST /v2/instances/{id}/groups/join
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/groups/join |
+| Auth Required | Yes (X-API-Key, scope `groups:write`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | Salah satu wajib: `code` (string kode undangan) atau `link` (URL `https://chat.whatsapp.com/...`) |
+| Response | 200 `{ jid }` · 400 `invalid_request` · 502 `upstream_error` |
+| Notes | Prefix URL dan query string diekstrak menjadi kode undangan serta menginvalidasi cache daftar grup instance |
+
+## POST /v2/instances/{id}/groups/{jid}/leave
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/groups/{jid}/leave |
+| Auth Required | Yes (X-API-Key, scope `groups:write`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 204 No Content · 403 `group_forbidden` · 404 `group_not_found` |
+| Notes | Mengeluarkan akun instance dari grup dan menghapus entri ringkasan grup instance di cache |
+
+## GET /v2/instances/{id}/groups/{jid}/requests
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/groups/{jid}/requests |
+| Auth Required | Yes (X-API-Key, scope `groups:read`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{ requests: [{ jid, requested_at }] }` (`requested_at` Unix detik) · 403 `group_forbidden` · 404 `group_not_found` |
+| Notes | Mengambil daftar permintaan bergabung ke grup yang menunggu persetujuan admin |
+
+## POST /v2/instances/{id}/groups/{jid}/requests
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/groups/{jid}/requests |
+| Auth Required | Yes (X-API-Key, scope `groups:write`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | `action` (`approve\|reject`), `participants` (array nomor/JID, 1..50 peserta) |
+| Response | 200 `{ results: [{ jid, status }] }` · 400 `invalid_request` · 403 `group_forbidden` |
+| Notes | Pemetaan field `status` per peserta identik dengan `POST /groups/{jid}/participants` |
+
+## GET /v2/instances/{id}/contacts/{jid}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/contacts/{jid} |
+| Auth Required | Yes (X-API-Key, scope `messages:read`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{ jid, pn, lid, push_name, full_name, business_name, about, picture: { url, id } \| null, verified_name }` · 400 `invalid_number`/`invalid_request` · 503 `instance_not_connected` |
+| Notes | Profil di-cache di `LRU` 256 entri (TTL 1 jam); input `@lid` diresolusi ke PN terlebih dahulu via `Store.LIDs`; bila foto profil tidak disetel atau dibatasi privasi (401/404), endpoint tetap mengembalikan 200 dengan `picture: null`; `verified_name` bertipe string |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -354,7 +486,7 @@
 | Method + Endpoint | POST ke `webhook_url` instance (`User-Agent: waapi-webhook/2.0`) |
 | Headers | Mode `waapi`: `X-WA-Event`, `X-WA-Instance`, `X-WA-Timestamp`, `X-WA-Event-Id`, `X-WA-Delivery-Attempt`, `X-WA-Signature` (`sha256=` HMAC `timestamp.body`). Mode `standard`: `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>` Standard Webhooks) |
 | Body | Envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) dibaca bertahap dari `journal.db` |
-| Event | message, receipt, undecryptable, connection, pairing, outbox, poll_vote, presence, chat_presence (dan `test` untuk `waapi webhook test`). Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik). Payload `poll_vote`: `{ poll_id, chat, voter, voter_pn?, selected, selected_hashes, poll_known, timestamp }`. Payload `presence`: `{ from, from_pn?, unavailable, last_seen? }`. Payload `chat_presence`: `{ chat, sender, state, media? }` |
+| Event | message, receipt, undecryptable, connection, pairing, outbox, poll_vote, presence, chat_presence, group, call (dan `test` untuk `waapi webhook test`). Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik). Payload `poll_vote`: `{ poll_id, chat, voter, voter_pn?, selected, selected_hashes, poll_known, timestamp }`. Payload `presence`: `{ from, from_pn?, unavailable, last_seen? }`. Payload `chat_presence`: `{ chat, sender, state, media? }`. Payload `group`: `{ group, actor?, actor_pn?, timestamp, changes: [{ action, participants?, value? }], join_reason?, name? }`. Payload `call`: `{ call_id, from, from_pn?, group?, action, reason? }` (`c:<call_id>:<offer\|rejected\|terminate>`) |
 | Notes | Pengiriman berurutan per `lane = part % webhook_lanes` (default 4 lane). Jadwal retry `0, 5s, 15s, 45s, 2m, 5m, 15m, 30m, 1h...` (±20% jitter) hingga `webhook_max_attempts` (default 12), menghormati `Retry-After` (maks 1h); `410 Gone` mem-pause target (`gone`); `4xx` lainnya maks 3 percobaan lalu dipindah ke `webhook_dead` (DLQ). Target dibaca dari `TargetCache` memori |
 
 ## Control Plane (CLI only, Unix socket)

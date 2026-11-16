@@ -96,12 +96,14 @@ type Manager struct {
 	mediaPipe   *media.Pipeline
 	mediaOnce   sync.Once
 	uploadStore *media.UploadStore
-	retryWaiter *media.RetryWaiter
-	pollStore   *PollStore
-	mediaHTTP   *http.Client
-	waLog       waLog.Logger
-	pairingSem  *semaphore.Weighted
-	mediaSem    *semaphore.Weighted
+	retryWaiter  *media.RetryWaiter
+	pollStore    *PollStore
+	mediaHTTP    *http.Client
+	waLog        waLog.Logger
+	pairingSem   *semaphore.Weighted
+	mediaSem     *semaphore.Weighted
+	groupListLRU *LRU[string, []GroupSummary]
+	groupGov     GroupGovernor
 
 	obsMu     sync.RWMutex
 	observers []InboundObserver
@@ -137,11 +139,13 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		waDB:       waDB,
 		container:  container,
 		webhook:    wh,
-		waLog:      waLogger,
-		mediaHTTP:  netguard.NewClient(netguard.Policy{}, 60*time.Second),
-		pairingSem: semaphore.NewWeighted(1), // maksimal 1 proses pairing dalam satu waktu
-		mediaSem:   semaphore.NewWeighted(2), // maksimal 2 stream media aktif bersamaan
-		instances:  make(map[string]*Instance),
+		waLog:        waLogger,
+		mediaHTTP:    netguard.NewClient(netguard.Policy{}, 60*time.Second),
+		pairingSem:   semaphore.NewWeighted(1), // maksimal 1 proses pairing dalam satu waktu
+		mediaSem:     semaphore.NewWeighted(2), // maksimal 2 stream media aktif bersamaan
+		groupListLRU: NewLRU[string, []GroupSummary](128, 60*time.Second),
+		groupGov:     noopGroupGovernor{},
+		instances:    make(map[string]*Instance),
 	}
 	for _, opt := range opts {
 		if opt != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -49,6 +50,20 @@ func NormalizeEvent(ctx context.Context, instanceID string, raw any, nc Normaliz
 		return normalizePresenceEvent(ctx, instanceID, e, nc)
 	case *events.ChatPresence:
 		return normalizeChatPresenceEvent(ctx, instanceID, e, nc)
+	case *events.GroupInfo:
+		return normalizeGroupInfoEvent(ctx, instanceID, e, nc)
+	case *events.JoinedGroup:
+		return normalizeJoinedGroupEvent(ctx, instanceID, e, nc)
+	case *events.CallOffer:
+		if e == nil {
+			return nil, false
+		}
+		return buildCallJournalEvent(ctx, instanceID, e.BasicCallMeta, "offer", "", nc)
+	case *events.CallTerminate:
+		if e == nil {
+			return nil, false
+		}
+		return buildCallJournalEvent(ctx, instanceID, e.BasicCallMeta, "terminate", e.Reason, nc)
 	default:
 		return nil, false
 	}
@@ -737,6 +752,231 @@ func normalizeChatPresenceEvent(ctx context.Context, instanceID string, e *event
 		Sender:     addr.senderRaw,
 		TS:         nc.Now.Unix(),
 		ReceivedAt: nc.Now.UnixMilli(),
+		Payload:    payload,
+	}, true
+}
+
+func resolveOptionalActor(ctx context.Context, sender, senderPN *types.JID, lid LIDResolver) (string, string) {
+	var actorStr, pnStr string
+	if senderPN != nil && !senderPN.IsEmpty() {
+		pnStr = senderPN.ToNonAD().String()
+	}
+	if sender != nil && !sender.IsEmpty() {
+		nonAD := sender.ToNonAD()
+		actorStr = nonAD.String()
+		if pnStr == "" {
+			switch nonAD.Server {
+			case types.DefaultUserServer:
+				pnStr = actorStr
+			case types.HiddenUserServer:
+				if lid != nil {
+					if pn, ok := lid.PNForLID(ctx, nonAD); ok && !pn.IsEmpty() {
+						pnStr = pn.ToNonAD().String()
+					}
+				}
+			}
+		}
+	}
+	return actorStr, pnStr
+}
+
+func jidsToNonADStrings(in []types.JID) []string {
+	out := make([]string, 0, len(in))
+	for _, j := range in {
+		if j.IsEmpty() {
+			continue
+		}
+		out = append(out, j.ToNonAD().String())
+	}
+	return out
+}
+
+func normalizeGroupInfoEvent(ctx context.Context, instanceID string, e *events.GroupInfo, nc NormalizeContext) (*journal.Event, bool) {
+	if e == nil || e.JID.IsEmpty() {
+		return nil, false
+	}
+	var changes []GroupChangeV2
+	if len(e.Join) > 0 {
+		changes = append(changes, GroupChangeV2{Action: "join", Participants: jidsToNonADStrings(e.Join)})
+	}
+	if len(e.Leave) > 0 {
+		changes = append(changes, GroupChangeV2{Action: "leave", Participants: jidsToNonADStrings(e.Leave)})
+	}
+	if len(e.Promote) > 0 {
+		changes = append(changes, GroupChangeV2{Action: "promote", Participants: jidsToNonADStrings(e.Promote)})
+	}
+	if len(e.Demote) > 0 {
+		changes = append(changes, GroupChangeV2{Action: "demote", Participants: jidsToNonADStrings(e.Demote)})
+	}
+	if e.Name != nil {
+		changes = append(changes, GroupChangeV2{Action: "name", Value: e.Name.Name})
+	}
+	if e.Topic != nil {
+		changes = append(changes, GroupChangeV2{Action: "description", Value: e.Topic.Topic})
+	}
+	if e.Announce != nil {
+		changes = append(changes, GroupChangeV2{Action: "announce", Value: strconv.FormatBool(e.Announce.IsAnnounce)})
+	}
+	if e.Locked != nil {
+		changes = append(changes, GroupChangeV2{Action: "locked", Value: strconv.FormatBool(e.Locked.IsLocked)})
+	}
+	if e.Ephemeral != nil {
+		val := "0"
+		if e.Ephemeral.IsEphemeral {
+			val = strconv.FormatUint(uint64(e.Ephemeral.DisappearingTimer), 10)
+		}
+		changes = append(changes, GroupChangeV2{Action: "ephemeral", Value: val})
+	}
+	if e.NewInviteLink != nil {
+		changes = append(changes, GroupChangeV2{Action: "invite_link", Value: *e.NewInviteLink})
+	}
+	if e.MembershipApprovalMode != nil {
+		changes = append(changes, GroupChangeV2{Action: "membership_approval", Value: strconv.FormatBool(e.MembershipApprovalMode.IsJoinApprovalRequired)})
+	}
+	if e.Delete != nil {
+		val := e.Delete.DeleteReason
+		if val == "" && e.Delete.Deleted {
+			val = "true"
+		}
+		changes = append(changes, GroupChangeV2{Action: "delete", Value: val})
+	}
+	if len(changes) == 0 {
+		return nil, false
+	}
+
+	grpStr := e.JID.ToNonAD().String()
+	actorStr, actorPN := resolveOptionalActor(ctx, e.Sender, e.SenderPN, nc.LID)
+	ts := eventUnixTS(e.Timestamp, nc.Now)
+	body := GroupEventV2{
+		Group:      grpStr,
+		Actor:      actorStr,
+		ActorPN:    actorPN,
+		Timestamp:  ts,
+		Changes:    changes,
+		JoinReason: e.JoinReason,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, false
+	}
+	var flags uint32
+	if nc.Offline {
+		flags |= journal.FlagOffline
+	}
+	return &journal.Event{
+		InstanceID: instanceID,
+		Type:       "group",
+		Chat:       grpStr,
+		Sender:     actorStr,
+		TS:         ts,
+		ReceivedAt: nc.Now.UnixMilli(),
+		Flags:      flags,
+		Payload:    payload,
+	}, true
+}
+
+func normalizeJoinedGroupEvent(ctx context.Context, instanceID string, e *events.JoinedGroup, nc NormalizeContext) (*journal.Event, bool) {
+	if e == nil || e.JID.IsEmpty() {
+		return nil, false
+	}
+	grpStr := e.JID.ToNonAD().String()
+	actorStr, actorPN := resolveOptionalActor(ctx, e.Sender, e.SenderPN, nc.LID)
+	ts := nc.Now.Unix()
+	body := GroupEventV2{
+		Group:      grpStr,
+		Actor:      actorStr,
+		ActorPN:    actorPN,
+		Timestamp:  ts,
+		Changes:    []GroupChangeV2{{Action: "joined"}},
+		JoinReason: e.Reason,
+		Name:       e.Name,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, false
+	}
+	var flags uint32
+	if nc.Offline {
+		flags |= journal.FlagOffline
+	}
+	return &journal.Event{
+		InstanceID: instanceID,
+		Type:       "group",
+		Chat:       grpStr,
+		Sender:     actorStr,
+		TS:         ts,
+		ReceivedAt: nc.Now.UnixMilli(),
+		Flags:      flags,
+		Payload:    payload,
+	}, true
+}
+
+func resolveCallFromPN(ctx context.Context, meta types.BasicCallMeta, lid LIDResolver) string {
+	for _, cand := range []types.JID{meta.From, meta.CallCreator, meta.CallCreatorAlt} {
+		if !cand.IsEmpty() && cand.Server == types.DefaultUserServer {
+			return cand.ToNonAD().String()
+		}
+	}
+	if lid != nil {
+		for _, cand := range []types.JID{meta.From, meta.CallCreator} {
+			if !cand.IsEmpty() && cand.Server == types.HiddenUserServer {
+				if pn, ok := lid.PNForLID(ctx, cand.ToNonAD()); ok && !pn.IsEmpty() {
+					return pn.ToNonAD().String()
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func buildCallJournalEvent(ctx context.Context, instanceID string, meta types.BasicCallMeta, action, reason string, nc NormalizeContext) (*journal.Event, bool) {
+	if meta.CallID == "" {
+		return nil, false
+	}
+	fromJID := meta.From.ToNonAD()
+	if fromJID.IsEmpty() {
+		fromJID = meta.CallCreator.ToNonAD()
+	}
+	fromStr := fromJID.String()
+	fromPN := resolveCallFromPN(ctx, meta, nc.LID)
+	var groupStr string
+	if !meta.GroupJID.IsEmpty() {
+		groupStr = meta.GroupJID.ToNonAD().String()
+	}
+
+	ts := eventUnixTS(meta.Timestamp, nc.Now)
+	body := CallEventV2{
+		CallID: meta.CallID,
+		From:   fromStr,
+		FromPN: fromPN,
+		Group:  groupStr,
+		Action: action,
+		Reason: reason,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, false
+	}
+	chatCanon := fromStr
+	if groupStr != "" {
+		chatCanon = groupStr
+	} else if fromPN != "" {
+		chatCanon = fromPN
+	}
+	var flags uint32
+	if nc.Offline {
+		flags |= journal.FlagOffline
+	}
+	return &journal.Event{
+		InstanceID: instanceID,
+		Type:       "call",
+		Chat:       chatCanon,
+		Sender:     fromStr,
+		WAID:       meta.CallID,
+		DedupeKey:  "c:" + meta.CallID + ":" + action,
+		TS:         ts,
+		ReceivedAt: nc.Now.UnixMilli(),
+		Flags:      flags,
 		Payload:    payload,
 	}, true
 }

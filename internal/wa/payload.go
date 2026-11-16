@@ -125,3 +125,31 @@ type ChatPresenceV2 struct {
 	State  string `json:"state"`
 	Media  string `json:"media,omitempty"`
 }
+
+// GroupChangeV2 merepresentasikan satu perubahan metadata atau keanggotaan dalam event grup v2.
+type GroupChangeV2 struct {
+	Action       string   `json:"action"`
+	Participants []string `json:"participants,omitempty"`
+	Value        string   `json:"value,omitempty"`
+}
+
+// GroupEventV2 adalah representasi kanonik event perubahan grup atau bergabung ke grup pada journal v2.
+type GroupEventV2 struct {
+	Group      string          `json:"group"`
+	Actor      string          `json:"actor,omitempty"`
+	ActorPN    string          `json:"actor_pn,omitempty"`
+	Timestamp  int64           `json:"timestamp"`
+	Changes    []GroupChangeV2 `json:"changes"`
+	JoinReason string          `json:"join_reason,omitempty"`
+	Name       string          `json:"name,omitempty"`
+}
+
+// CallEventV2 adalah representasi kanonik event panggilan masuk, penolakan otomatis, atau pemutusan panggilan.
+type CallEventV2 struct {
+	CallID string `json:"call_id"`
+	From   string `json:"from"`
+	FromPN string `json:"from_pn,omitempty"`
+	Group  string `json:"group,omitempty"`
+	Action string `json:"action"`
+	Reason string `json:"reason,omitempty"`
+}
