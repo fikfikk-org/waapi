@@ -40,6 +40,12 @@ jobs:
             -o dist/waapi-linux-arm64 ./cmd/waapi
           cd dist && sha256sum waapi-linux-* > checksums.txt
 
+      - name: Sign release checksums (Ed25519)
+        if: startsWith(github.ref, 'refs/tags/v') && env.WAAPI_RELEASE_ED25519_SEED != ''
+        env:
+          WAAPI_RELEASE_ED25519_SEED: ${{ secrets.WAAPI_RELEASE_ED25519_SEED }}
+        run: go run ./tools/sign -key-env WAAPI_RELEASE_ED25519_SEED dist/checksums.txt > dist/checksums.txt.sig
+
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -48,5 +54,6 @@ jobs:
             dist/waapi-linux-amd64
             dist/waapi-linux-arm64
             dist/checksums.txt
+            dist/checksums.txt.sig
           generate_release_notes: true
 

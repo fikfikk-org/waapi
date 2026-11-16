@@ -2,11 +2,15 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,13 +20,20 @@ import (
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/outbox"
+	"github.com/fikfikk-org/waapi/internal/policy"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"go.mau.fi/whatsmeow/types"
 )
 
 type ctxKey int
 
-const keyMetaCtx ctxKey = 1
+const (
+	keyMetaCtx      ctxKey = 1
+	keyScopeCtx     ctxKey = 2
+	keyRequestIDCtx ctxKey = 3
+)
+
+var validRequestIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{8,64}$`)
 
 // RouteInfo mendeskripsikan pola HTTP dan scope yang dibutuhkan oleh sebuah endpoint API.
 type RouteInfo struct {
@@ -45,6 +56,24 @@ func WithGovernor(src governor.Source) ServerOption {
 	return func(s *Server) {
 		if src != nil {
 			s.gov = src
+		}
+	}
+}
+
+// WithPolicyEnforcer menyetel PolicyEnforcer untuk pemeriksaan aksi destruktif pada grup HTTP.
+func WithPolicyEnforcer(pe *policy.Enforcer) ServerOption {
+	return func(s *Server) {
+		if pe != nil {
+			s.policyEnforcer = pe
+		}
+	}
+}
+
+// WithAuditLog menyetel AuditLog untuk mencatat aksi mutasi sensitif dari REST API.
+func WithAuditLog(al *auth.AuditLog) ServerOption {
+	return func(s *Server) {
+		if al != nil {
+			s.audit = al
 		}
 	}
 }
@@ -182,10 +211,12 @@ type Server struct {
 	mediaDriver   mediaTransport
 	pollStore     *wa.PollStore
 	chatDriver    chatTransport
-	groupDriver   groupTransport
-	contactDriver contactTransport
-	healthDriver  healthTransport
-	gov           governor.Source
+	groupDriver    groupTransport
+	contactDriver  contactTransport
+	healthDriver   healthTransport
+	policyEnforcer *policy.Enforcer
+	audit          *auth.AuditLog
+	gov            governor.Source
 	sseMax        int
 	sseSem        chan struct{}
 	v1WaitTimeout time.Duration
@@ -232,6 +263,12 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	}
 	if s.contactDriver == nil && w != nil {
 		s.contactDriver = w
+	}
+	if s.audit == nil && s.appDB != nil {
+		s.audit = auth.NewAuditLog(s.appDB)
+	}
+	if s.policyEnforcer == nil && a != nil {
+		s.policyEnforcer = policy.New(a, nil)
 	}
 	if s.sseMax <= 0 {
 		if envMax := strings.TrimSpace(os.Getenv("WAAPI_SSE_MAX")); envMax != "" {
@@ -283,8 +320,10 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("POST /v2/instances/{id}/groups/{jid}/requests", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2HandleGroupRequests))
 	s.handle("GET /v2/instances/{id}/contacts/{jid}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetContactProfile))
 	s.handle("GET /v2/instances/{id}/health", auth.ScopeHealthRead, s.withInstanceAuth(s.handleV2GetHealth))
+	s.handle("GET /v2/instances/{id}/settings", auth.ScopeSettingsAdmin, s.withInstanceAuth(s.handleV2GetSettings))
+	s.handle("PATCH /v2/instances/{id}/settings", auth.ScopeSettingsAdmin, s.withInstanceAuth(s.handleV2PatchSettings))
 
-	s.handler = recoverMiddleware(s.mux)
+	s.handler = requestIDAndRecoverMiddleware(s.mux)
 	return s
 }
 
@@ -305,10 +344,13 @@ func (s *Server) Routes() []RouteInfo {
 	return out
 }
 
-// handle mendaftarkan handler pada mux sekaligus mencatat scope endpoint (penegakan aktif mulai Batch 11).
+// handle mendaftarkan handler pada mux serta menyisipkan scope endpoint ke context request untuk ditegakkan middleware auth.
 func (s *Server) handle(pattern string, scope auth.Scope, h http.HandlerFunc) {
 	s.routes = append(s.routes, RouteInfo{Pattern: pattern, Scope: scope})
-	s.mux.HandleFunc(pattern, h)
+	s.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), keyScopeCtx, scope)
+		h(w, r.WithContext(ctx))
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -338,14 +380,52 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		raw := strings.TrimSpace(r.Header.Get("X-API-Key"))
-		meta, ok := s.auth.Verify(raw)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "X-API-Key tidak valid atau sudah dicabut", 0)
+		raw := extractAPIKey(r)
+		meta, err := s.auth.Verify(raw)
+		if err != nil {
+			if errors.Is(err, auth.ErrKeyExpired) {
+				writeError(w, http.StatusUnauthorized, "key_expired", "API key telah kedaluwarsa", 0)
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "unauthorized", "API key tidak valid atau sudah dicabut", 0)
+			return
+		}
+		if reqScope, ok := r.Context().Value(keyScopeCtx).(auth.Scope); ok && reqScope != "" && !meta.Scopes.Has(reqScope) {
+			writeError(w, http.StatusForbidden, "scope_denied", "API key tidak memiliki scope untuk endpoint ini", 0)
+			return
+		}
+		if !meta.Allow() {
+			writeError(w, http.StatusTooManyRequests, "rate_limited", "batas laju permintaan API key terlampaui, coba lagi", 1)
 			return
 		}
 		ctx := context.WithValue(r.Context(), keyMetaCtx, meta)
 		next(w, r.WithContext(ctx))
+	}
+}
+
+func extractAPIKey(r *http.Request) string {
+	if raw := strings.TrimSpace(r.Header.Get("X-API-Key")); raw != "" {
+		return raw
+	}
+	authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(authHdr) > 7 && strings.EqualFold(authHdr[:7], "Bearer ") {
+		return strings.TrimSpace(authHdr[7:])
+	}
+	return ""
+}
+
+func (s *Server) recordHTTPAudit(r *http.Request, action, target, detail string) {
+	if s == nil || s.audit == nil || r == nil {
+		return
+	}
+	actor := "key:unknown"
+	if km, ok := r.Context().Value(keyMetaCtx).(*auth.KeyMeta); ok && km != nil && km.ID != "" {
+		actor = "key:" + km.ID
+	}
+	aCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+	defer cancel()
+	if err := s.audit.Write(aCtx, actor, action, target, detail); err != nil {
+		slog.Warn("gagal mencatat audit log HTTP", "action", action, "target", target, "err", err)
 	}
 }
 
@@ -366,15 +446,24 @@ func (s *Server) withInstanceAuth(next func(http.ResponseWriter, *http.Request, 
 	})
 }
 
-func recoverMiddleware(next http.Handler) http.Handler {
+func requestIDAndRecoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+		if !validRequestIDRe.MatchString(reqID) {
+			var b [8]byte
+			_, _ = rand.Read(b[:])
+			reqID = hex.EncodeToString(b[:])
+		}
+		w.Header().Set("X-Request-Id", reqID)
+		ctx := context.WithValue(r.Context(), keyRequestIDCtx, reqID)
+
 		defer func() {
 			if rec := recover(); rec != nil {
-				slog.Error("panic pada handler HTTP publik", "err", rec, "path", r.URL.Path)
+				slog.Error("panic pada handler HTTP publik", "request_id", reqID, "err", rec, "path", r.URL.Path)
 				writeError(w, http.StatusInternalServerError, "internal_error", "terjadi kesalahan internal", 0)
 			}
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

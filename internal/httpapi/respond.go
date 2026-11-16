@@ -4,6 +4,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -21,11 +22,12 @@ type ErrorBody struct {
 	Error ErrorDetail `json:"error"`
 }
 
-// ErrorDetail memuat kode mesin, pesan manusia, retry_after opsional, dan rincian terstruktur.
+// ErrorDetail memuat kode mesin, pesan manusia, retry_after opsional, request_id, dan rincian terstruktur.
 type ErrorDetail struct {
 	Code       string         `json:"code"`
 	Message    string         `json:"message"`
 	RetryAfter int            `json:"retry_after,omitempty"`
+	RequestID  string         `json:"request_id,omitempty"`
 	Details    map[string]any `json:"details,omitempty"`
 }
 
@@ -43,11 +45,13 @@ func writeErrorDetails(w http.ResponseWriter, status int, code, msg string, retr
 	if retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	}
+	reqID := w.Header().Get("X-Request-Id")
 	writeJSON(w, status, ErrorBody{
 		Error: ErrorDetail{
 			Code:       code,
 			Message:    msg,
 			RetryAfter: retryAfter,
+			RequestID:  reqID,
 			Details:    details,
 		},
 	})
@@ -113,7 +117,8 @@ func writeMappedError(w http.ResponseWriter, err error) {
 		errors.Is(err, netguard.ErrBlockedIP), errors.Is(err, netguard.ErrNonHTTPS), errors.Is(err, netguard.ErrTooManyRedirects):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), 0)
 	default:
-		writeError(w, http.StatusBadGateway, "send_failed", err.Error(), 0)
+		slog.Error("kesalahan upstream API", "request_id", w.Header().Get("X-Request-Id"), "err", err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "terjadi kesalahan saat memproses permintaan ke layanan upstream", 0)
 	}
 }
 

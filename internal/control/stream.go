@@ -29,6 +29,7 @@ func (s *Server) handlePairInstance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.pair.start", id, "")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

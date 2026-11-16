@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,9 +22,16 @@ import (
 	"time"
 
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/control"
 )
 
-const githubRepo = "fikfikk-org/waapi"
+const (
+	githubRepo       = "fikfikk-org/waapi"
+	maxChecksumsSize = 1 << 20 // 1 MiB
+	maxSigSize       = 4 << 10 // 4 KiB
+)
+
+var resolveBinaryPathFn = resolveBinaryPath
 
 type githubRelease struct {
 	TagName     string `json:"tag_name"`
@@ -31,12 +40,13 @@ type githubRelease struct {
 	Prerelease  bool   `json:"prerelease"`
 }
 
-// runUpdateCommand menangani waapi update [--check|--list|--force] [latest|vX.Y.Z].
+// runUpdateCommand menangani waapi update [--check|--list|--force|--insecure-no-verify] [latest|vX.Y.Z].
 func runUpdateCommand(ctx context.Context, cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	checkOnly := fs.Bool("check", false, "hanya periksa apakah ada versi terbaru")
 	listOnly := fs.Bool("list", false, "tampilkan daftar versi di GitHub & backup lokal")
 	force := fs.Bool("force", false, "paksa pasang ulang walau versi sudah sama")
+	insecureNoVerify := fs.Bool("insecure-no-verify", false, "lewati verifikasi tanda tangan Ed25519 (khusus rilis v1 tanpa .sig)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -69,7 +79,7 @@ func runUpdateCommand(ctx context.Context, cfg *config.Config, args []string) er
 		return nil
 	}
 
-	return installReleaseVersion(ctx, cfg, target)
+	return installReleaseVersionWithOptions(ctx, cfg, target, *insecureNoVerify)
 }
 
 // runCheckUpdate memeriksa versi terbaru dari GitHub Releases dan membandingkannya dengan binary saat ini.
@@ -137,7 +147,7 @@ func runRollbackCommand(ctx context.Context, cfg *config.Config, args []string) 
 		}
 	}
 
-	exePath, err := resolveBinaryPath()
+	exePath, err := resolveBinaryPathFn()
 	if err != nil {
 		return err
 	}
@@ -170,20 +180,64 @@ func runRollbackCommand(ctx context.Context, cfg *config.Config, args []string) 
 	return installReleaseVersion(ctx, cfg, targetTag)
 }
 
-// installReleaseVersion mengunduh binary versi targetTag, memverifikasi checksum, mem-backup binary lama, lalu menggantinya.
+// installReleaseVersion mengunduh binary versi targetTag secara fail-closed dengan verifikasi tanda tangan Ed25519.
 func installReleaseVersion(ctx context.Context, cfg *config.Config, targetTag string) error {
+	return installReleaseVersionWithOptions(ctx, cfg, targetTag, false)
+}
+
+func updateBaseURL(cfg *config.Config) string {
+	if envURL := strings.TrimRight(strings.TrimSpace(os.Getenv("WAAPI_UPDATE_BASE_URL")), "/"); envURL != "" {
+		return envURL
+	}
+	if cfg != nil && strings.TrimSpace(cfg.UpdateBaseURL) != "" {
+		return strings.TrimRight(strings.TrimSpace(cfg.UpdateBaseURL), "/")
+	}
+	return fmt.Sprintf("https://github.com/%s/releases/download", githubRepo)
+}
+
+func installReleaseVersionWithOptions(ctx context.Context, cfg *config.Config, targetTag string, insecureNoVerify bool) error {
 	assetName, err := releaseAssetName()
 	if err != nil {
 		return err
 	}
-	exePath, err := resolveBinaryPath()
+	exePath, err := resolveBinaryPathFn()
 	if err != nil {
 		return err
 	}
 
-	baseURL := fmt.Sprintf("https://github.com/%s/releases/download/%s", githubRepo, targetTag)
+	baseURL := updateBaseURL(cfg) + "/" + targetTag
 	binURL := baseURL + "/" + assetName
 	sumURL := baseURL + "/checksums.txt"
+	sigURL := baseURL + "/checksums.txt.sig"
+
+	dlCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	// 1. Unduh dan verifikasi tanda tangan checksums.txt secara fail-closed sebelum menyentuh binary.
+	sumBytes, sumErr := downloadBytesLimit(dlCtx, sumURL, maxChecksumsSize)
+	if !insecureNoVerify {
+		if sumErr != nil {
+			return fmt.Errorf("unduh checksums.txt gagal (fail-closed): %w", sumErr)
+		}
+		sigBytes, sigErr := downloadBytesLimit(dlCtx, sigURL, maxSigSize)
+		if sigErr != nil {
+			return fmt.Errorf("unduh checksums.txt.sig gagal (fail-closed): %w", sigErr)
+		}
+		if err := verifyReleaseSignature(sumBytes, string(sigBytes), releasePublicKeys); err != nil {
+			return err
+		}
+		fmt.Println("✔ Tanda tangan Ed25519 checksums.txt terverifikasi")
+	} else {
+		fmt.Fprintln(os.Stderr, "PERINGATAN: --insecure-no-verify aktif; verifikasi tanda tangan Ed25519 dilewati.")
+	}
+
+	var expectedHash string
+	if sumErr == nil && len(sumBytes) > 0 {
+		expectedHash = parseChecksumFromBytes(sumBytes, assetName)
+	}
+	if !insecureNoVerify && expectedHash == "" {
+		return fmt.Errorf("checksum SHA-256 untuk aset %s tidak ditemukan di checksums.txt", assetName)
+	}
 
 	fmt.Printf("Mengunduh %s (%s)...\n", targetTag, assetName)
 	tmpFile, err := os.CreateTemp(filepath.Dir(exePath), ".waapi-update-*")
@@ -196,9 +250,6 @@ func installReleaseVersion(ctx context.Context, cfg *config.Config, targetTag st
 		_ = os.Remove(tmpPath)
 	}()
 
-	dlCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-
 	hasher := sha256.New()
 	if err := downloadToWriter(dlCtx, binURL, io.MultiWriter(tmpFile, hasher)); err != nil {
 		return fmt.Errorf("unduh binary %s gagal: %w", targetTag, err)
@@ -208,12 +259,16 @@ func installReleaseVersion(ctx context.Context, cfg *config.Config, targetTag st
 	}
 	gotHash := hex.EncodeToString(hasher.Sum(nil))
 
-	// Verifikasi checksums.txt jika tersedia di release
-	if expectedHash, err := fetchAssetChecksum(dlCtx, sumURL, assetName); err == nil && expectedHash != "" {
+	if expectedHash != "" {
 		if !strings.EqualFold(gotHash, expectedHash) {
 			return fmt.Errorf("checksum SHA-256 tidak cocok! diharapkan %s, didapat %s", expectedHash, gotHash)
 		}
-		fmt.Printf("✔ Checksum SHA-256 terverifikasi (%s)\n", gotHash[:12])
+		fmt.Printf("✔ Checksum SHA-256 terverifikasi (%s)\n", gotHash[:min(12, len(gotHash))])
+	}
+
+	// 2. Jika daemon aktif, backup ketiga database (app, journal, wa) lewat control plane tanpa membuka DB langsung.
+	if err := backupDatabaseViaControl(ctx, cfg); err != nil {
+		return fmt.Errorf("backup database sebelum update gagal: %w", err)
 	}
 
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
@@ -231,6 +286,69 @@ func installReleaseVersion(ctx context.Context, cfg *config.Config, targetTag st
 	restartSystemdIfActive(ctx)
 	fmt.Printf("✔ Berhasil memperbarui waapi ke %s.\n", targetTag)
 	return nil
+}
+
+func backupDatabaseViaControl(ctx context.Context, cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	sock := cfg.ControlSocket()
+	if _, err := os.Stat(sock); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	bCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var res control.BackupResult
+	err := control.NewClient(sock).DoJSON(bCtx, http.MethodPost, "/control/backup", nil, &res)
+	if err != nil {
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
+			// Daemon tidak berjalan: lewati backup DB (CLI tidak boleh membuka DB langsung).
+			return nil
+		}
+		return err
+	}
+	if res.Dir != "" {
+		fmt.Printf("✔ Backup database disimpan ke %s (%s)\n", res.Dir, strings.Join(res.Files, ", "))
+	}
+	return nil
+}
+
+func downloadBytesLimit(ctx context.Context, url string, maxBytes int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "waapi-updater")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d untuk %s", resp.StatusCode, url)
+	}
+	limited := io.LimitReader(resp.Body, maxBytes+1)
+	b, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("ukuran respons %s melebihi batas %d byte", url, maxBytes)
+	}
+	return b, nil
+}
+
+func parseChecksumFromBytes(raw []byte, assetName string) string {
+	sc := bufio.NewScanner(bytes.NewReader(raw))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) >= 2 && strings.TrimPrefix(fields[1], "*") == assetName {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 // backupCurrentBinary menyalin binary yang sedang terpasang ke direktori backups sebelum ditimpa.
@@ -391,29 +509,6 @@ func downloadToWriter(ctx context.Context, url string, w io.Writer) error {
 	}
 	_, err = io.Copy(w, resp.Body)
 	return err
-}
-
-func fetchAssetChecksum(ctx context.Context, sumURL, assetName string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sumURL, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	sc := bufio.NewScanner(resp.Body)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && strings.TrimPrefix(fields[1], "*") == assetName {
-			return fields[0], nil
-		}
-	}
-	return "", sc.Err()
 }
 
 func restartSystemdIfActive(ctx context.Context) {

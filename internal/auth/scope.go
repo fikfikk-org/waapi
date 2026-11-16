@@ -54,6 +54,22 @@ var scopeBits = func() map[Scope]ScopeSet {
 // ScopeAll merepresentasikan seluruh scope yang tersedia (setara '*').
 const ScopeAll ScopeSet = (1 << 12) - 1
 
+// DefaultScopes mengembalikan himpunan scope bawaan aman untuk API key baru (§4.1.5).
+func DefaultScopes() ScopeSet {
+	var out ScopeSet
+	for _, sc := range []Scope{
+		ScopeInstancesRead,
+		ScopeMessagesSend,
+		ScopeMessagesRead,
+		ScopeMediaWrite,
+		ScopeEventsRead,
+		ScopeHealthRead,
+	} {
+		out |= scopeBits[sc]
+	}
+	return out
+}
+
 // Has memeriksa apakah ScopeSet memiliki scope yang diminta.
 func (s ScopeSet) Has(target Scope) bool {
 	if target == ScopeWildcard {

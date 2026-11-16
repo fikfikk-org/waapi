@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ func (s *Server) handleStartPair(w http.ResponseWriter, r *http.Request, inst *w
 		writePairingError(w, err)
 		return
 	}
+	s.recordHTTPAudit(r, "instance.pair.start", r.PathValue("id"), "")
 
 	snap, err := sess.WaitReady(r.Context())
 	if err != nil {
@@ -40,11 +42,12 @@ func (s *Server) handleStartPair(w http.ResponseWriter, r *http.Request, inst *w
 		return
 	}
 	if snap.State == wa.PairError {
-		msg := "pairing gagal"
+		errDetail := ""
 		if snap.Error != nil {
-			msg = *snap.Error
+			errDetail = *snap.Error
 		}
-		writeError(w, http.StatusBadGateway, "pairing_failed", msg, 0)
+		slog.Error("pairing gagal pada tahap handshake", "instance", r.PathValue("id"), "request_id", w.Header().Get("X-Request-Id"), "err", errDetail)
+		writeError(w, http.StatusBadGateway, "pairing_failed", "proses pairing gagal, silakan coba lagi", 0)
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -61,12 +64,13 @@ func (s *Server) handleGetPair(w http.ResponseWriter, _ *http.Request, inst *wa.
 }
 
 // handleCancelPair membatalkan sesi pairing aktif pada sebuah instance.
-func (s *Server) handleCancelPair(w http.ResponseWriter, _ *http.Request, inst *wa.Instance) {
+func (s *Server) handleCancelPair(w http.ResponseWriter, r *http.Request, inst *wa.Instance) {
 	snap, err := inst.CancelPairing()
 	if err != nil {
 		writePairingError(w, err)
 		return
 	}
+	s.recordHTTPAudit(r, "instance.pair.cancel", r.PathValue("id"), "")
 	writeJSON(w, http.StatusOK, snap)
 }
 
@@ -113,6 +117,7 @@ func writePairingError(w http.ResponseWriter, err error) {
 	case errors.Is(err, wa.ErrQRNotAvailable):
 		writeError(w, http.StatusNotFound, "qr_not_available", err.Error(), 0)
 	default:
-		writeError(w, http.StatusBadGateway, "pairing_failed", err.Error(), 0)
+		slog.Error("kesalahan pairing WhatsApp", "request_id", w.Header().Get("X-Request-Id"), "err", err)
+		writeError(w, http.StatusBadGateway, "pairing_failed", "proses pairing gagal, silakan coba lagi", 0)
 	}
 }

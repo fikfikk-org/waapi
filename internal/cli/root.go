@@ -75,6 +75,8 @@ func Execute(args []string) error {
 		return runInstanceSubcommand(ctx, ctrl, rest)
 	case "key":
 		return runKeySubcommand(ctx, ctrl, rest)
+	case "audit":
+		return runAudit(ctx, ctrl, rest)
 	case "webhook":
 		return runWebhookSubcommand(ctx, ctrl, rest)
 	case "events":
@@ -170,8 +172,11 @@ PERINTAH UTAMA (INSTANCE):
 
 MANAJEMEN API KEY:
   waapi key list                               Daftar seluruh API key
-  waapi key add --name <nama> [--instance <id>] Buat API key baru (ditampilkan sekali)
+  waapi key add --name <nama> [opsi]           Buat API key baru (--scopes/--expires/--rate/--policy)
+  waapi key show <key-id>                      Lihat metadata, scope, expiry, & policy key
+  waapi key rotate <key-id> [--grace 24h]      Rotasi API key dengan grace period key lama
   waapi key rm <key-id>                        Cabut (revoke) API key
+  waapi audit [--since 24h] [--action pola]    Lihat catatan audit aksi administratif
 
 MANAJEMEN WEBHOOK:
   waapi webhook set <id> <url> [--from ...]    Pasang URL webhook (--from now|retained)

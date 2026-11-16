@@ -115,7 +115,14 @@ func setupV2ChatServer(t *testing.T, drv *fakeChatDriver) (http.Handler, *journa
 	t.Cleanup(func() { _ = j.Close() })
 
 	ps := wa.NewPollStore(j.DB())
-	key, _, _ := authMgr.Create(ctx, "chat-test", "")
+	key, _, err := authMgr.CreateWithOptions(ctx, auth.CreateKeyRequest{
+		Name:       "chat-test",
+		Scopes:     auth.ScopeAll,
+		RatePerSec: 1000,
+	})
+	if err != nil {
+		t.Fatalf("CreateWithOptions gagal: %v", err)
+	}
 	h := NewHandler(authMgr, waMgr,
 		WithDB(st.DB),
 		WithJournal(j),

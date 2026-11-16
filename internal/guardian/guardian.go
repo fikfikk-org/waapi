@@ -1514,6 +1514,39 @@ func (g *Guardian) Summary(ctx context.Context, instanceID string) (HealthSummar
 	}, nil
 }
 
+func (g *Guardian) contactRowForPolicy(ctx context.Context, instanceID, target string) (ContactRow, bool) {
+	if g == nil || g.st == nil {
+		return ContactRow{}, false
+	}
+	canon, _, _ := g.canonicalRecipient(ctx, instanceID, target)
+	if canon == "" {
+		return ContactRow{}, false
+	}
+	row, found, err := g.st.GetContact(ctx, instanceID, canon)
+	if err != nil || !found {
+		return ContactRow{}, false
+	}
+	return row, true
+}
+
+// LastIn membaca waktu pesan masuk terakhir dari contacts_seen (memenuhi policy.ContactView).
+func (g *Guardian) LastIn(ctx context.Context, instanceID, target string) (time.Time, bool) {
+	row, ok := g.contactRowForPolicy(ctx, instanceID, target)
+	if !ok || row.LastIn <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(row.LastIn, 0), true
+}
+
+// FirstIn membaca waktu pesan masuk pertama dari contacts_seen (memenuhi policy.ContactView).
+func (g *Guardian) FirstIn(ctx context.Context, instanceID, target string) (time.Time, bool) {
+	row, ok := g.contactRowForPolicy(ctx, instanceID, target)
+	if !ok || row.FirstIn <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(row.FirstIn, 0), true
+}
+
 func (g *Guardian) recordShadowDecision(code, instanceID string) {
 	obs.MetricGuardianShadowTotal.With(code).Inc()
 	slog.Debug("keputusan guardian dilewati oleh shadow mode", "instance", instanceID, "code", code)

@@ -25,6 +25,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/outbox"
+	"github.com/fikfikk-org/waapi/internal/policy"
 	"github.com/fikfikk-org/waapi/internal/sdnotify"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
@@ -251,7 +252,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	)
 	waMgr.AddInboundObserver(guard.InboundObserver())
 
-	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, guard, nil, outbox.Options{
+	auditLog := auth.NewAuditLog(st.DB)
+	policyEnf := policy.New(authMgr, guard)
+
+	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, guard, policyEnf, outbox.Options{
 		DefaultTTL: cfg.OutboxTTL,
 		MaxQueued:  cfg.OutboxMaxQueued,
 		OnActivity: waMgr.RecordActivity,
@@ -289,6 +293,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			if gErr := guard.Prune(pCtx, time.Now()); gErr != nil && ctx.Err() == nil {
 				slog.Warn("pruner guardian gagal", "err", gErr)
 			}
+			if _, aErr := auditLog.Prune(pCtx, time.Now().Add(-auth.AuditRetention)); aErr != nil && ctx.Err() == nil {
+				slog.Warn("pruner audit_log gagal", "err", aErr)
+			}
 		},
 	})
 
@@ -298,6 +305,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		control.WithOutbox(outboxSvc),
 		control.WithHealthProvider(guard),
 		control.WithGovernor(gov),
+		control.WithAuditLog(auditLog),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
@@ -315,6 +323,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	ctrlHTTP := &http.Server{
 		Handler:           ctrlSrv.Handler(),
+		ConnContext:       ctrlSrv.ConnContext,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -330,7 +339,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,

@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +28,8 @@ import (
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
 )
+
+type peerUIDKey struct{}
 
 // ServerOption mengatur opsi dependensi tambahan untuk Server control plane.
 type ServerOption func(*Server)
@@ -79,6 +84,15 @@ func WithGovernor(src governor.Source) ServerOption {
 	}
 }
 
+// WithAuditLog memasang pencatat AuditLog ke control plane.
+func WithAuditLog(al *auth.AuditLog) ServerOption {
+	return func(s *Server) {
+		if al != nil {
+			s.audit = al
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -92,6 +106,7 @@ type Server struct {
 	outbox     *outbox.Service
 	health     healthProvider
 	gov        governor.Source
+	audit      *auth.AuditLog
 	startedAt  time.Time
 	version    string
 }
@@ -119,6 +134,9 @@ func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manag
 	if s.dead == nil && s.journal != nil && s.journal.DB() != nil {
 		s.dead = webhook.NewDeadStore(s.journal.DB())
 	}
+	if s.audit == nil && st != nil && st.DB != nil {
+		s.audit = auth.NewAuditLog(st.DB)
+	}
 	return s
 }
 
@@ -129,16 +147,33 @@ func (s *Server) SetVersion(v string) {
 	}
 }
 
-// Listen membuka Unix Domain Socket dengan permission 0660 agar group waapi dapat menjalankan CLI tanpa sudo.
+// Listen membuka Unix Domain Socket secara atomik (listen tmp -> chmod 0660 -> rename) tanpa jendela izin terbuka.
 func (s *Server) Listen() (net.Listener, error) {
 	sock := s.cfg.ControlSocket()
-	_ = os.Remove(sock)
-	ln, err := net.Listen("unix", sock)
+	tmpSock := sock + ".tmp"
+	_ = os.Remove(tmpSock)
+
+	ln, err := net.Listen("unix", tmpSock)
 	if err != nil {
 		return nil, fmt.Errorf("listen unix socket %s: %w", sock, err)
 	}
-	// Permission 0660 mengizinkan user waapi dan anggota group waapi mengakses control socket
-	_ = os.Chmod(sock, 0o660)
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	if runtime.GOOS != "windows" {
+		// Setel izin 0660 sebelum rename agar tidak ada jeda izin umask proses.
+		if err := os.Chmod(tmpSock, 0o660); err != nil {
+			_ = ln.Close()
+			_ = os.Remove(tmpSock)
+			return nil, fmt.Errorf("chmod control socket %s: %w", tmpSock, err)
+		}
+	}
+	_ = os.Remove(sock)
+	if err := os.Rename(tmpSock, sock); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(tmpSock)
+		return nil, fmt.Errorf("rename control socket %s: %w", sock, err)
+	}
 	return ln, nil
 }
 
@@ -147,9 +182,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /control/doctor", s.handleDoctor)
+	mux.HandleFunc("GET /control/audit", s.handleListAudit)
+	mux.HandleFunc("POST /control/backup", s.handleBackup)
 
 	mux.HandleFunc("GET /control/keys", s.handleListKeys)
 	mux.HandleFunc("POST /control/keys", s.handleCreateKey)
+	mux.HandleFunc("GET /control/keys/{id}", s.handleGetKey)
+	mux.HandleFunc("POST /control/keys/{id}/rotate", s.handleRotateKey)
 	mux.HandleFunc("DELETE /control/keys/{id}", s.handleRevokeKey)
 
 	mux.HandleFunc("GET /control/instances", s.handleListInstances)
@@ -259,8 +298,13 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 type createKeyReq struct {
-	Name       string `json:"name"`
-	InstanceID string `json:"instance_id"`
+	Name       string          `json:"name"`
+	InstanceID string          `json:"instance_id"`
+	Scopes     string          `json:"scopes"`
+	ExpiresAt  int64           `json:"expires_at"`
+	ExpiresIn  string          `json:"expires_in"`
+	RatePerSec int             `json:"rate_per_sec"`
+	Policy     *auth.KeyPolicy `json:"policy"`
 }
 
 type createKeyResp struct {
@@ -278,12 +322,87 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("nama key wajib diisi"))
 		return
 	}
-	raw, meta, err := s.auth.Create(r.Context(), strings.TrimSpace(req.Name), strings.TrimSpace(req.InstanceID))
+
+	scopes := auth.DefaultScopes()
+	if strings.TrimSpace(req.Scopes) != "" {
+		parsed, err := auth.ParseScopes(req.Scopes)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		scopes = parsed
+	}
+
+	var expiresAt time.Time
+	if strings.TrimSpace(req.ExpiresIn) != "" {
+		dur, err := time.ParseDuration(strings.TrimSpace(req.ExpiresIn))
+		if err != nil || dur <= 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("durasi expires_in harus bernilai positif"))
+			return
+		}
+		expiresAt = time.Now().Add(dur)
+	} else if req.ExpiresAt > 0 {
+		expiresAt = time.Unix(req.ExpiresAt, 0)
+	}
+
+	var pol auth.KeyPolicy
+	if req.Policy != nil {
+		pol = *req.Policy
+	}
+
+	raw, meta, err := s.auth.CreateWithOptions(r.Context(), auth.CreateKeyRequest{
+		Name:       strings.TrimSpace(req.Name),
+		InstanceID: strings.TrimSpace(req.InstanceID),
+		Scopes:     scopes,
+		ExpiresAt:  expiresAt,
+		RatePerSec: req.RatePerSec,
+		Policy:     pol,
+	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	s.recordAudit(r.Context(), "key.create", meta.ID,
+		fmt.Sprintf("name=%s instance=%s scopes=%s", meta.Name, meta.InstanceID, meta.Scopes))
 	writeJSON(w, http.StatusCreated, createKeyResp{Key: raw, Meta: meta})
+}
+
+func (s *Server) handleGetKey(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	k, err := s.store.GetAPIKey(r.Context(), id)
+	if err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, k)
+}
+
+type rotateKeyReq struct {
+	Grace string `json:"grace"`
+}
+
+func (s *Server) handleRotateKey(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req rotateKeyReq
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	grace := 24 * time.Hour
+	if strings.TrimSpace(req.Grace) != "" {
+		dur, err := time.ParseDuration(strings.TrimSpace(req.Grace))
+		if err != nil || dur < 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("durasi grace tidak valid"))
+			return
+		}
+		grace = dur
+	}
+
+	raw, meta, err := s.auth.Rotate(r.Context(), id, grace)
+	if err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	s.recordAudit(r.Context(), "key.rotate", id, fmt.Sprintf("new_id=%s grace=%s", meta.ID, grace))
+	writeJSON(w, http.StatusOK, createKeyResp{Key: raw, Meta: meta})
 }
 
 func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
@@ -296,7 +415,56 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.recordAudit(r.Context(), "key.revoke", id, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+}
+
+func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
+	if s.audit == nil {
+		writeJSON(w, http.StatusOK, []auth.AuditEntry{})
+		return
+	}
+	qp := r.URL.Query()
+	q := auth.AuditQuery{
+		ActionPattern: strings.TrimSpace(qp.Get("action")),
+	}
+	if rawSince := strings.TrimSpace(qp.Get("since")); rawSince != "" {
+		dur, err := time.ParseDuration(rawSince)
+		if err != nil || dur <= 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("parameter since harus durasi Go yang valid, mis. 24h"))
+			return
+		}
+		q.Since = time.Now().Add(-dur)
+	}
+	if rawLimit := strings.TrimSpace(qp.Get("limit")); rawLimit != "" {
+		n, err := strconv.Atoi(rawLimit)
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("parameter limit harus bilangan bulat positif"))
+			return
+		}
+		q.Limit = n
+	}
+	entries, err := s.audit.List(r.Context(), q)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) recordAudit(ctx context.Context, action, target, detail string) {
+	if s == nil || s.audit == nil {
+		return
+	}
+	actor := "control"
+	if uid, ok := ctx.Value(peerUIDKey{}).(uint32); ok {
+		actor = "control:uid=" + strconv.FormatUint(uint64(uid), 10)
+	}
+	aCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	if err := s.audit.Write(aCtx, actor, action, target, detail); err != nil {
+		slog.Warn("gagal menulis audit control plane", "action", action, "target", target, "err", err)
+	}
 }
 
 func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +496,7 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.create", st.ID, fmt.Sprintf("rate=%d auto_start=%v", st.RatePerMin, st.AutoStart))
 	writeJSON(w, http.StatusCreated, st)
 }
 
@@ -394,42 +563,51 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.update", id, fmt.Sprintf("rotate_secret=%v", req.RotateSecret))
 	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleRestartInstance(w http.ResponseWriter, r *http.Request) {
-	st, err := s.wa.Restart(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	st, err := s.wa.Restart(r.Context(), id)
 	if err != nil {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.restart", id, "")
 	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleRecycleInstance(w http.ResponseWriter, r *http.Request) {
-	st, err := s.wa.Recycle(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	st, err := s.wa.Recycle(r.Context(), id)
 	if err != nil {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.recycle", id, "")
 	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleStopInstance(w http.ResponseWriter, r *http.Request) {
-	st, err := s.wa.Stop(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	st, err := s.wa.Stop(r.Context(), id)
 	if err != nil {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.stop", id, "")
 	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleLogoutInstance(w http.ResponseWriter, r *http.Request) {
-	st, err := s.wa.Logout(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	st, err := s.wa.Logout(r.Context(), id)
 	if err != nil {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.logout", id, "")
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -439,6 +617,7 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "instance.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
 }
 
@@ -459,6 +638,7 @@ func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
+	s.recordAudit(r.Context(), "webhook.test", id, strconv.Itoa(code))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "delivered", "http_status": code})
 }
 

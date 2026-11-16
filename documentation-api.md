@@ -1,24 +1,23 @@
 # Dokumentasi API — wa-api
 
 > Status: terimplementasi (`internal/httpapi`, `internal/control`, `internal/cli`). Base URL: `http://127.0.0.1:8080` (diekspos via reverse proxy TLS).
-> Autentikasi: header `X-API-Key: wak_...` (bukan Sanctum). Key dibuat lewat CLI `waapi key add --name <nama>`.
+> Autentikasi: header `X-API-Key: wak_...` atau `Authorization: Bearer wak_...` (bukan Sanctum). Key dibuat lewat CLI `waapi key add --name <nama>`. Setiap respons membawa header `X-Request-Id`.
 
 ## Format Error Umum
 
 | HTTP | code | Arti |
 |---|---|---|
 | 400 | invalid_request / invalid_number / invalid_spec | Payload, nomor, URL non-HTTPS/SSRF, atau spesifikasi pesan outbox tidak valid |
-| 401 | unauthorized | Key tidak ada, salah, atau dicabut |
-| 403 | forbidden_instance | Key tidak punya akses ke instance |
+| 401 | unauthorized / key_expired | Key tidak ada, salah, dicabut, atau melewati `expires_at` |
+| 403 | forbidden_instance / scope_denied / chat_not_allowed / outside_reply_window / first_contact_denied / first_contact_requires_approval / destructive_denied / destructive_requires_approval | Key tidak punya akses instance, scope kurang, atau melanggar aturan `KeyPolicy` pengiriman / aksi destruktif |
 | 404 | instance_not_found / message_not_found / event_not_found / upload_not_found | Instance, pesan outbox, event journal, atau descriptor upload tidak ditemukan |
 | 409 | instance_not_paired / message_not_cancellable | Instance belum di-pairing atau status pesan bukan `queued` saat pembatalan |
 | 410 | upload_expired / media_gone | Descriptor `upload_id` kedaluwarsa (>24 jam) atau media sudah tidak tersedia (termasuk setelah media resurrection) |
 | 413 | media_too_large | Media melebihi batas (16 MiB media, 64 MiB dokumen, 1 MiB sticker) |
 | 415 | unsupported_media / ptt_requires_ogg_opus / sticker_requires_webp | Format media tidak didukung (mis. GIF sebagai `image`), PTT wajib OGG Opus, sticker wajib WebP |
 | 422 | idempotency_key_reused | Header `Idempotency-Key` dipakai ulang untuk tujuan atau isi pesan berbeda |
-| 429 | queue_full | Antrian kirim penuh (ada `retry_after` & header `Retry-After`) |
-| 429 | sse_limit | Batas koneksi SSE konkuren tercapai (disertai header `Retry-After: 10`) |
-| 502 | send_failed | Pengiriman gagal permanen (`failed`/`expired`/`cancelled`) saat `wait=sent` |
+| 429 | queue_full / sse_limit / rate_limited / policy_rate_limited / guardian_limited | Antrian kirim penuh, kuota SSE penuh, rate limit per API key terlampaui (`Retry-After: 1`), kuota per jam `KeyPolicy` habis, atau batas Guardian |
+| 502 | send_failed / upstream_error / pairing_failed | Kesalahan upstream/pengiriman gagal permanen dengan pesan generik aman (detail asli dicatat hanya di log internal) |
 | 503 | not_ready / memory_pressure | Daemon tidak siap (DB gagal atau tekanan memori level `Red`; endpoint media menyertakan `Retry-After: 15`) |
 | 503 | instance_not_connected | Instance belum/tidak tersambung |
 | 504 | send_timeout | WhatsApp tidak merespons dalam batas tunggu (v2 menyertakan `details: { id, status_url }`) |
@@ -405,14 +404,14 @@
 | Query Params | - |
 | Request Body | `action` (`add\|remove\|promote\|demote`), `participants` (array nomor/JID, 1..50 peserta) |
 | Response | 200 `{ results: [{ jid, status }] }` (`ok\|privacy_requires_invite\|already_member\|not_on_whatsapp\|error_<kode>`) · 400 `invalid_request` · 403/429 dari `GroupGovernor` / IQError |
-| Notes | `GroupGovernor.AllowParticipantAdd` diperiksa khusus saat `action == "add"` sebelum memanggil WhatsApp |
+| Notes | `GroupGovernor.AllowParticipantAdd` diperiksa khusus saat `action == "add"` dan `PolicyChecker.CheckDestructive` diperiksa saat `action == "remove"` sebelum memanggil WhatsApp |
 
 ## GET /v2/instances/{id}/groups/{jid}/invite-link
 
 | Field | Detail |
 |---|---|
 | Method + Endpoint | GET /v2/instances/{id}/groups/{jid}/invite-link |
-| Auth Required | Yes (X-API-Key, scope `groups:read`, atau `groups:write` bila `reset=true` saat penegakan scope aktif) |
+| Auth Required | Yes (X-API-Key, scope `groups:read`, atau `groups:write` bila `reset=true`) |
 | Headers | X-API-Key |
 | Query Params | `reset` (bool opsional, default `false`) |
 | Request Body | - |
@@ -491,6 +490,30 @@
 | Response | 200 `{ instance, state, score, profile, shadow, factors: [{ code, impact, detail }], counters: { sent_24h, first_contact_24h, delivered_24h, replied_24h }, limits: { daily_cap, daily_remaining, first_contact_cap, first_contact_remaining, warmup_factor, quiet_hours }, ban: { active, last_code?, last_at?, until } }` · 404 `instance_not_found` |
 | Notes | `factors` diurutkan menurut penalti `impact` terberat lebih dulu (mis. `-60`, `-22`, `+8`); selama shadow mode aktif (`shadow: true`), aturan 3–7 `Decide` dan kuota grup hanya dicatat ke `waapi_guardian_shadow_total` |
 
+## GET /v2/instances/{id}/settings
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/settings |
+| Auth Required | Yes (`X-API-Key` / `Bearer`, scope `settings:admin`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 langsung objek `store.InstanceSettings` di level atas JSON · 401 · 403 `scope_denied` · 404 |
+| Notes | - |
+
+## PATCH /v2/instances/{id}/settings
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | PATCH /v2/instances/{id}/settings |
+| Auth Required | Yes (`X-API-Key` / `Bearer`, scope `settings:admin`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...`, Content-Type: application/json |
+| Query Params | - |
+| Request Body | Patch JSON parsial terhadap field `InstanceSettings` (field asing atau nilai tidak valid ditolak `400`) |
+| Response | 200 langsung objek `store.InstanceSettings` terbaru · 400 `invalid_request` / `invalid_spec` · 403 `scope_denied` · 404 |
+| Notes | Menerapkan `InstanceSettings.Merge`, menyinkronkan cache target/instance di memori, dan mencatat entri `settings.update` ke `audit_log` |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -513,6 +536,9 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
 - `POST /control/instances/{id}/recycle` menghentikan supervisor, melepas client lama, memuat ulang device `sqlstore`, dan menyalakan ulang supervisor (`waapi recycle <id>`). Ditolak HTTP 400 bila belum dipairing.
 - `GET /control/instances/{id}/health` mengembalikan `HealthReport` Guardian lengkap untuk sebuah instance (`waapi health <id> [--json]`).
+- `POST /control/keys` mendukung atribut v2 (`scopes`, `expires_in`/`expires_at`, `rate_per_sec`, `policy`), `GET /control/keys/{id}` menampilkan detail metadata key tanpa rahasia (`waapi key show <id>`), dan `POST /control/keys/{id}/rotate` menerbitkan key pengganti sekaligus menetapkan masa grace key lama (`waapi key rotate <id> [--grace 24h]`).
+- `GET /control/audit` (`?since=24h&action=...&limit=100`) membaca entri `audit_log` beserta actor UID (`SO_PEERCRED` Linux) / key ID (`waapi audit`).
+- `POST /control/backup` membuat backup atomik `VACUUM INTO` untuk `app.db`, `journal.db`, dan `wa.db` ke `backups/db-<versi>-<timestamp>/` (`0600`, retensi 3 backup terbaru); dipanggil otomatis oleh `waapi update` bila daemon hidup. Socket `control.sock` dibuat atomik lewat temp socket -> `chmod 0660` -> `rename`.
 
 ## Scheduled Tasks
 
@@ -526,7 +552,7 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Outbox lease recovery | Saat startup & tiap 60 detik | Kembalikan pekerjaan `sending` yang lease-nya kedaluwarsa (crash/kill) | Ubah status kembali ke `queued` dan bangunkan scheduler instance |
 | Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
-| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox`, `uploads`, serta bucket Guardian tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox`, descriptor `uploads` > 24h, `guardian_hourly` > 8 hari, `guardian_fanout` > 2 hari, serta inkremen `dropped_undelivered_total` |
+| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox`, `uploads`, bucket Guardian, serta `audit_log` (> 90 hari) tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox`, descriptor `uploads` > 24h, `guardian_hourly` > 8 hari, `guardian_fanout` > 2 hari, `audit_log` > 90 hari, serta inkremen `dropped_undelivered_total` |
 | Guardian bucket flusher | Tiap 30 detik & saat shutdown | Sinkronkan delta ring counter 25 jam dari RAM ke tabel `guardian_hourly` di `journal.db` | Menjaga hitungan skor dan kuota tetap akurat setelah restart tanpa write DB per pesan |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |

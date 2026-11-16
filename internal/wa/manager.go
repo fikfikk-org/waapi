@@ -448,6 +448,11 @@ func (m *Manager) Recycle(ctx context.Context, id string) (*InstanceStatus, erro
 	return m.Status(ctx, id)
 }
 
+// UpdateSettings memperbarui konfigurasi InstanceSettings secara aman sekaligus menyinkronkan TargetCache dan deliverer.
+func (m *Manager) UpdateSettings(ctx context.Context, id string, settings store.InstanceSettings) (*InstanceStatus, error) {
+	return m.Update(ctx, id, store.InstanceUpdate{Settings: &settings})
+}
+
 // Update memperbarui konfigurasi instance di DB dan menyinkronkan rate limiter, settings, cursor, serta deliverer webhook.
 func (m *Manager) Update(ctx context.Context, id string, up store.InstanceUpdate) (*InstanceStatus, error) {
 	prev, err := m.store.GetInstance(ctx, id)

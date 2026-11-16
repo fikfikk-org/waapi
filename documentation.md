@@ -38,7 +38,10 @@ flowchart TD
         SB -->|"Stop()"| SST
     end
     subgraph ApiKey
-        KA["active"] -->|"key revoke"| KR["revoked"]
+        KA["active (scope + policy + rate)"] -->|"key revoke"| KR["revoked"]
+        KA -->|"key rotate (--grace)"| KG["grace period (expires_at = now + grace)"]
+        KG -->|"melewati expires_at"| KE["expired (401 key_expired)"]
+        KA -->|"melewati expires_at"| KE
     end
     subgraph WebhookEvent
         E1["journal.db (cursor lane)"] -->|"2xx"| E2["cursor commit"]
@@ -115,10 +118,22 @@ flowchart TD
 
 | Field | Rule | Catatan |
 |---|---|---|
-| key | Ditampilkan sekali saat dibuat | Hanya hash yang disimpan |
+| key | Ditampilkan sekali saat dibuat atau dirotasi | Hanya hash SHA-256 yang disimpan |
 | instance_id | Kosong = akses semua instance | Scope per instance |
+| scopes | v1 `Create()` -> `*`; v2 default `instances:read,messages:send,messages:read,media:write,events:read,health:read` | Ditegakkan di router HTTP; `?reset=true` invite-link wajib `groups:write` |
+| expires_at | Unix detik opsional (0 = tidak kedaluwarsa) | Mengembalikan `401 key_expired` setelah terlampaui |
+| rate_per_sec | Token bucket per key (default `50 rps`, burst `100`) | Melebihi batas membalas `429 rate_limited` + `Retry-After: 1` |
+| policy | `KeyPolicy` JSON (`reply_window`, `allowed_chats`, `first_contact`, `max_sends_per_hour`, `destructive`, `tools`) | Key berscope `mcp` tanpa override otomatis memakai `DefaultMCPPolicy()` (`24h`, `ask`, `30/j`, `ask`); key lain memakai `DefaultPolicy()` |
 | revoked_at | Terisi = key tidak berlaku | Efek instan |
 | last_used_at | Diperbarui berkala (60 detik) | Bukan per request |
+
+### Audit Log & Keamanan Rilis
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `audit_log` (`app.db`) | Mencatat aksi mutasi control plane + pairing/settings HTTP dengan retensi `90 hari` | Actor `"control:uid=<UID>"` dari `SO_PEERCRED` di Linux atau `"key:<key_id>"` di HTTP; tidak pernah mencatat token/secret mentah |
+| Socket control atomik | `net.Listen` ke `.tmp` -> `chmod 0660` -> `os.Rename` ke `control.sock` | Meniadakan race permission sesuai `umask` saat startup daemon |
+| Backup & update binary | `waapi update` memverifikasi `checksums.txt` via tanda tangan Ed25519 (`checksums.txt.sig`) fail-closed sebelum unduh/pasang | Bila daemon hidup, memicu `POST /control/backup` (`VACUUM INTO` 3 DB perm `0600`, simpan maks 3 backup); `--insecure-no-verify` hanya untuk rilis lama |
 
 ### Webhook Outbox (Legacy / Migrasi V1 -> V2)
 
@@ -353,4 +368,5 @@ flowchart TD
 | Normalisasi event `group` & `call` | `events.GroupInfo` menggabungkan seluruh perubahan dalam satu event `group` (`changes[]`), `events.JoinedGroup` menghasilkan `action="joined"`, dan `events.CallOffer` / `CallTerminate` / auto-reject memakai dedupe key `c:<call_id>:<action>` tanpa memblokir hot path untuk `RejectCall` |
 | Skor & penegakan Account Health Guardian | Skor murni [0,100] mengevaluasi `recent_temp_ban`, `undelivered_ratio` (`>=20` di `[now-25j,now-1j)`), `first_contact_ratio` (`>=10`), `content_fanout` (`>=0.8`), `rate_overlimit`, dan bonus `reply_rate` (`>=10`); evaluasi `Decide` menerapkan 10 aturan berurutan (opt-out -> ban -> restricted -> fan-out -> low score -> FC cap -> daily cap -> quiet hours -> token bucket); pesan non-teks/caption kosong bebas cek fan-out; pembaruan counter RAM & konfirmasi opt-out hanya berjalan pasca-commit transaksi journal |
 | Admission control & hardening governor | Pada level `Red`, endpoint berat (`POST /pair`, SSE `events/stream`, unggah/unduh media v1/v2, serta `POST /v2/messages` dengan `media.url`) ditolak `503 memory_pressure` (`Retry-After: 15`) dan `/readyz` kembali `503 not_ready`; kirim teks biasa & media `upload_id` tetap diizinkan; unit systemd menyertakan profil `lean` default serta skrip burn-in `scripts/burnin.sh` |
+| Penegakan Scope, Policy, Bearer & 5xx | REST API mendukung `Authorization: Bearer` setara `X-API-Key`, meneruskan `X-Request-Id` ke respons + `error.request_id`, menegakkan scope & rate limit per key, menyaring pengiriman outbox & aksi destruktif grup (`revoke`, `remove`, `leave`) via `PolicyChecker`, dan memastikan respons `5xx` memakai pesan generik tanpa detail error internal |
 

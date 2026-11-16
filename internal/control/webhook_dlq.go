@@ -29,6 +29,7 @@ func (s *Server) handleResumeWebhook(w http.ResponseWriter, r *http.Request) {
 		writeStatusErr(w, err)
 		return
 	}
+	s.recordAudit(r.Context(), "webhook.resume", id, "")
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -96,6 +97,7 @@ func (s *Server) handleReplayWebhookDLQ(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
+	s.recordAudit(r.Context(), "webhook.dlq.replay", id, "count="+strconv.Itoa(len(seqs)))
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -114,5 +116,6 @@ func (s *Server) handlePurgeWebhookDLQ(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.recordAudit(r.Context(), "webhook.dlq.purge", id, "purged="+strconv.FormatInt(purged, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "purged", "purged": purged})
 }

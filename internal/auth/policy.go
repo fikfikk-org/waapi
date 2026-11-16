@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -76,4 +77,64 @@ func validPolicyAction(v string) bool {
 	default:
 		return false
 	}
+}
+
+// ParseKeyPolicy mem-parse JSON KeyPolicy di atas nilai default reguler dan memvalidasinya.
+func ParseKeyPolicy(raw string) (KeyPolicy, error) {
+	p := DefaultPolicy()
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "" && trimmed != "{}" {
+		if err := json.Unmarshal([]byte(trimmed), &p); err != nil {
+			return KeyPolicy{}, fmt.Errorf("parse key policy JSON: %w", err)
+		}
+		if p.FirstContact == "" {
+			p.FirstContact = "allow"
+		}
+		if p.Destructive == "" {
+			p.Destructive = "allow"
+		}
+		if p.AllowedChats == nil {
+			p.AllowedChats = []string{}
+		}
+		if p.Tools == nil {
+			p.Tools = []string{}
+		}
+	}
+	if err := p.Validate(); err != nil {
+		return KeyPolicy{}, err
+	}
+	return p, nil
+}
+
+func normalizePolicyForCreate(p KeyPolicy, scopes ScopeSet) (KeyPolicy, error) {
+	isZero := p.ReplyWindow == 0 && len(p.AllowedChats) == 0 && p.FirstContact == "" &&
+		p.MaxSendsPerHour == 0 && p.Destructive == "" && len(p.Tools) == 0
+	if isZero {
+		if scopes.Has(ScopeMCP) {
+			p = DefaultMCPPolicy()
+		} else {
+			p = DefaultPolicy()
+		}
+	} else {
+		base := DefaultPolicy()
+		if scopes.Has(ScopeMCP) {
+			base = DefaultMCPPolicy()
+		}
+		if p.FirstContact == "" {
+			p.FirstContact = base.FirstContact
+		}
+		if p.Destructive == "" {
+			p.Destructive = base.Destructive
+		}
+		if p.AllowedChats == nil {
+			p.AllowedChats = []string{}
+		}
+		if p.Tools == nil {
+			p.Tools = []string{}
+		}
+	}
+	if err := p.Validate(); err != nil {
+		return KeyPolicy{}, err
+	}
+	return p, nil
 }

@@ -190,8 +190,8 @@ func TestMigrate_DataDirV1KeV2(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&ver); err != nil {
 		t.Fatalf("baca user_version: %v", err)
 	}
-	if ver != 3 {
-		t.Fatalf("user_version diharapkan 3, didapat %d", ver)
+	if ver != 4 {
+		t.Fatalf("user_version diharapkan 4, didapat %d", ver)
 	}
 
 	var settingsLama string

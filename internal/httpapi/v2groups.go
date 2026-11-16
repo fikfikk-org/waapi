@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -127,6 +128,12 @@ func (s *Server) handleV2GroupParticipants(w http.ResponseWriter, r *http.Reques
 	if !decodeGroupJSON(w, r, 32<<10, &req) {
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(req.Action), "remove") && s.policyEnforcer != nil {
+		if err := s.policyEnforcer.CheckDestructive(outboxOriginFromContext(r.Context(), "api"), "remove"); err != nil {
+			writeMappedError(w, err)
+			return
+		}
+	}
 	results, err := s.groupDriver.UpdateGroupParticipants(r.Context(), r.PathValue("id"), grpJID, req)
 	if err != nil {
 		writeMappedError(w, err)
@@ -152,6 +159,12 @@ func (s *Server) handleV2GroupInviteLink(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		reset = parsedReset
+	}
+	if reset {
+		if km, ok := r.Context().Value(keyMetaCtx).(*auth.KeyMeta); ok && km != nil && !km.Scopes.Has(auth.ScopeGroupsWrite) {
+			writeError(w, http.StatusForbidden, "scope_denied", "API key tidak memiliki scope groups:write untuk reset link undangan", 0)
+			return
+		}
 	}
 	link, err := s.groupDriver.GetGroupInviteLink(r.Context(), r.PathValue("id"), grpJID, reset)
 	if err != nil {
@@ -190,6 +203,12 @@ func (s *Server) handleV2JoinGroup(w http.ResponseWriter, r *http.Request, _ *wa
 func (s *Server) handleV2LeaveGroup(w http.ResponseWriter, r *http.Request, _ *wa.Instance) {
 	if !s.ensureGroupDriver(w) {
 		return
+	}
+	if s.policyEnforcer != nil {
+		if err := s.policyEnforcer.CheckDestructive(outboxOriginFromContext(r.Context(), "api"), "leave"); err != nil {
+			writeMappedError(w, err)
+			return
+		}
 	}
 	grpJID, ok := parseGroupJIDParam(w, r)
 	if !ok {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -239,10 +240,13 @@ func writeOutboxWaitError(w http.ResponseWriter, reqCtx context.Context, instID 
 	}
 	if errors.Is(waitErr, outbox.ErrSendFailed) {
 		msg := "pesan gagal dikirim"
-		if ref.ErrorMsg != "" {
-			msg = ref.ErrorMsg
-		} else if ref.Status == outbox.StatusExpired {
+		if ref.Status == outbox.StatusExpired {
 			msg = "pesan kedaluwarsa sebelum terkirim"
+		}
+		if ref.ErrorMsg != "" {
+			slog.Error("eksekusi pesan outbox gagal permanen",
+				"instance", instID, "msg_id", ref.ID, "error_code", ref.ErrorCode,
+				"request_id", w.Header().Get("X-Request-Id"), "err", ref.ErrorMsg)
 		}
 		details := map[string]any{
 			"id":     ref.ID,
