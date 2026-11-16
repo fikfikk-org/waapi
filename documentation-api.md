@@ -56,7 +56,7 @@
 | Headers | Accept: text/plain (opsional) |
 | Query Params | - |
 | Request Body | - |
-| Response | 200 `text/plain; version=0.0.4; charset=utf-8` berisi metrik berawalan `waapi_` |
+| Response | 200 `text/plain; version=0.0.4; charset=utf-8` berisi metrik berawalan `waapi_` (termasuk `waapi_memory_governor_level`: `0` green, `1` yellow, `2` red) |
 | Notes | Mati secara default bila `WAAPI_METRICS_ADDR` kosong; memicu log WARN saat start bila alamat bukan loopback; hanya melayani `/metrics` |
 
 ## GET /v1/instances
@@ -92,8 +92,8 @@
 | Headers | X-API-Key, Content-Type: application/json (opsional) |
 | Query Params | - |
 | Request Body | phone (string, opsional, 8-15 digit tanpa awalan 0 untuk mode kode 8-digit; kosongkan untuk mode QR) |
-| Response | 200 instance, method, state, pairing_code, qr_raw, qr_image_url, expires_in, session_expires_in · 400 · 409 · 504 |
-| Notes | Idempoten untuk method+phone yang sama; sesi berjalan di latar belakang dengan TTL 170 detik |
+| Response | 200 instance, method, state, pairing_code, qr_raw, qr_image_url, expires_in, session_expires_in · 400 · 409 · 503 `memory_pressure` · 504 |
+| Notes | Idempoten untuk method+phone yang sama; sesi berjalan di latar belakang dengan TTL 170 detik; ditolak `503 memory_pressure` (`Retry-After: 15`) saat level governor `Red` |
 
 ## GET /v1/instances/{id}/pair
 
@@ -212,8 +212,8 @@
 | Headers | X-API-Key, Last-Event-ID (opsional, diprioritaskan di atas query `after`) |
 | Query Params | `after` (int64 >= 0, opsional; bila kosong bersama `Last-Event-ID` mulai dari head seq terkini), `types` (string csv, opsional) |
 | Request Body | - |
-| Response | 200 `text/event-stream` (`id: <seq>`, `event: <type>`, `data: <envelope v2 JSON>`; heartbeat `: ping` tiap 25 detik) · 400 · 403 · 404 · 429 `sse_limit` · 503 |
-| Notes | Kuota koneksi SSE dibatasi `WAAPI_SSE_MAX` (header `Retry-After: 10` saat penuh); write deadline per frame 30 detik via `http.ResponseController` untuk memutus klien lambat tanpa mematikan stream idle |
+| Response | 200 `text/event-stream` (`id: <seq>`, `event: <type>`, `data: <envelope v2 JSON>`; heartbeat `: ping` tiap 25 detik) · 400 · 403 · 404 · 429 `sse_limit` · 503 `memory_pressure` / `journal_unavailable` |
+| Notes | Kuota koneksi SSE dibatasi `WAAPI_SSE_MAX` (header `Retry-After: 10` saat penuh); koneksi baru ditolak `503 memory_pressure` (`Retry-After: 15`) saat governor level `Red`; write deadline per frame 30 detik via `http.ResponseController` |
 
 ## POST /v2/instances/{id}/media
 
@@ -260,8 +260,8 @@
 | Headers | X-API-Key, Content-Type: application/json, Idempotency-Key (opsional) |
 | Query Params | - |
 | Request Body | to (string, wajib) · type (`text` \| `image` \| `video` \| `audio` \| `document` \| `sticker` \| `location` \| `contact` \| `poll` \| `reaction` \| `edit` \| `revoke`) · text (1–60.000 byte untuk `text`) · media (`{ upload_id \| url, ... }`) · location (`{ lat, lng, name?, address? }`) · contacts (`[{ name, phones?, vcard? }]`, 1–10 kontak) · poll (`{ name, options, selectable }`, 2–12 opsi unik) · reaction (`{ message_id, sender?, emoji }`) · edit (`{ message_id, text }`) · revoke (`{ message_id, sender? }`) · reply_to (`{ id, sender? }`, opsional) · mentions (`[]string`, opsional) · typing (bool, opsional) · send_at (RFC3339, opsional) · priority (`normal` \| `urgent`, default `normal`) · ttl (Go duration, opsional) · wait (`none` \| `sent`, default `none`) |
-| Response | `wait=none`: 202 (baru) / 200 (idempoten hit) `{ id, wa_message_id, status, to, not_before, status_url }` · `wait=sent`: 200 objek detail pesan · 400 · 404 `upload_not_found` · 409 · 410 `upload_expired` · 422 · 429 · 502 · 504 |
-| Notes | `upload_id` divalidasi langsung di handler HTTP dan diperiksa ulang saat eksekusi (`media_expired`); thumbnail base64 maks 16 KiB; voice note memakai `type: "audio"` + `media.ptt: true`; panjang teks `1–60.000 byte` divalidasi saat enqueue; seluruh timestamp JSON bernilai Unix detik |
+| Response | `wait=none`: 202 (baru) / 200 (idempoten hit) `{ id, wa_message_id, status, to, not_before, status_url }` · `wait=sent`: 200 objek detail pesan · 400 · 404 `upload_not_found` · 409 · 410 `upload_expired` · 422 · 429 · 502 · 503 `memory_pressure` (bila `media.url` diisi saat `Red`) · 504 |
+| Notes | `upload_id` divalidasi langsung di handler HTTP dan diperiksa ulang saat eksekusi (`media_expired`); pada level governor `Red`, hanya enqueue dengan `media.url` non-kosong yang ditolak `503 memory_pressure` sementara pesan teks & `upload_id` tetap diizinkan |
 
 ## GET /v2/instances/{id}/messages/{msg_id}
 
@@ -508,7 +508,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `POST /control/instances/{id}/webhook/resume` menghapus status `webhook_paused` dan menyalakan ulang deliverer dari cursor tersimpan (`waapi webhook resume <id>`).
 - `GET /control/instances/{id}/webhook/dlq` (`?limit=N`), `POST /control/instances/{id}/webhook/dlq/replay` (`{ all, seq, seqs }`), dan `DELETE /control/instances/{id}/webhook/dlq` mengelola dead-letter queue (`waapi webhook dlq <id> <ls|replay|purge>`).
 - `POST /control/instances/{id}/messages` mengantrekan pesan teks ke Durable Outbox dari kontrol lokal `{ to, text, reply_to?, typing?, wait?, idem_key? }` (`wait`: `none` atau `sent` maks 30 detik), diakses melalui CLI `waapi send <id> <to> <text> [--wait] [--idem KEY] [--typing] [--json]`.
-- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB termasuk `journal.db`, ringkasan per-instance `webhook`: `head_seq`, `min_cursor`, `lag`, `oldest_undelivered_sec`, `dlq`, `paused`, `dropped_undelivered`, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]`.
+- `GET /control/doctor?deep=1` mengembalikan `DeepReport` (blok proses `procfs`/`smaps_rollup`, `runtime/metrics`, cgroup v2 & PSI, THP mode, `DBStatus` SQLite per DB termasuk `journal.db`, ringkasan per-instance `webhook`: `head_seq`, `min_cursor`, `lag`, `oldest_undelivered_sec`, `dlq`, `paused`, `dropped_undelivered`, field `governor_level`, metadata build, dan jumlah `goroutineleak`), diakses via `waapi doctor --deep [--json]` (menampilkan saran `GODEBUG=disablethp=1` bila THP `always`). `GET /control/doctor` standar juga menyertakan `governor_level`.
 - `GET /control/instances/{id}/events` mengambil atau long-poll (`?after=N&limit=N&types=csv&wait=N`), dan `GET /control/instances/{id}/events/stream` melakukan SSE stream event journal v2 per instance via `waapi events <id> [--after N] [--types csv] [--limit N] [--follow] [--json]`.
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
 - `POST /control/instances/{id}/recycle` menghentikan supervisor, melepas client lama, memuat ulang device `sqlstore`, dan menyalakan ulang supervisor (`waapi recycle <id>`). Ditolak HTTP 400 bila belum dipairing.
@@ -530,4 +530,7 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Guardian bucket flusher | Tiap 30 detik & saat shutdown | Sinkronkan delta ring counter 25 jam dari RAM ke tabel `guardian_hourly` di `journal.db` | Menjaga hitungan skor dan kuota tetap akurat setelah restart tanpa write DB per pesan |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
+| Memory Governor loop | Tiap 5 detik | Sampel memori anonim cgroup/procfs + PSI dengan hysteresis bertahap | Atur `GOGC` (`25`/`BaseGOGC`), jalankan `PRAGMA shrink_memory` (`Yellow`), `FreeOSMemory()` (`Red`), pacing webhook `200 ms`, dan auto-recycle round-robin saat `Red >= 10m` & `WAAPI_AUTO_RECYCLE=on` |
+| Scheduled recycle harian | Tiap 30 detik cek `recycle_at` lokal | Refresh client `wa.Manager.Recycle` sekali sehari di luar jam sibuk | Dilewati untuk hari itu bila ada job `sending` atau aktivitas pesan 5 menit terakhir |
+| Boot binary pageout | 90 detik setelah start (bila `WAAPI_PAGEOUT_AFTER_BOOT` `cold` \| `pageout`) | Terapkan `SYS_MADVISE` pada mapping `r-xp`/`r--p` binary Linux (mati secara default) | Tandai halaman teks/rodata binary agar siap di-reclaim kernel |
 

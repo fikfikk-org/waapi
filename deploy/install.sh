@@ -6,6 +6,29 @@ REPO="fikfikk-org/waapi"
 BIN_PATH="/usr/local/bin/waapi"
 DATA_DIR="/var/lib/waapi"
 SERVICE_FILE="/etc/systemd/system/waapi.service"
+PROFILE="${WAAPI_PROFILE:-lean}"
+
+case "${PROFILE}" in
+  micro)
+    PROFILE_GOMEMLIMIT="20MiB"
+    PROFILE_MEM_HIGH="40M"
+    PROFILE_MEM_MAX="64M"
+    ;;
+  lean)
+    PROFILE_GOMEMLIMIT="28MiB"
+    PROFILE_MEM_HIGH="56M"
+    PROFILE_MEM_MAX="80M"
+    ;;
+  classic)
+    PROFILE_GOMEMLIMIT="80MiB"
+    PROFILE_MEM_HIGH="90M"
+    PROFILE_MEM_MAX="100M"
+    ;;
+  *)
+    echo "Profil WAAPI_PROFILE tidak valid: ${PROFILE} (pilih: micro, lean, classic)" >&2
+    exit 1
+    ;;
+esac
 
 # Pastikan skrip dijalankan sebagai root
 if [[ "${EUID}" -ne 0 ]]; then
@@ -75,47 +98,81 @@ export WAAPI_DATA_DIR="/var/lib/waapi"
 EOF
 chmod 0644 /etc/profile.d/waapi.sh
 
-# Tulis unit systemd langsung agar install.sh dapat dijalankan standalone via curl | sudo bash
-cat >"${SERVICE_FILE}" <<'EOF'
-# Unit systemd untuk daemon waapi dengan batas RAM keras 100 MB
+# Backup unit systemd lama sebelum menimpa dengan konfigurasi v2
+if [[ -f "${SERVICE_FILE}" ]]; then
+  cp -f "${SERVICE_FILE}" "${SERVICE_FILE}.bak"
+  chmod 0644 "${SERVICE_FILE}.bak"
+  echo "✔ Unit lama di-backup ke ${SERVICE_FILE}.bak"
+fi
+
+# Tulis unit systemd berbasis profil agar install.sh dapat dijalankan standalone via curl | sudo bash
+cat >"${SERVICE_FILE}" <<EOF
+# Unit systemd waapi v2 untuk profil ${PROFILE}
 [Unit]
-Description=waapi Private WhatsApp API Gateway
+Description=waapi WhatsApp API Gateway v2
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
 NotifyAccess=main
-WatchdogSec=30s
-TimeoutStartSec=90
 User=waapi
 Group=waapi
 UMask=0007
-Environment=WAAPI_DATA_DIR=/var/lib/waapi
+Environment=WAAPI_DATA_DIR=${DATA_DIR}
 Environment=WAAPI_HTTP_ADDR=127.0.0.1:8080
-Environment=GOMEMLIMIT=80MiB
+Environment=WAAPI_PROFILE=${PROFILE}
+Environment=GOMEMLIMIT=${PROFILE_GOMEMLIMIT}
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
+# Aktifkan hanya bila waapi doctor --deep melaporkan THP "always", lalu bandingkan RSS
+#Environment=GODEBUG=disablethp=1
 ExecStart=/usr/local/bin/waapi serve
 Restart=always
 RestartSec=3
+TimeoutStartSec=90
+WatchdogSec=30s
 
-# Throttle memori mulai 90 MB dan batasi maksimum 100 MB tanpa swap
-MemoryHigh=90M
-MemoryMax=100M
+# Throttle & batas maksimum cgroup v2 sesuai profil ${PROFILE} tanpa swap
+MemoryHigh=${PROFILE_MEM_HIGH}
+MemoryMax=${PROFILE_MEM_MAX}
 MemorySwapMax=0
+TasksMax=64
+LimitNOFILE=4096
 
 # Hardening keamanan sistem operasi
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/waapi
+ReadWritePaths=${DATA_DIR}
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service madvise fadvise64 sync_file_range
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
 EOF
 chmod 0644 "${SERVICE_FILE}"
+
+if command -v systemd-analyze >/dev/null 2>&1; then
+  if ! systemd-analyze syscall-filter @system-service >/dev/null 2>&1; then
+    echo "Catatan: systemd-analyze syscall-filter tidak tersedia; daftar syscall eksplisit tetap terpasang."
+  fi
+fi
 
 systemctl daemon-reload
 systemctl enable --now waapi

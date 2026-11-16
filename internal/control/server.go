@@ -16,6 +16,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/guardian"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
@@ -69,6 +70,15 @@ func WithHealthProvider(hp healthProvider) ServerOption {
 	}
 }
 
+// WithGovernor memasang sumber level tekanan memori Governor agar dilaporkan oleh waapi doctor.
+func WithGovernor(src governor.Source) ServerOption {
+	return func(s *Server) {
+		if src != nil {
+			s.gov = src
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -81,6 +91,7 @@ type Server struct {
 	journal    *journal.Journal
 	outbox     *outbox.Service
 	health     healthProvider
+	gov        governor.Source
 	startedAt  time.Time
 	version    string
 }
@@ -93,6 +104,7 @@ func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manag
 		auth:      a,
 		wa:        w,
 		webhook:   wh,
+		gov:       governor.AlwaysGreen,
 		startedAt: time.Now(),
 		version:   "dev",
 	}
@@ -175,6 +187,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 	outbox, _ := s.store.CountOutbox(r.Context())
 	counts := s.wa.CountByStatus(r.Context())
+	govLevel := governor.Green.String()
+	if s.gov != nil {
+		govLevel = s.gov.Level().String()
+	}
 	if r.URL.Query().Get("deep") == "1" {
 		dbs := []obs.DBInput{
 			{Name: "app.db", DB: s.store.DB, Path: s.cfg.AppDBPath()},
@@ -186,6 +202,8 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 			dbs = append(dbs, obs.DBInput{Name: "journal.db", DB: s.journal.DB(), Path: s.cfg.JournalDBPath()})
 		}
 		rep := obs.CollectDeep(r.Context(), s.startedAt, s.cfg.AppDBPath(), s.cfg.WADBPath(), outbox, counts, dbs, s.version)
+		rep.GovernorLevel = govLevel
+		rep.Doctor.GovernorLevel = govLevel
 		if s.journal != nil && s.store != nil {
 			if instances, err := s.store.ListInstances(r.Context()); err == nil {
 				whReports := make([]obs.WebhookInstanceReport, 0, len(instances))
@@ -227,6 +245,7 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rep := obs.Collect(s.startedAt, s.cfg.AppDBPath(), s.cfg.WADBPath(), outbox, counts)
+	rep.GovernorLevel = govLevel
 	writeJSON(w, http.StatusOK, rep)
 }
 

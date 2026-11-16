@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/store"
 )
@@ -23,6 +24,7 @@ type Gate interface {
 // Options mengatur dependensi tambahan dan tuning deliverer webhook v2.
 type Options struct {
 	Store          *store.Store
+	Governor       governor.Source
 	CommitEvery    int
 	CommitInterval time.Duration
 	AttemptTimeout time.Duration
@@ -116,6 +118,7 @@ type Service struct {
 	pauser  targetPauser
 	client  *http.Client
 	gate    Gate
+	gov     governor.Source
 	opt     Options
 
 	mu         sync.Mutex
@@ -160,6 +163,10 @@ func newServiceWithDeps(
 	if client == nil {
 		client = defaultWebhookHTTPClient()
 	}
+	gov := opt.Governor
+	if gov == nil {
+		gov = governor.AlwaysGreen
+	}
 	return &Service{
 		journal:    j,
 		jr:         jr,
@@ -169,6 +176,7 @@ func newServiceWithDeps(
 		pauser:     pauser,
 		client:     client,
 		gate:       gate,
+		gov:        gov,
 		opt:        opt,
 		deliverers: make(map[string]*laneDeliverer),
 	}

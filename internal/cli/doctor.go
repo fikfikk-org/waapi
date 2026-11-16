@@ -60,6 +60,9 @@ func runDoctor(ctx context.Context, ctrl *control.Client, args []string) error {
 	total := totalInstances(rep.InstanceCount)
 
 	fmt.Printf("Daemon        running (pid %d, uptime %s)\n", rep.PID, formatDuration(rep.UptimeSec))
+	if rep.GovernorLevel != "" {
+		fmt.Printf("Governor      %s\n", rep.GovernorLevel)
+	}
 	fmt.Printf("RSS           %s   (hard target < 100 MB)\n", formatBytes(int64(rep.RSSBytes)))
 	fmt.Printf("Go heap       %s alloc / %s sys   (GOMEMLIMIT %s, GOGC %s)\n",
 		formatBytes(int64(rep.HeapAlloc)), formatBytes(int64(rep.HeapSys)), memLimit, gogc)
@@ -109,6 +112,12 @@ func printDeepDoctor(rep obs.DeepReport) {
 	fmt.Printf("Goroutines    %d (leaks: %d) · GC cycles %d (P99 pause %dµs)\n",
 		rt.Goroutines, rep.GoroutineLeaks, rt.GCCycles, rt.GCPauseP99Ns/1000)
 	fmt.Printf("GC tuning     GOMEMLIMIT %s · GOGC %d\n", formatBytes(int64(rt.MemoryLimit)), rt.GOGC)
+	if govLvl := rep.GovernorLevel; govLvl != "" || doc.GovernorLevel != "" {
+		if govLvl == "" {
+			govLvl = doc.GovernorLevel
+		}
+		fmt.Printf("Governor      %s\n", govLvl)
+	}
 
 	fmt.Println("\n=== Cgroup v2 ===")
 	if rep.Cgroup == nil {
@@ -140,6 +149,9 @@ func printDeepDoctor(rep obs.DeepReport) {
 		thp = "tidak tersedia"
 	}
 	fmt.Printf("Mode          %s\n", thp)
+	if thp == "always" {
+		fmt.Println("Rekomendasi   THP 'always' terdeteksi; coba GODEBUG=disablethp=1 di unit systemd lalu bandingkan RSS")
+	}
 
 	fmt.Println("\n=== SQLite ===")
 	for _, db := range rep.SQLite {

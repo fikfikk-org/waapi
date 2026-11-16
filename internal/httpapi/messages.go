@@ -68,10 +68,6 @@ func (s *Server) handleSendText(w http.ResponseWriter, r *http.Request, inst *wa
 
 // handleSendMedia memproses multipart/form-data secara streaming menggunakan multipart.Reader.
 func (s *Server) handleSendMedia(w http.ResponseWriter, r *http.Request, inst *wa.Instance) {
-	if s.rejectIfRed(w) {
-		return
-	}
-
 	rc := http.NewResponseController(w)
 	deadline := time.Now().Add(mediaTransferDeadline)
 	_ = rc.SetReadDeadline(deadline)
@@ -192,10 +188,6 @@ func (s *Server) handleSendMedia(w http.ResponseWriter, r *http.Request, inst *w
 
 // handleSendMediaURL mengunduh media dari URL https eksternal (anti-SSRF) melalui pipeline lalu mengirimkannya.
 func (s *Server) handleSendMediaURL(w http.ResponseWriter, r *http.Request, inst *wa.Instance) {
-	if s.rejectIfRed(w) {
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var req sendMediaURLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

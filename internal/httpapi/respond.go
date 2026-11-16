@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/media"
@@ -116,13 +115,5 @@ func writeMappedError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusBadGateway, "send_failed", err.Error(), 0)
 	}
-}
-
-func (s *Server) rejectIfRed(w http.ResponseWriter) bool {
-	if s != nil && s.gov != nil && s.gov.Level() == governor.Red {
-		writeError(w, http.StatusServiceUnavailable, "memory_pressure", "daemon berada dalam tekanan memori level Red", 15)
-		return true
-	}
-	return false
 }
 

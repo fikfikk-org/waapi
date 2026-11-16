@@ -17,6 +17,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/control"
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
@@ -130,8 +131,8 @@ func TestObservabilityEndpoints(t *testing.T) {
 		}
 	}
 
-	// 4. Pastikan handler /metrics berisi seluruh 9 metrik awal Prometheus
-	mHandler := newMetricsHandler(cfg, st, waMgr)
+	// 4. Pastikan handler /metrics berisi metrik awal Prometheus dan level governor
+	mHandler := newMetricsHandler(cfg, st, waMgr, governor.AlwaysGreen)
 	recMetrics := httptest.NewRecorder()
 	mHandler.ServeHTTP(recMetrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if recMetrics.Code != http.StatusOK {
@@ -146,6 +147,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 		"waapi_go_gc_cycles_total",
 		"waapi_cgroup_memory_current_bytes",
 		"waapi_cgroup_memory_pressure_some_avg10",
+		"waapi_memory_governor_level",
 		"waapi_sqlite_cache_used_bytes{",
 		"waapi_instances{",
 	}

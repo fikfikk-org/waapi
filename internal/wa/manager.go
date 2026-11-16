@@ -9,12 +9,14 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
 	"github.com/fikfikk-org/waapi/internal/media"
@@ -133,6 +135,10 @@ type Manager struct {
 	mediaSem     *semaphore.Weighted
 	groupListLRU *LRU[string, []GroupSummary]
 	groupGov     GroupGovernor
+	recycleCoord *recycleCoordinator
+	freeOSMu     sync.Mutex
+	freeOSFn     func()
+	lastFreeOS   time.Time
 
 	obsMu     sync.RWMutex
 	observers []InboundObserver
@@ -176,6 +182,7 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		groupGov:     noopGroupGovernor{},
 		instances:    make(map[string]*Instance),
 	}
+	m.recycleCoord = newRecycleCoordinator(managerRecycleBackend{mgr: m}, governor.AlwaysGreen)
 	for _, opt := range opts {
 		if opt != nil {
 			opt(m)
@@ -744,5 +751,62 @@ func (m *Manager) EnqueueSystemText(ctx context.Context, instanceID, to, text, i
 		Origin: outbox.Origin{Kind: "system"},
 	})
 	return err
+}
+
+// SetFreeOSMemoryFn menyetel fungsi pelepas memori OS pasca-pairing (disambungkan ke Governor dari daemon).
+func (m *Manager) SetFreeOSMemoryFn(fn func()) {
+	if m == nil {
+		return
+	}
+	m.freeOSMu.Lock()
+	m.freeOSFn = fn
+	m.freeOSMu.Unlock()
+}
+
+func (m *Manager) freeOSMemoryAfterPairing() {
+	if m == nil {
+		return
+	}
+	m.freeOSMu.Lock()
+	fn := m.freeOSFn
+	if fn != nil {
+		m.freeOSMu.Unlock()
+		fn()
+		return
+	}
+	now := time.Now()
+	if !m.lastFreeOS.IsZero() && now.Sub(m.lastFreeOS) < 60*time.Second {
+		m.freeOSMu.Unlock()
+		return
+	}
+	m.lastFreeOS = now
+	m.freeOSMu.Unlock()
+	debug.FreeOSMemory()
+}
+
+// RecordActivity memperbarui stempel waktu aktivitas pesan terbaru sebuah instance (dipakai outbox Enqueue).
+func (m *Manager) RecordActivity(instanceID string, at time.Time) {
+	if m == nil {
+		return
+	}
+	if inst, ok := m.Get(instanceID); ok {
+		inst.recordActivity(at)
+	}
+}
+
+// StartRecycleLoop menjalankan scheduler recycle harian (recycle_at) hingga ctx dibatalkan.
+func (m *Manager) StartRecycleLoop(ctx context.Context) {
+	if m == nil || m.recycleCoord == nil {
+		return
+	}
+	go m.recycleCoord.Run(ctx)
+}
+
+// RecycleNextEligible me-recycle satu instance secara round-robin dengan cooldown >= 6 jam jika tidak ada job sending.
+func (m *Manager) RecycleNextEligible(ctx context.Context) (bool, error) {
+	if m == nil || m.recycleCoord == nil {
+		return false, nil
+	}
+	return m.recycleCoord.RecycleNextEligible(ctx)
 }
 

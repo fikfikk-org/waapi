@@ -373,6 +373,10 @@ func (s *PairSession) run() {
 
 		s.readyOnce.Do(func() { close(s.ready) })
 		close(s.done)
+
+		if success && s.inst.mgr != nil {
+			s.inst.mgr.freeOSMemoryAfterPairing()
+		}
 	}()
 
 	factory := s.inst.driverFactory

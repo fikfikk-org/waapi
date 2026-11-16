@@ -1,30 +1,35 @@
-# Unit systemd untuk daemon waapi dengan batas RAM keras 100 MB
+# Unit systemd waapi v2, profil lean (<= 4 instance)
 [Unit]
-Description=waapi Private WhatsApp API Gateway
+Description=waapi WhatsApp API Gateway v2
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
 NotifyAccess=main
-WatchdogSec=30s
-TimeoutStartSec=90
 User=waapi
 Group=waapi
 UMask=0007
 Environment=WAAPI_DATA_DIR=/var/lib/waapi
 Environment=WAAPI_HTTP_ADDR=127.0.0.1:8080
-Environment=GOMEMLIMIT=80MiB
+Environment=WAAPI_PROFILE=lean
+Environment=GOMEMLIMIT=28MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
+# Aktifkan hanya bila `waapi doctor --deep` melaporkan THP "always", lalu bandingkan RSS
+#Environment=GODEBUG=disablethp=1
 ExecStart=/usr/local/bin/waapi serve
 Restart=always
 RestartSec=3
+TimeoutStartSec=90
+WatchdogSec=30s
 
-# Throttle memori mulai 90 MB dan batasi maksimum 100 MB tanpa swap
-MemoryHigh=90M
-MemoryMax=100M
+# Batas RAM cgroup v2 untuk profil lean tanpa swap
+MemoryHigh=56M
+MemoryMax=80M
 MemorySwapMax=0
+TasksMax=64
+LimitNOFILE=4096
 
 # Hardening keamanan sistem operasi
 NoNewPrivileges=true
@@ -32,7 +37,22 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/waapi
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service madvise fadvise64 sync_file_range
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
-

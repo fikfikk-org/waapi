@@ -24,6 +24,7 @@ type DoctorReport struct {
 	WAWALBytes    int64             `json:"wa_wal_bytes"`
 	OutboxPending int               `json:"outbox_pending"`
 	InstanceCount map[string]int    `json:"instance_count"`
+	GovernorLevel string            `json:"governor_level,omitempty"`
 	Env           map[string]string `json:"env"`
 }
 

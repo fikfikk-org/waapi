@@ -79,6 +79,23 @@ func (s *SQLiteStore) CountQueued(ctx context.Context, instanceID string) (int, 
 	return count, nil
 }
 
+// HasSending mengembalikan true apabila instance memiliki job yang sedang dalam status pengiriman (sending).
+func (s *SQLiteStore) HasSending(ctx context.Context, instanceID string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, nil
+	}
+	var exists int
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT EXISTS(SELECT 1 FROM outbox WHERE instance_id = ? AND status = 'sending')`,
+		instanceID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("cek status sending outbox: %w", err)
+	}
+	return exists == 1, nil
+}
+
 // Insert menyisipkan baris job baru dan mengembalikan ErrIdempotencyConflict jika melanggar indeks idem_key.
 func (s *SQLiteStore) Insert(ctx context.Context, job *Job) error {
 	if s == nil || s.db == nil {

@@ -657,6 +657,8 @@ var (
 	MetricJournalAppendErrorsTotal = Default.NewCounter("journal_append_errors_total", "Total kegagalan transaksi append atau hook ke journal.db")
 	// MetricGuardianShadowTotal mencatat keputusan Guardian yang diizinkan namun dicatat selama shadow mode aktif.
 	MetricGuardianShadowTotal = Default.NewCounterVec("guardian_shadow_total", "Total keputusan Guardian yang hanya dicatat selama shadow mode aktif", "code")
+	// MetricMemoryGovernorLevel mencatat level tekanan memori Governor aktif (0=green, 1=yellow, 2=red).
+	MetricMemoryGovernorLevel = Default.NewGauge("memory_governor_level", "Level tekanan memori Governor saat ini (0=green, 1=yellow, 2=red)")
 )
 
 // RefreshDefaultMetrics memperbarui seluruh metrik bawaan pada Default tanpa memakai runtime.ReadMemStats.

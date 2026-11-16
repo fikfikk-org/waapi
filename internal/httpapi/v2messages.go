@@ -88,6 +88,11 @@ func (s *Server) handleV2SendMessage(w http.ResponseWriter, r *http.Request, _ *
 		return
 	}
 
+	// Tolak enqueue media.url saat level Red karena unduhan streaming akan menekan RAM.
+	if req.Media != nil && strings.TrimSpace(req.Media.URL) != "" && s.rejectIfRed(w) {
+		return
+	}
+
 	priority, err := parseOutboxPriority(req.Priority)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error(), 0)

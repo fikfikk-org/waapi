@@ -173,7 +173,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	dead := webhook.NewDeadStore(j.DB())
-	whSvc := webhook.NewService(j, tc, dead, nil, nil, webhook.Options{Store: st})
+	gov := governor.New(governor.Config{
+		BudgetBytes: int64(cfg.MemoryBudgetMiB) << 20,
+	}, governor.NewProcSampler("", "", ""))
+	gov.SetOnTransition(func(prev, next governor.Level) {
+		slog.Warn("perubahan level tekanan memori governor", "from", prev.String(), "to", next.String())
+	})
+
+	whSvc := webhook.NewService(j, tc, dead, nil, nil, webhook.Options{
+		Store:    st,
+		Governor: gov,
+	})
 
 	instances, err := st.ListInstances(ctx)
 	if err != nil {
@@ -244,9 +254,25 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, guard, nil, outbox.Options{
 		DefaultTTL: cfg.OutboxTTL,
 		MaxQueued:  cfg.OutboxMaxQueued,
+		OnActivity: waMgr.RecordActivity,
 	})
 	waMgr.AttachOutbox(outboxSvc, guard)
+	waMgr.SetFreeOSMemoryFn(func() { gov.TriggerFreeOSMemory() })
 	outboxSvc.StartLeaseRecovery(ctx)
+
+	gov.RegisterAction(governor.Yellow, "shrink_memory", 60*time.Second, governor.ShrinkPoolsAction([]governor.DBPool{
+		{Name: "app.db", DB: st.DB},
+		{Name: "journal.db", DB: j.DB()},
+		{Name: "wa.db", DB: waMgr.WADB()},
+	}))
+	gov.RegisterAction(governor.Red, "free_os_memory", 60*time.Second, func(context.Context) {
+		gov.TriggerFreeOSMemory()
+	})
+	if cfg.AutoRecycle == "on" {
+		gov.RegisterSustainedAction(governor.Red, 10*time.Minute, "auto_recycle", 30*time.Minute, func(actCtx context.Context) {
+			_, _ = waMgr.RecycleNextEligible(actCtx)
+		})
+	}
 
 	go j.RunPruner(ctx, journal.PrunePolicy{
 		Retention:    cfg.JournalRetention,
@@ -271,6 +297,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		control.WithWebhookService(whSvc, dead),
 		control.WithOutbox(outboxSvc),
 		control.WithHealthProvider(guard),
+		control.WithGovernor(gov),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
@@ -303,7 +330,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -328,7 +355,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		}
 		metricsHTTP = &http.Server{
 			Addr:              addr,
-			Handler:           newMetricsHandler(cfg, st, waMgr),
+			Handler:           newMetricsHandler(cfg, st, waMgr, gov),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -366,6 +393,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	// Jalankan auto-start instance secara berurutan di latar belakang
 	go waMgr.AutoStartAll(ctx)
+	go gov.Run(ctx)
+	waMgr.StartRecycleLoop(ctx)
+	governor.ScheduleBootPageout(ctx, cfg.PageoutAfterBoot)
 
 	slog.Info("daemon waapi aktif",
 		"http", cfg.HTTPAddr,
@@ -436,7 +466,7 @@ func runWatchdogLoop(ctx context.Context, db *sql.DB, interval time.Duration) {
 }
 
 // newMetricsHandler membangun HTTP handler terpisah yang hanya melayani /metrics.
-func newMetricsHandler(cfg *config.Config, st *store.Store, waMgr *wa.Manager) http.Handler {
+func newMetricsHandler(cfg *config.Config, st *store.Store, waMgr *wa.Manager, gov governor.Source) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		dbStats := []obs.DBStats{
@@ -449,6 +479,9 @@ func newMetricsHandler(cfg *config.Config, st *store.Store, waMgr *wa.Manager) h
 			dbStats = append(dbStats, obs.CollectDBStats(r.Context(), "journal.db", j.DB(), cfg.JournalDBPath()))
 		}
 		counts := waMgr.CountByStatus(r.Context())
+		if gov != nil {
+			obs.MetricMemoryGovernorLevel.Set(float64(gov.Level()))
+		}
 		obs.RefreshDefaultMetrics(dbStats, counts)
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

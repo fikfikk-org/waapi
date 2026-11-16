@@ -44,6 +44,7 @@ type DeepReport struct {
 	SQLite         []DBStats               `json:"sqlite"`
 	Webhook        []WebhookInstanceReport `json:"webhook,omitempty"`
 	Build          BuildInfo               `json:"build"`
+	GovernorLevel  string                  `json:"governor_level,omitempty"`
 	GoroutineLeaks int                     `json:"goroutine_leaks"`
 }
 

@@ -153,6 +153,9 @@ func (m *Manager) executeWithSender(ctx context.Context, job *outbox.Job, deps C
 	if err != nil {
 		return outbox.ExecResult{}, toSendError(err)
 	}
+	if rc, ok := deps.(*realComposeDeps); ok && rc.inst != nil {
+		rc.inst.recordActivity(time.Now())
+	}
 	return outbox.ExecResult{ServerTS: resp.Timestamp}, nil
 }
 

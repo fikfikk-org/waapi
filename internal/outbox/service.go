@@ -38,6 +38,7 @@ type Options struct {
 	LeaseDuration      time.Duration
 	ExecTimeout        time.Duration
 	RecoverInterval    time.Duration
+	OnActivity         func(instanceID string, at time.Time) // dipanggil saat pesan baru diterima ke antrian outbox
 	DisableSendJitter  bool // khusus pengujian synctest agar jeda 300-1500 ms tidak menggeser jadwal deterministik
 	DisableRetryJitter bool // khusus pengujian synctest agar backoff retry deterministik
 }
@@ -230,8 +231,27 @@ func (s *Service) Enqueue(ctx context.Context, req EnqueueRequest) (job *Job, cr
 	}
 
 	// 8. Bangunkan scheduler agar job langsung dijadwalkan.
+	if s.opt.OnActivity != nil {
+		s.opt.OnActivity(req.InstanceID, now)
+	}
 	s.wakeInstance(req.InstanceID)
 	return candidate, true, nil
+}
+
+type sendingChecker interface {
+	HasSending(ctx context.Context, instanceID string) (bool, error)
+}
+
+// HasSending memeriksa apakah instance sedang memiliki job berstatus sending di outbox.
+func (s *Service) HasSending(ctx context.Context, instanceID string) (bool, error) {
+	if s == nil || s.st == nil {
+		return false, nil
+	}
+	sc, ok := s.st.(sendingChecker)
+	if !ok {
+		return false, nil
+	}
+	return sc.HasSending(ctx, instanceID)
 }
 
 // Get mengambil detail satu job outbox milik instance tertentu.

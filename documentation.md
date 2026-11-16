@@ -86,6 +86,13 @@ flowchart TD
         GH3 -->|"TemporaryBan diterima"| GH4
         GH4 -->|"ban berakhir & skor pulih"| GH1
     end
+    subgraph MemoryGovernor
+        MG["green (GOGC base)"] -->|"anon >= 0.75 atau PSI some >= 5.0"| MY["yellow (GOGC 25 + shrink_memory + pacing 200ms)"]
+        MG -->|"anon >= 0.90 atau PSI full >= 2.0"| MR["red (GOGC 25 + FreeOSMemory + admission 503)"]
+        MY -->|"anon >= 0.90 atau PSI full >= 2.0"| MR
+        MY -->|"anon < 0.65 & PSI some < 2.5"| MG
+        MR -->|"bertahap: anon < 0.80 & PSI full < 1.0"| MY
+    end
 ```
 
 ## Aturan per Entitas
@@ -222,6 +229,17 @@ flowchart TD
 | Shadow mode upgrade | Instance lama yang sudah tertaut saat bootstrap pertama mendapat shadow `7 hari` | Selama shadow, aturan 3–7 & kuota grup hanya dicatat sebagai metrik dan diloloskan; opt-out, ban aktif, dan quiet hours tetap ditegakkan |
 | Batas etis mutlak | Tanpa spintax, variasi konten otomatis, rotasi IP/proxy, atau spoofing perangkat | Guardian hanya menunda atau menolak pengiriman berisiko |
 
+### Memory Governor & Profil Runtime
+
+| Field | Rule | Catatan |
+|---|---|---|
+| Sumber sampel anonim | Cgroup v2 `memory.stat` (`anon`) + PSI, fallback procfs `RssAnon` | Membandingkan anggaran memori **anonim** (`WAAPI_MEMORY_BUDGET_MIB`), bukan `VmRSS` |
+| Profil runtime (`WAAPI_PROFILE`) | `micro` (16/20MiB, High 40M/Max 64M), `lean` (default: 22/28MiB, 56M/80M), `classic` (64/80MiB, 90M/100M) | Diterapkan oleh `deploy/install.sh` (unit lama disimpan ke `waapi.service.bak`) dengan hardening systemd & `SystemCallFilter=@system-service madvise fadvise64 sync_file_range` |
+| Penyesuaian GC (`GOGC`) | Memasuki `Yellow` atau `Red` menyetel `GOGC=25`; kembali `Green` memulihkan `BaseGOGC` (env `GOGC` / default `50`) | Perubahan hanya dieksekusi saat transisi level agar tidak berulang |
+| Aksi edge & cooldown | `Yellow`: `PRAGMA shrink_memory` seluruh pool (app, journal, wa, timeout ambil koneksi `100 ms`, cooldown `60s`) + pacing deliverer webhook `200 ms`/lane; `Red`: `debug.FreeOSMemory()` (cooldown global `60s`, dipakai bersama pasca-pairing) | Pacing `200 ms` tetap aktif selama level `>= Yellow` |
+| Auto-recycle & `recycle_at` | `Red >= 10m` + `WAAPI_AUTO_RECYCLE=on` me-recycle 1 instance round-robin (`>= 6j`/instance, cooldown `30m`); `recycle_at` (`HH:MM` lokal) jalan 1x/hari | Keduanya melewatkan instance dengan job `sending`; `recycle_at` juga melewatkan instance dengan aktivitas masuk/keluar dalam `5 menit` terakhir (dilewati untuk hari itu) |
+| Eksperimen pageout & THP | `WAAPI_PAGEOUT_AFTER_BOOT` (`off` default) hanya menyentuh mapping `r-xp`/`r--p` binary setelah 90s; `GODEBUG=disablethp=1` nonaktif default | `waapi doctor --deep` memberi rekomendasi `GODEBUG=disablethp=1` jika THP host terdeteksi `always` |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -283,6 +301,16 @@ flowchart TD
 | semua | suspended | Peristiwa `TemporaryBan` dari WhatsApp diterima Supervisor; pengiriman ditunda sampai `BanUntil + 10m` |
 | restricted / suspended | healthy / cautious | Masa ban + 10m berakhir atau rasio pengiriman/balasan jendela 24 jam kembali membaik |
 
+## Transisi Level Memory Governor
+
+| Dari | Ke | Syarat |
+|---|---|---|
+| `green` | `red` | `rasio anon >= RedEnter (0.90)` atau `PSI full avg10 >= PSIRed (2.0)` |
+| `green` | `yellow` | `rasio anon >= YellowEnter (0.75)` atau `PSI some avg10 >= PSIYellow (5.0)` |
+| `yellow` | `red` | `rasio anon >= RedEnter (0.90)` atau `PSI full avg10 >= PSIRed (2.0)` |
+| `yellow` | `green` | `rasio anon < YellowExit (0.65)` dan `PSI some avg10 < PSIYellow / 2 (2.5)` |
+| `red` | `yellow` | `rasio anon < RedExit (0.80)` dan `PSI full avg10 < PSIRed / 2 (1.0)` (selalu turun bertahap ke `yellow` lebih dulu, tidak melompat langsung ke `green`) |
+
 ## Batasan Bisnis & Trigger
 
 | Aturan | Detail |
@@ -324,4 +352,5 @@ flowchart TD
 | API grup & pemetaan IQError | Seluruh cache daftar grup dibatasi LRU tanpa menyimpan daftar peserta penuh; error `*whatsmeow.IQError` dipetakan deterministik ke `403 group_forbidden` (401/403), `404 group_not_found`, `400 invalid_request` (406), `429 rate_limited`, dan `502 upstream_error` lainnya; `GroupGovernor` memeriksa kuota sebelum membuat grup atau menambah peserta |
 | Normalisasi event `group` & `call` | `events.GroupInfo` menggabungkan seluruh perubahan dalam satu event `group` (`changes[]`), `events.JoinedGroup` menghasilkan `action="joined"`, dan `events.CallOffer` / `CallTerminate` / auto-reject memakai dedupe key `c:<call_id>:<action>` tanpa memblokir hot path untuk `RejectCall` |
 | Skor & penegakan Account Health Guardian | Skor murni [0,100] mengevaluasi `recent_temp_ban`, `undelivered_ratio` (`>=20` di `[now-25j,now-1j)`), `first_contact_ratio` (`>=10`), `content_fanout` (`>=0.8`), `rate_overlimit`, dan bonus `reply_rate` (`>=10`); evaluasi `Decide` menerapkan 10 aturan berurutan (opt-out -> ban -> restricted -> fan-out -> low score -> FC cap -> daily cap -> quiet hours -> token bucket); pesan non-teks/caption kosong bebas cek fan-out; pembaruan counter RAM & konfirmasi opt-out hanya berjalan pasca-commit transaksi journal |
+| Admission control & hardening governor | Pada level `Red`, endpoint berat (`POST /pair`, SSE `events/stream`, unggah/unduh media v1/v2, serta `POST /v2/messages` dengan `media.url`) ditolak `503 memory_pressure` (`Retry-After: 15`) dan `/readyz` kembali `503 not_ready`; kirim teks biasa & media `upload_id` tetap diizinkan; unit systemd menyertakan profil `lean` default serta skrip burn-in `scripts/burnin.sh` |
 

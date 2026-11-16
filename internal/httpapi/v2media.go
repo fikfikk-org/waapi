@@ -32,9 +32,6 @@ type v2UploadResponse struct {
 
 // handleV2UploadMedia menangani unggahan multipart satu-pass dan menyimpan descriptor ke UploadStore (201 Created).
 func (s *Server) handleV2UploadMedia(w http.ResponseWriter, r *http.Request, _ *wa.Instance) {
-	if s.rejectIfRed(w) {
-		return
-	}
 	if s.mediaPipe == nil || s.uploadStore == nil || s.mediaDriver == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", "media engine belum aktif", 0)
 		return
@@ -160,9 +157,6 @@ func (s *Server) uploadMediaRecord(ctx context.Context, instID string, r io.Read
 
 // handleV2DownloadEventMedia mengunduh media event journal dengan mekanisme media resurrection saat 404/410 CDN.
 func (s *Server) handleV2DownloadEventMedia(w http.ResponseWriter, r *http.Request, _ *wa.Instance) {
-	if s.rejectIfRed(w) {
-		return
-	}
 	if s.journal == nil || s.mediaPipe == nil || s.mediaDriver == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", "layanan journal atau media belum aktif", 0)
 		return
@@ -223,10 +217,6 @@ func (s *Server) handleV2DownloadMedia(w http.ResponseWriter, r *http.Request, i
 }
 
 func (s *Server) serveDescriptorDownload(w http.ResponseWriter, r *http.Request, inst *wa.Instance) {
-	if s.rejectIfRed(w) {
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
 	var desc wa.MediaDescriptor
 	if err := json.NewDecoder(r.Body).Decode(&desc); err != nil {

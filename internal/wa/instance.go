@@ -81,7 +81,8 @@ type Instance struct {
 	settings       store.InstanceSettings
 	cancel         context.CancelFunc
 
-	offline atomic.Bool
+	offline      atomic.Bool
+	lastActivity atomic.Int64 // unix milidetik pesan masuk/keluar terbaru
 
 	checkLRU     *LRU[string, NumberCheckResult]
 	checkGroup   singleflight.Group
@@ -664,6 +665,36 @@ func (i *Instance) Close() {
 	}
 }
 
+func (i *Instance) recordActivity(at time.Time) {
+	if i == nil {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	ms := at.UnixMilli()
+	for {
+		prev := i.lastActivity.Load()
+		if ms <= prev {
+			return
+		}
+		if i.lastActivity.CompareAndSwap(prev, ms) {
+			return
+		}
+	}
+}
+
+func (i *Instance) lastActivityTime() time.Time {
+	if i == nil {
+		return time.Time{}
+	}
+	ms := i.lastActivity.Load()
+	if ms <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
+}
+
 // Logout melepas tautan perangkat dari WhatsApp dan menghapus device dari wa.db.
 func (i *Instance) Logout(ctx context.Context) error {
 	_, _ = i.CancelPairing()
@@ -919,6 +950,9 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 		return false
 	}
 	ev.Seq = res.Seq
+	if ev.Type == "message" {
+		i.recordActivity(nc.Now)
+	}
 
 	// Invalidasi ringkasan grup jika ada perubahan metadata/keanggotaan dari server.
 	switch evt := rawEvt.(type) {
@@ -976,6 +1010,7 @@ func (i *Instance) handlePollUpdateEvent(ctx context.Context, evt *events.Messag
 		slog.Warn("gagal menyimpan event poll_vote ke journal", "instance", i.id, "poll_id", pollID, "err", err)
 		return false
 	}
+	i.recordActivity(nc.Now)
 	return true
 }
 

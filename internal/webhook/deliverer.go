@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
 )
 
@@ -22,6 +23,7 @@ const (
 	maxResponseBodyRead = 4 << 10   // baca respons penerima maksimal 4 KiB
 	stopDrainTimeout    = 10 * time.Second
 	commitFlushTimeout  = 3 * time.Second
+	pressurePacingDelay = 200 * time.Millisecond
 )
 
 type deliverOutcome uint8
@@ -115,6 +117,7 @@ func (d *laneDeliverer) runLane(lane, lanes int) {
 	committed := cursor
 	pendingEvents := 0
 	lastCommit := time.Now()
+	var lastAttempt time.Time
 
 	flushCursor := func(seq int64) {
 		if seq <= committed {
@@ -213,7 +216,18 @@ func (d *laneDeliverer) runLane(lane, lanes int) {
 				}
 			}
 
+			// Terapkan pacing 200 ms per lane selama governor >= Yellow untuk mengerem alokasi HTTP/JSON.
+			if !lastAttempt.IsZero() && d.svc.gov != nil && d.svc.gov.Level() >= governor.Yellow {
+				if waitDur := pressurePacingDelay - time.Since(lastAttempt); waitDur > 0 {
+					if !waitWithContext(d.loopCtx, waitDur) {
+						flushCursor(cursor)
+						return
+					}
+				}
+			}
+
 			outcome := d.deliverEventWithRetry(ev, &cursor, committed, flushCursor)
+			lastAttempt = time.Now()
 			switch outcome {
 			case outcomeDelivered, outcomeDLQ:
 				cursor = ev.Seq
