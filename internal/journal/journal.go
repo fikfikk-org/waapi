@@ -181,6 +181,49 @@ func PartForChat(chat string) uint8 {
 	return uint8(h % numPartitions)
 }
 
+type postCommitKey struct{}
+
+type postCommitQueue struct {
+	mu  sync.Mutex
+	fns []func()
+}
+
+func (q *postCommitQueue) add(fn func()) {
+	q.mu.Lock()
+	q.fns = append(q.fns, fn)
+	q.mu.Unlock()
+}
+
+func (q *postCommitQueue) run() {
+	q.mu.Lock()
+	fns := q.fns
+	q.fns = nil
+	q.mu.Unlock()
+	for _, fn := range fns {
+		if fn != nil {
+			fn()
+		}
+	}
+}
+
+func ensurePostCommit(ctx context.Context) (context.Context, *postCommitQueue, bool) {
+	if q, ok := ctx.Value(postCommitKey{}).(*postCommitQueue); ok && q != nil {
+		return ctx, q, false
+	}
+	q := &postCommitQueue{}
+	return context.WithValue(ctx, postCommitKey{}, q), q, true
+}
+
+// OnCommit mendaftarkan callback yang hanya dijalankan setelah transaksi Append atau RunTx sukses di-commit.
+func OnCommit(ctx context.Context, fn func()) {
+	if ctx == nil || fn == nil {
+		return
+	}
+	if q, ok := ctx.Value(postCommitKey{}).(*postCommitQueue); ok && q != nil {
+		q.add(fn)
+	}
+}
+
 // Append menyimpan event secara atomik bersama hooks dalam satu transaksi immediate sebelum ack.
 func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (AppendResult, error) {
 	if j == nil || j.db == nil {
@@ -190,6 +233,7 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 		return AppendResult{}, err
 	}
 
+	hookCtx, pcQueue, ownQueue := ensurePostCommit(ctx)
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AppendResult{}, fmt.Errorf("mulai transaksi append journal: %w", err)
@@ -218,7 +262,7 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 		if hook == nil {
 			continue
 		}
-		if err := hook(ctx, tx, res.Seq); err != nil {
+		if err := hook(hookCtx, tx, res.Seq); err != nil {
 			return AppendResult{}, fmt.Errorf("jalankan hook journal: %w", err)
 		}
 	}
@@ -228,6 +272,9 @@ func (j *Journal) Append(ctx context.Context, ev *Event, hooks ...TxHook) (Appen
 	}
 	committed = true
 
+	if ownQueue {
+		pcQueue.run()
+	}
 	j.notify(ev.InstanceID)
 	return res, nil
 }
@@ -316,6 +363,7 @@ func (j *Journal) RunTx(ctx context.Context, hooks ...TxHook) error {
 		return nil
 	}
 
+	hookCtx, pcQueue, ownQueue := ensurePostCommit(ctx)
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("mulai transaksi RunTx: %w", err)
@@ -331,7 +379,7 @@ func (j *Journal) RunTx(ctx context.Context, hooks ...TxHook) error {
 		if hook == nil {
 			continue
 		}
-		if err := hook(ctx, tx, 0); err != nil {
+		if err := hook(hookCtx, tx, 0); err != nil {
 			return fmt.Errorf("jalankan hook RunTx: %w", err)
 		}
 	}
@@ -339,6 +387,9 @@ func (j *Journal) RunTx(ctx context.Context, hooks ...TxHook) error {
 		return fmt.Errorf("commit RunTx: %w", err)
 	}
 	committed = true
+	if ownQueue {
+		pcQueue.run()
+	}
 	return nil
 }
 

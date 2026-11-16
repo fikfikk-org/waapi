@@ -78,6 +78,14 @@ flowchart TD
         CA3 -->|"sukses"| CA4["event call action=rejected"]
         CA4 -->|"call_reject_message terisi & lolos LRU 6 jam"| CA5["enqueue pesan outbox (origin=system)"]
     end
+    subgraph GuardianHealth
+        GH1["healthy (skor >= 70)"] -->|"penalti skor (40-69)"| GH2["cautious (rate 0.5x, kuota FC 0.5x)"]
+        GH2 -->|"penalti berat (< 40)"| GH3["restricted (tolak kontak baru tanpa last_in 24h)"]
+        GH1 -->|"TemporaryBan diterima"| GH4["suspended (tunda sampai BanUntil + 10m)"]
+        GH2 -->|"TemporaryBan diterima"| GH4
+        GH3 -->|"TemporaryBan diterima"| GH4
+        GH4 -->|"ban berakhir & skor pulih"| GH1
+    end
 ```
 
 ## Aturan per Entitas
@@ -203,6 +211,17 @@ flowchart TD
 | `replyLRU` | Kapasitas maksimal `1024` kunci penelepon, TTL `6` jam | Memakai JID kanonik PN (resolusi `CallCreatorAlt` / `Store.LIDs`, fallback `evt.From`) agar penelepon `@lid` dan PN tidak mendapat pesan balasan ganda dalam 6 jam |
 | Guard panggilan | Lewati bila `!auto_reject_calls`, sinkronisasi `offline=true`, atau panggilan grup | Pesan sopan (`<= 500` karakter) diantrekan ke outbox dengan `origin=system` dan `Idempotency-Key: call:<call_id>` hanya setelah `RejectCall` sukses |
 
+### Account Health Guardian & Consent Ledger
+
+| Field | Rule | Catatan |
+|---|---|---|
+| Profil kuota | `strict` (200/20 FC/10 fanout/2 grup, min skor 70, quiet default `21:00-07:00`), `standard` (1000/50/30/5, min 50), `relaxed` (5000/200/100/10, min 30), `off` | Profil `off` mematikan skor & kuota namun tetap menegakkan consent opt-out dan ban |
+| Warm-up pairing | Hari `0–2` x`0.25`, `3–6` x`0.5`, `7–13` x`0.75`, `>=14` x`1.0` | Mengalikan kuota harian & first-contact (tidak mengalikan kuota pembuatan grup); pairing ulang nomor baru me-reset `paired_at` |
+| First-contact | Penerima belum punya `first_in`, belum punya `first_out`, dan tidak tersimpan bernama di buku alamat akun | Cache buku alamat berbatas 4096 entri (TTL 1 jam); kontak tersimpan di HP tidak terkena batas first-contact |
+| Consent opt-out/opt-in | Kata kunci trim + uppercase persis cocok `optout_keywords` / `optin_keywords` | Ditulis atomik bersama journal (`contacts_seen` + event `consent`); pesan konfirmasi (`origin=system`) tetap boleh lewat ke penerima opt-out |
+| Shadow mode upgrade | Instance lama yang sudah tertaut saat bootstrap pertama mendapat shadow `7 hari` | Selama shadow, aturan 3–7 & kuota grup hanya dicatat sebagai metrik dan diloloskan; opt-out, ban aktif, dan quiet hours tetap ditegakkan |
+| Batas etis mutlak | Tanpa spintax, variasi konten otomatis, rotasi IP/proxy, atau spoofing perangkat | Guardian hanya menunda atau menolak pengiriman berisiko |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -255,6 +274,15 @@ flowchart TD
 | tercatat (`polls`) | terpilih (`poll_votes`) | `PollUpdateMessage` terdekripsi oleh `DecryptPollVote` lalu hash SHA-256 dicocokkan dengan opsi |
 | terpilih (`poll_votes`) | diperbarui / batal (`[]`) | Pemilih mengganti opsi atau membatalkan seluruh pilihan (dikeluarkan dari `total_voters`) |
 
+## Transisi Status Kesehatan Guardian
+
+| Dari | Ke | Pemicu |
+|---|---|---|
+| healthy (`>= 70`) | cautious (`40–69`) | Penalti `undelivered_ratio`, `first_contact_ratio`, `content_fanout`, atau `rate_overlimit` menurunkan skor; kuota FC & laju kirim dibagi 2 |
+| cautious | restricted (`< 40`) | Akumulasi penalti berat menurunkan skor di bawah 40; kontak tanpa `last_in` 24 jam ditolak |
+| semua | suspended | Peristiwa `TemporaryBan` dari WhatsApp diterima Supervisor; pengiriman ditunda sampai `BanUntil + 10m` |
+| restricted / suspended | healthy / cautious | Masa ban + 10m berakhir atau rasio pengiriman/balasan jendela 24 jam kembali membaik |
+
 ## Batasan Bisnis & Trigger
 
 | Aturan | Detail |
@@ -295,4 +323,5 @@ flowchart TD
 | Presence & subscription reconnect | Status `presence` / `chat_presence` masuk dinormalisasi ke `journal.db` tanpa dedupe key (`last_seen` Unix detik); daftar `SubscribePresence` dibatasi maks 100 JID per instance dan disinkronkan ulang saat koneksi mencapai state `online` |
 | API grup & pemetaan IQError | Seluruh cache daftar grup dibatasi LRU tanpa menyimpan daftar peserta penuh; error `*whatsmeow.IQError` dipetakan deterministik ke `403 group_forbidden` (401/403), `404 group_not_found`, `400 invalid_request` (406), `429 rate_limited`, dan `502 upstream_error` lainnya; `GroupGovernor` memeriksa kuota sebelum membuat grup atau menambah peserta |
 | Normalisasi event `group` & `call` | `events.GroupInfo` menggabungkan seluruh perubahan dalam satu event `group` (`changes[]`), `events.JoinedGroup` menghasilkan `action="joined"`, dan `events.CallOffer` / `CallTerminate` / auto-reject memakai dedupe key `c:<call_id>:<action>` tanpa memblokir hot path untuk `RejectCall` |
+| Skor & penegakan Account Health Guardian | Skor murni [0,100] mengevaluasi `recent_temp_ban`, `undelivered_ratio` (`>=20` di `[now-25j,now-1j)`), `first_contact_ratio` (`>=10`), `content_fanout` (`>=0.8`), `rate_overlimit`, dan bonus `reply_rate` (`>=10`); evaluasi `Decide` menerapkan 10 aturan berurutan (opt-out -> ban -> restricted -> fan-out -> low score -> FC cap -> daily cap -> quiet hours -> token bucket); pesan non-teks/caption kosong bebas cek fan-out; pembaruan counter RAM & konfirmasi opt-out hanya berjalan pasca-commit transaksi journal |
 

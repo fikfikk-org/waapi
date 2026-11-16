@@ -17,15 +17,20 @@ const (
 type TokenBucketGovernor struct {
 	mu            sync.Mutex
 	rateFn        func(instanceID string) int
-	limiters      map[string]*rate.Limiter
+	limiters      map[string]*scaledLimiter
 	cooldownUntil map[string]time.Time
+}
+
+type scaledLimiter struct {
+	rpm int
+	lim *rate.Limiter
 }
 
 // NewTokenBucketGovernor membuat Governor token bucket per instance menggunakan rateFn untuk membaca batas per menit.
 func NewTokenBucketGovernor(rateFn func(instanceID string) int) *TokenBucketGovernor {
 	return &TokenBucketGovernor{
 		rateFn:        rateFn,
-		limiters:      make(map[string]*rate.Limiter),
+		limiters:      make(map[string]*scaledLimiter),
 		cooldownUntil: make(map[string]time.Time),
 	}
 }
@@ -35,14 +40,18 @@ func (g *TokenBucketGovernor) SetRate(instanceID string, rpm int) {
 	if g == nil || instanceID == "" {
 		return
 	}
+	if rpm <= 0 {
+		rpm = defaultRatePerMin
+	}
 	limit := rpmToLimit(rpm)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if lim, ok := g.limiters[instanceID]; ok {
-		lim.SetLimit(limit)
+	if sl, ok := g.limiters[instanceID]; ok {
+		sl.rpm = rpm
+		sl.lim.SetLimit(limit)
 		return
 	}
-	g.limiters[instanceID] = rate.NewLimiter(limit, defaultBurstSize)
+	g.limiters[instanceID] = &scaledLimiter{rpm: rpm, lim: rate.NewLimiter(limit, defaultBurstSize)}
 }
 
 // Precheck selalu mengizinkan saat enqueue karena throttling dilakukan ketika penjadwalan eksekusi.
@@ -51,9 +60,17 @@ func (g *TokenBucketGovernor) Precheck(context.Context, *Job) error {
 }
 
 // Decide memeriksa apakah token bucket mengizinkan pengiriman pada waktu now, atau mengembalikan jeda tunda.
-func (g *TokenBucketGovernor) Decide(_ context.Context, job *Job, now time.Time) Decision {
+func (g *TokenBucketGovernor) Decide(ctx context.Context, job *Job, now time.Time) Decision {
+	return g.DecideWithScale(ctx, job, now, 1.0)
+}
+
+// DecideWithScale memeriksa izin token bucket dengan faktor pengali laju (misal 0.5 saat state cautious).
+func (g *TokenBucketGovernor) DecideWithScale(_ context.Context, job *Job, now time.Time, scale float64) Decision {
 	if g == nil || job == nil {
 		return Decision{Allow: true}
+	}
+	if scale <= 0 {
+		scale = 1.0
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -70,7 +87,7 @@ func (g *TokenBucketGovernor) Decide(_ context.Context, job *Job, now time.Time)
 		delete(g.cooldownUntil, job.InstanceID)
 	}
 
-	lim := g.limiterLocked(job.InstanceID)
+	lim := g.limiterLocked(job.InstanceID, scale)
 	res := lim.ReserveN(now, 1)
 	if !res.OK() {
 		return Decision{
@@ -108,18 +125,26 @@ func (g *TokenBucketGovernor) Record(_ context.Context, job *Job, out Outcome) {
 	}
 }
 
-func (g *TokenBucketGovernor) limiterLocked(instanceID string) *rate.Limiter {
-	if lim, ok := g.limiters[instanceID]; ok {
-		return lim
-	}
-	rpm := defaultRatePerMin
+func (g *TokenBucketGovernor) limiterLocked(instanceID string, scale float64) *rate.Limiter {
+	baseRPM := defaultRatePerMin
 	if g.rateFn != nil {
 		if v := g.rateFn(instanceID); v > 0 {
-			rpm = v
+			baseRPM = v
 		}
 	}
-	lim := rate.NewLimiter(rpmToLimit(rpm), defaultBurstSize)
-	g.limiters[instanceID] = lim
+	effRPM := int(float64(baseRPM) * scale)
+	if effRPM < 1 {
+		effRPM = 1
+	}
+	if sl, ok := g.limiters[instanceID]; ok {
+		if sl.rpm != effRPM {
+			sl.rpm = effRPM
+			sl.lim.SetLimit(rpmToLimit(effRPM))
+		}
+		return sl.lim
+	}
+	lim := rate.NewLimiter(rpmToLimit(effRPM), defaultBurstSize)
+	g.limiters[instanceID] = &scaledLimiter{rpm: effRPM, lim: lim}
 	return lim
 }
 

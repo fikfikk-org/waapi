@@ -12,7 +12,7 @@ import (
 )
 
 // DefaultWebhookEvents adalah daftar event bawaan saat instance baru dibuat.
-const DefaultWebhookEvents = "message,receipt,connection,pairing"
+const DefaultWebhookEvents = "message,receipt,connection,pairing,outbox,poll_vote,health"
 
 // Status instance yang diizinkan di database.
 const (

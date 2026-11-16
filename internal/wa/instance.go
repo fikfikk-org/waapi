@@ -28,6 +28,12 @@ import (
 // ErrInvalidRecipient dikembalikan jika format nomor atau JID tujuan tidak valid.
 var ErrInvalidRecipient = jid.ErrInvalidRecipient
 
+// HealthSummary merangkum state dan skor kesehatan akun untuk disematkan pada status instance.
+type HealthSummary struct {
+	State string `json:"state"`
+	Score int    `json:"score"`
+}
+
 // InstanceStatus adalah representasi status runtime + database sebuah instance.
 type InstanceStatus struct {
 	ID                string                 `json:"id"`
@@ -37,6 +43,7 @@ type InstanceStatus struct {
 	ReconnectAttempts int                    `json:"reconnect_attempts"`
 	NextRetryIn       int                    `json:"next_retry_in"`
 	Ban               *BanInfo               `json:"ban"`
+	Health            *HealthSummary         `json:"health,omitempty"`
 	JID               string                 `json:"jid,omitempty"`
 	PushName          string                 `json:"push_name,omitempty"`
 	QueueDepth        int                    `json:"queue_depth"`
@@ -257,6 +264,13 @@ func (i *Instance) Snapshot(meta store.Instance) InstanceStatus {
 	}
 	if sup != nil {
 		applySupervisorSnapshot(&out, sup.State())
+	}
+	if i.mgr != nil && i.mgr.healthSummary != nil {
+		hCtx, hCancel := context.WithTimeout(context.Background(), time.Second)
+		if hs, err := i.mgr.healthSummary(hCtx, i.id); err == nil && hs != nil {
+			out.Health = hs
+		}
+		hCancel()
 	}
 	return out
 }
@@ -779,10 +793,19 @@ func (i *Instance) routeSupervisorEvent(rawEvt any) bool {
 			sup.OnEvent(evt)
 		}
 		return true
+	case *events.TemporaryBan:
+		if sup := i.getSupervisor(); sup != nil {
+			sup.OnEvent(evt)
+		}
+		if i.mgr != nil && i.mgr.onTempBan != nil {
+			banCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = i.mgr.onTempBan(banCtx, i.id, int(evt.Code), evt.Expire)
+			cancel()
+		}
+		return true
 	case *events.Disconnected,
 		*events.LoggedOut,
 		*events.StreamReplaced,
-		*events.TemporaryBan,
 		*events.ClientOutdated,
 		*events.ConnectFailure,
 		*events.KeepAliveTimeout,

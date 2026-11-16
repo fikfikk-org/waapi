@@ -3,6 +3,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/guardian"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/outbox"
@@ -54,6 +56,19 @@ func WithOutbox(svc *outbox.Service) ServerOption {
 	}
 }
 
+type healthProvider interface {
+	Health(ctx context.Context, instanceID string) (guardian.HealthReport, error)
+}
+
+// WithHealthProvider memasang Guardian ke control plane untuk perintah CLI waapi health.
+func WithHealthProvider(hp healthProvider) ServerOption {
+	return func(s *Server) {
+		if hp != nil {
+			s.health = hp
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -65,6 +80,7 @@ type Server struct {
 	dead       *webhook.DeadStore
 	journal    *journal.Journal
 	outbox     *outbox.Service
+	health     healthProvider
 	startedAt  time.Time
 	version    string
 }
@@ -141,6 +157,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /control/instances/{id}/webhook/dlq", s.handlePurgeWebhookDLQ)
 	mux.HandleFunc("GET /control/instances/{id}/events", s.handleGetEvents)
 	mux.HandleFunc("GET /control/instances/{id}/events/stream", s.handleStreamEvents)
+	mux.HandleFunc("GET /control/instances/{id}/health", s.handleGetHealth)
 	mux.HandleFunc("POST /control/instances/{id}/messages", s.handleSendMessage)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
@@ -424,6 +441,19 @@ func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "delivered", "http_status": code})
+}
+
+func (s *Server) handleGetHealth(w http.ResponseWriter, r *http.Request) {
+	if s.health == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("layanan kesehatan akun belum aktif"))
+		return
+	}
+	rep, err := s.health.Health(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

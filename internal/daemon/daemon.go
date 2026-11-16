@@ -18,6 +18,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/control"
 	"github.com/fikfikk-org/waapi/internal/governor"
+	"github.com/fikfikk-org/waapi/internal/guardian"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
@@ -28,6 +29,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
 	"github.com/fikfikk-org/waapi/internal/webhook"
+	"go.mau.fi/whatsmeow/types"
 )
 
 var daemonBuildVersion = "dev"
@@ -208,12 +210,42 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("inisialisasi wa manager: %w", err)
 	}
 
-	outboxGov := outbox.NewTokenBucketGovernor(waMgr.RatePerMin)
-	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, outboxGov, nil, outbox.Options{
+	gDeps := &guardianDaemonAdapter{st: st, waMgr: waMgr}
+	guard, err := guardian.New(j.DB(), guardian.Options{
+		Settings: gDeps,
+		Contacts: gDeps,
+		LIDs:     gDeps,
+		Enqueuer: gDeps,
+		Emitter:  gDeps,
+	})
+	if err != nil {
+		_ = waMgr.Close()
+		whSvc.Stop()
+		return fmt.Errorf("inisialisasi account health guardian: %w", err)
+	}
+	guard.BootstrapShadow(ctx)
+	guard.StartFlushLoop(ctx)
+
+	waMgr.SetGroupGovernor(guard)
+	waMgr.SetHealthHooks(
+		guard.ObserveDelivered,
+		guard.ObserveTempBan,
+		func(id string) { guard.OnInstancePaired(context.Background(), id) },
+		func(sCtx context.Context, id string) (*wa.HealthSummary, error) {
+			sum, sErr := guard.Summary(sCtx, id)
+			if sErr != nil {
+				return nil, sErr
+			}
+			return &wa.HealthSummary{State: sum.State, Score: sum.Score}, nil
+		},
+	)
+	waMgr.AddInboundObserver(guard.InboundObserver())
+
+	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, guard, nil, outbox.Options{
 		DefaultTTL: cfg.OutboxTTL,
 		MaxQueued:  cfg.OutboxMaxQueued,
 	})
-	waMgr.AttachOutbox(outboxSvc, outboxGov)
+	waMgr.AttachOutbox(outboxSvc, guard)
 	outboxSvc.StartLeaseRecovery(ctx)
 
 	go j.RunPruner(ctx, journal.PrunePolicy{
@@ -228,6 +260,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			if _, uErr := uploadStore.Prune(pCtx, time.Now()); uErr != nil && ctx.Err() == nil {
 				slog.Warn("pruner uploads gagal", "err", uErr)
 			}
+			if gErr := guard.Prune(pCtx, time.Now()); gErr != nil && ctx.Err() == nil {
+				slog.Warn("pruner guardian gagal", "err", gErr)
+			}
 		},
 	})
 
@@ -235,12 +270,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		control.WithJournal(j),
 		control.WithWebhookService(whSvc, dead),
 		control.WithOutbox(outboxSvc),
+		control.WithHealthProvider(guard),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
 	if err != nil {
 		outboxSvc.Stop()
 		_ = waMgr.Close()
+		guard.Stop()
 		whSvc.Stop()
 		return err
 	}
@@ -258,6 +295,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		outboxSvc.Stop()
 		_ = waMgr.Close()
+		guard.Stop()
 		whSvc.Stop()
 		return fmt.Errorf("listen HTTP publik %s: %w", cfg.HTTPAddr, err)
 	}
@@ -265,7 +303,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -284,6 +322,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			_ = pubLn.Close()
 			outboxSvc.Stop()
 			_ = waMgr.Close()
+			guard.Stop()
 			whSvc.Stop()
 			return fmt.Errorf("listen metrik %s: %w", addr, err)
 		}
@@ -358,6 +397,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	_ = ctrlHTTP.Shutdown(shutCtx)
 	outboxSvc.Stop()
 	_ = waMgr.Close()
+	guard.Stop()
 	whSvc.Stop()
 	wh.Stop()
 	_ = authMgr.FlushOnce(shutCtx)
@@ -430,4 +470,54 @@ func isLoopbackListenAddr(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+type guardianDaemonAdapter struct {
+	st    *store.Store
+	waMgr *wa.Manager
+}
+
+func (a *guardianDaemonAdapter) InstanceMeta(ctx context.Context, instanceID string) (store.Instance, bool) {
+	meta, err := a.st.GetInstance(ctx, instanceID)
+	if err != nil || meta == nil {
+		return store.Instance{}, false
+	}
+	return *meta, true
+}
+
+func (a *guardianDaemonAdapter) ListInstances(ctx context.Context) ([]store.Instance, error) {
+	return a.st.ListInstances(ctx)
+}
+
+func (a *guardianDaemonAdapter) SetShadowUntil(ctx context.Context, instanceID string, until int64) error {
+	meta, err := a.st.GetInstance(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	s := meta.Settings
+	s.GuardianShadowUntil = until
+	updated, err := a.st.UpdateInstance(ctx, instanceID, store.InstanceUpdate{Settings: &s})
+	if err != nil {
+		return err
+	}
+	if inst, ok := a.waMgr.Get(instanceID); ok {
+		inst.SetSettings(updated.Settings)
+	}
+	return nil
+}
+
+func (a *guardianDaemonAdapter) IsSavedContact(ctx context.Context, instanceID string, target types.JID) bool {
+	return a.waMgr.IsAddressBookContact(ctx, instanceID, target)
+}
+
+func (a *guardianDaemonAdapter) ResolvePN(ctx context.Context, instanceID string, target types.JID) (types.JID, bool) {
+	return a.waMgr.ResolveLIDToPN(ctx, instanceID, target)
+}
+
+func (a *guardianDaemonAdapter) EnqueueSystemText(ctx context.Context, instanceID, to, text, idemKey string) error {
+	return a.waMgr.EnqueueSystemText(ctx, instanceID, to, text, idemKey)
+}
+
+func (a *guardianDaemonAdapter) EmitHealth(ctx context.Context, instanceID string, payload guardian.HealthEventPayload) error {
+	return a.waMgr.EmitHealthEvent(ctx, instanceID, payload)
 }

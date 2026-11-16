@@ -26,6 +26,11 @@ func observerInstanceID(ctx context.Context) string {
 
 // NewReceiptObserver membuat InboundObserver yang memajukan status outbox saat receipt diterima sebelum ack ke WhatsApp.
 func NewReceiptObserver(svc *outbox.Service) InboundObserver {
+	return NewReceiptObserverWithCallback(svc, nil)
+}
+
+// NewReceiptObserverWithCallback memajukan status receipt di transaksi journal dan memanggil onDelivered hanya sesudah transaksi commit.
+func NewReceiptObserverWithCallback(svc *outbox.Service, onDelivered func(instanceID string, n int)) InboundObserver {
 	return func(ctx context.Context, ev *journal.Event, raw any) journal.TxHook {
 		if svc == nil {
 			return nil
@@ -64,8 +69,16 @@ func NewReceiptObserver(svc *outbox.Service) InboundObserver {
 
 		group := rec.IsGroup || rec.Chat.Server == types.GroupServer
 		return func(txCtx context.Context, tx *sql.Tx, _ int64) error {
-			_, err := svc.MarkReceiptTx(txCtx, tx, instanceID, waIDs, rtype, group)
-			return err
+			n, err := svc.MarkReceiptTx(txCtx, tx, instanceID, waIDs, rtype, group)
+			if err != nil {
+				return err
+			}
+			if n > 0 && onDelivered != nil {
+				journal.OnCommit(txCtx, func() {
+					onDelivered(instanceID, n)
+				})
+			}
+			return nil
 		}
 	}
 }

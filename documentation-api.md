@@ -80,7 +80,7 @@
 | Headers | X-API-Key |
 | Query Params | - |
 | Request Body | - |
-| Response | 200 id, status, state, state_since, reconnect_attempts, next_retry_in, ban, jid, push_name, queue_depth, rate_per_min, settings, paired_at, connected_since · 403 · 404 |
+| Response | 200 id, status, state, state_since, reconnect_attempts, next_retry_in, ban, health (`{ state, score }`), jid, push_name, queue_depth, rate_per_min, settings, paired_at, connected_since · 403 · 404 |
 | Notes | - |
 
 ## POST /v1/instances/{id}/pair
@@ -479,6 +479,18 @@
 | Response | 200 `{ jid, pn, lid, push_name, full_name, business_name, about, picture: { url, id } \| null, verified_name }` · 400 `invalid_number`/`invalid_request` · 503 `instance_not_connected` |
 | Notes | Profil di-cache di `LRU` 256 entri (TTL 1 jam); input `@lid` diresolusi ke PN terlebih dahulu via `Store.LIDs`; bila foto profil tidak disetel atau dibatasi privasi (401/404), endpoint tetap mengembalikan 200 dengan `picture: null`; `verified_name` bertipe string |
 
+## GET /v2/instances/{id}/health
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/health |
+| Auth Required | Yes (X-API-Key, scope `health:read`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 `{ instance, state, score, profile, shadow, factors: [{ code, impact, detail }], counters: { sent_24h, first_contact_24h, delivered_24h, replied_24h }, limits: { daily_cap, daily_remaining, first_contact_cap, first_contact_remaining, warmup_factor, quiet_hours }, ban: { active, last_code?, last_at?, until } }` · 404 `instance_not_found` |
+| Notes | `factors` diurutkan menurut penalti `impact` terberat lebih dulu (mis. `-60`, `-22`, `+8`); selama shadow mode aktif (`shadow: true`), aturan 3–7 `Decide` dan kuota grup hanya dicatat ke `waapi_guardian_shadow_total` |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -486,7 +498,7 @@
 | Method + Endpoint | POST ke `webhook_url` instance (`User-Agent: waapi-webhook/2.0`) |
 | Headers | Mode `waapi`: `X-WA-Event`, `X-WA-Instance`, `X-WA-Timestamp`, `X-WA-Event-Id`, `X-WA-Delivery-Attempt`, `X-WA-Signature` (`sha256=` HMAC `timestamp.body`). Mode `standard`: `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>` Standard Webhooks) |
 | Body | Envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) dibaca bertahap dari `journal.db` |
-| Event | message, receipt, undecryptable, connection, pairing, outbox, poll_vote, presence, chat_presence, group, call (dan `test` untuk `waapi webhook test`). Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik). Payload `poll_vote`: `{ poll_id, chat, voter, voter_pn?, selected, selected_hashes, poll_known, timestamp }`. Payload `presence`: `{ from, from_pn?, unavailable, last_seen? }`. Payload `chat_presence`: `{ chat, sender, state, media? }`. Payload `group`: `{ group, actor?, actor_pn?, timestamp, changes: [{ action, participants?, value? }], join_reason?, name? }`. Payload `call`: `{ call_id, from, from_pn?, group?, action, reason? }` (`c:<call_id>:<offer\|rejected\|terminate>`) |
+| Event | message, receipt, undecryptable, connection, pairing, outbox, poll_vote, presence, chat_presence, group, call, health, consent (dan `test` untuk `waapi webhook test`). Default untuk instance baru: `message,receipt,connection,pairing,outbox,poll_vote,health`. Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik). Payload `poll_vote`: `{ poll_id, chat, voter, voter_pn?, selected, selected_hashes, poll_known, timestamp }`. Payload `presence`: `{ from, from_pn?, unavailable, last_seen? }`. Payload `chat_presence`: `{ chat, sender, state, media? }`. Payload `group`: `{ group, actor?, actor_pn?, timestamp, changes: [{ action, participants?, value? }], join_reason?, name? }`. Payload `call`: `{ call_id, from, from_pn?, group?, action, reason? }` (`c:<call_id>:<offer\|rejected\|terminate>`). Payload `health`: `{ state, prev_state, score, profile, shadow, reason?, ban_code?, ban_until? }`. Payload `consent`: `{ jid, action, keyword }` |
 | Notes | Pengiriman berurutan per `lane = part % webhook_lanes` (default 4 lane). Jadwal retry `0, 5s, 15s, 45s, 2m, 5m, 15m, 30m, 1h...` (±20% jitter) hingga `webhook_max_attempts` (default 12), menghormati `Retry-After` (maks 1h); `410 Gone` mem-pause target (`gone`); `4xx` lainnya maks 3 percobaan lalu dipindah ke `webhook_dead` (DLQ). Target dibaca dari `TargetCache` memori |
 
 ## Control Plane (CLI only, Unix socket)
@@ -500,6 +512,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `GET /control/instances/{id}/events` mengambil atau long-poll (`?after=N&limit=N&types=csv&wait=N`), dan `GET /control/instances/{id}/events/stream` melakukan SSE stream event journal v2 per instance via `waapi events <id> [--after N] [--types csv] [--limit N] [--follow] [--json]`.
 - `GET /control/debug/pprof/*` menyediakan endpoint `net/http/pprof` (`heap`, `goroutine`, `goroutineleak`, `profile`, `cmdline`, `symbol`, `trace`), diakses via `waapi debug pprof <profil> [-o file] [--seconds N]`.
 - `POST /control/instances/{id}/recycle` menghentikan supervisor, melepas client lama, memuat ulang device `sqlstore`, dan menyalakan ulang supervisor (`waapi recycle <id>`). Ditolak HTTP 400 bila belum dipairing.
+- `GET /control/instances/{id}/health` mengembalikan `HealthReport` Guardian lengkap untuk sebuah instance (`waapi health <id> [--json]`).
 
 ## Scheduled Tasks
 
@@ -513,7 +526,8 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Outbox lease recovery | Saat startup & tiap 60 detik | Kembalikan pekerjaan `sending` yang lease-nya kedaluwarsa (crash/kill) | Ubah status kembali ke `queued` dan bangunkan scheduler instance |
 | Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
-| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox` serta `uploads` tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox` & descriptor `uploads` kedaluwarsa, serta inkremen `dropped_undelivered_total` |
+| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox`, `uploads`, serta bucket Guardian tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox`, descriptor `uploads` > 24h, `guardian_hourly` > 8 hari, `guardian_fanout` > 2 hari, serta inkremen `dropped_undelivered_total` |
+| Guardian bucket flusher | Tiap 30 detik & saat shutdown | Sinkronkan delta ring counter 25 jam dari RAM ke tabel `guardian_hourly` di `journal.db` | Menjaga hitungan skor dan kuota tetap akurat setelah restart tanpa write DB per pesan |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
 

@@ -184,6 +184,7 @@ type Server struct {
 	chatDriver    chatTransport
 	groupDriver   groupTransport
 	contactDriver contactTransport
+	healthDriver  healthTransport
 	gov           governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -281,6 +282,7 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("GET /v2/instances/{id}/groups/{jid}/requests", auth.ScopeGroupsRead, s.withInstanceAuth(s.handleV2ListGroupRequests))
 	s.handle("POST /v2/instances/{id}/groups/{jid}/requests", auth.ScopeGroupsWrite, s.withInstanceAuth(s.handleV2HandleGroupRequests))
 	s.handle("GET /v2/instances/{id}/contacts/{jid}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetContactProfile))
+	s.handle("GET /v2/instances/{id}/health", auth.ScopeHealthRead, s.withInstanceAuth(s.handleV2GetHealth))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

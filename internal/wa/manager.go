@@ -57,11 +57,36 @@ func WithWebhookService(ws *webhook.Service) ManagerOption {
 	}
 }
 
+// RateUpdater diperbarui saat rate_per_min instance diubah lewat API kontrol.
+type RateUpdater interface {
+	SetRate(instanceID string, rpm int)
+}
+
+// TempBanHandler menangani sinyal TemporaryBan WhatsApp ke komponen kesehatan akun.
+type TempBanHandler func(ctx context.Context, instanceID string, code int, expire time.Duration) error
+
 // WithOutbox memasang Service durable outbox beserta observer receipt ke Manager.
-func WithOutbox(svc *outbox.Service, gov *outbox.TokenBucketGovernor) ManagerOption {
+func WithOutbox(svc *outbox.Service, gov RateUpdater) ManagerOption {
 	return func(m *Manager) {
 		m.outbox = svc
 		m.outboxGov = gov
+	}
+}
+
+// WithHealthHooks memasang callback delivered post-commit, temporary ban, pairing selesai, dan ringkasan health untuk Guardian.
+func WithHealthHooks(onDelivered func(string, int), onTempBan TempBanHandler, onPaired func(string), summaryFn func(context.Context, string) (*HealthSummary, error)) ManagerOption {
+	return func(m *Manager) {
+		m.onDelivered = onDelivered
+		m.onTempBan = onTempBan
+		m.onPaired = onPaired
+		m.healthSummary = summaryFn
+	}
+}
+
+// WithHealthSummary memasang penyedia ringkasan state/score kesehatan akun pada snapshot status instance.
+func WithHealthSummary(fn func(context.Context, string) (*HealthSummary, error)) ManagerOption {
+	return func(m *Manager) {
+		m.healthSummary = fn
 	}
 }
 
@@ -91,8 +116,12 @@ type Manager struct {
 	webhookSvc  *webhook.Service
 	journal     *journal.Journal
 	targetCache *webhook.TargetCache
-	outbox      *outbox.Service
-	outboxGov   *outbox.TokenBucketGovernor
+	outbox        *outbox.Service
+	outboxGov     RateUpdater
+	onDelivered   func(string, int)
+	onTempBan     TempBanHandler
+	onPaired      func(string)
+	healthSummary func(context.Context, string) (*HealthSummary, error)
 	mediaPipe   *media.Pipeline
 	mediaOnce   sync.Once
 	uploadStore *media.UploadStore
@@ -153,7 +182,7 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		}
 	}
 	if m.outbox != nil {
-		m.AddInboundObserver(NewReceiptObserver(m.outbox))
+		m.AddInboundObserver(NewReceiptObserverWithCallback(m.outbox, m.onDelivered))
 	}
 
 	rows, err := st.ListInstances(ctx)
@@ -186,14 +215,14 @@ func (m *Manager) AddInboundObserver(fn InboundObserver) {
 }
 
 // AttachOutbox menghubungkan service outbox setelah konstruksi Manager, mendaftarkan observer receipt, dan menyalakan scheduler instance aktif.
-func (m *Manager) AttachOutbox(svc *outbox.Service, gov *outbox.TokenBucketGovernor) {
+func (m *Manager) AttachOutbox(svc *outbox.Service, gov RateUpdater) {
 	if m == nil {
 		return
 	}
 	m.outbox = svc
 	m.outboxGov = gov
 	if svc != nil {
-		m.AddInboundObserver(NewReceiptObserver(svc))
+		m.AddInboundObserver(NewReceiptObserverWithCallback(svc, m.onDelivered))
 		m.mu.RLock()
 		for _, inst := range m.instances {
 			if inst.getSupervisor() != nil || inst.IsConnected() {
@@ -612,5 +641,108 @@ func (m *Manager) CountByStatus(ctx context.Context) map[string]int {
 		counts[it.Status]++
 	}
 	return counts
+}
+
+// SetGroupGovernor memasang atau mengganti GroupGovernor aktif setelah Manager dikonstruksi.
+func (m *Manager) SetGroupGovernor(gov GroupGovernor) {
+	if m == nil || gov == nil {
+		return
+	}
+	m.groupGov = gov
+}
+
+// SetHealthHooks menyambungkan callback Guardian setelah konstruksi Manager (sebelum AttachOutbox & AutoStartAll).
+func (m *Manager) SetHealthHooks(onDelivered func(string, int), onTempBan TempBanHandler, onPaired func(string), summaryFn func(context.Context, string) (*HealthSummary, error)) {
+	if m == nil {
+		return
+	}
+	m.onDelivered = onDelivered
+	m.onTempBan = onTempBan
+	m.onPaired = onPaired
+	m.healthSummary = summaryFn
+}
+
+// notifyPaired dipanggil setelah pairing perangkat berhasil.
+func (m *Manager) notifyPaired(id string) {
+	if m != nil && m.onPaired != nil {
+		m.onPaired(id)
+	}
+}
+
+// IsAddressBookContact memeriksa buku alamat WhatsApp lokal (Found && FullName != "") tanpa panggilan jaringan.
+func (m *Manager) IsAddressBookContact(ctx context.Context, instanceID string, target types.JID) bool {
+	if m == nil || target.IsEmpty() {
+		return false
+	}
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return false
+	}
+	cli := inst.getClient()
+	if cli == nil || cli.Store == nil || cli.Store.Contacts == nil {
+		return false
+	}
+	nonAD := target.ToNonAD()
+	if info, err := cli.Store.Contacts.GetContact(ctx, nonAD); err == nil && info.Found && strings.TrimSpace(info.FullName) != "" {
+		return true
+	}
+	if nonAD.Server == types.HiddenUserServer && cli.Store.LIDs != nil {
+		if pn, err := cli.Store.LIDs.GetPNForLID(ctx, nonAD); err == nil && !pn.IsEmpty() {
+			if info, err := cli.Store.Contacts.GetContact(ctx, pn.ToNonAD()); err == nil && info.Found && strings.TrimSpace(info.FullName) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ResolveLIDToPN memetakan JID LID ke PN lewat store lokal milik instance jika tersedia.
+func (m *Manager) ResolveLIDToPN(ctx context.Context, instanceID string, target types.JID) (types.JID, bool) {
+	if m == nil || target.IsEmpty() {
+		return types.EmptyJID, false
+	}
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return types.EmptyJID, false
+	}
+	res := inst.lidResolver()
+	if res == nil {
+		return types.EmptyJID, false
+	}
+	return res.PNForLID(ctx, target)
+}
+
+// EmitHealthEvent mencatat event health instance melalui Emitter aktif ke journal/webhook.
+func (m *Manager) EmitHealthEvent(ctx context.Context, instanceID string, payload any) error {
+	if m == nil {
+		return nil
+	}
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return nil
+	}
+	emit := inst.emitter()
+	if emit == nil {
+		return nil
+	}
+	return emit.Emit(ctx, instanceID, "health", payload)
+}
+
+// EnqueueSystemText mengantrekan pesan teks sistem (seperti konfirmasi opt-out) lewat durable outbox.
+func (m *Manager) EnqueueSystemText(ctx context.Context, instanceID, to, text, idemKey string) error {
+	if m == nil || m.outbox == nil {
+		return nil
+	}
+	_, _, err := m.outbox.Enqueue(ctx, outbox.EnqueueRequest{
+		InstanceID: instanceID,
+		IdemKey:    idemKey,
+		Spec: outbox.Spec{
+			Type: "text",
+			To:   to,
+			Text: text,
+		},
+		Origin: outbox.Origin{Kind: "system"},
+	})
+	return err
 }
 

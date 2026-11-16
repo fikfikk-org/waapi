@@ -324,12 +324,18 @@ func (m *Manager) CreateGroup(ctx context.Context, instanceID string, req Create
 	if err != nil {
 		return GroupDetail{}, err
 	}
+	gov := m.activeGroupGovernor()
 	created, err := gcli.CreateGroup(ctx, whatsmeow.ReqCreateGroup{
 		Name:         name,
 		Participants: partJIDs,
 	})
 	if err != nil {
 		return GroupDetail{}, MapGroupIQError(err)
+	}
+	if rec, ok := gov.(interface {
+		RecordGroupCreated(context.Context, string)
+	}); ok {
+		rec.RecordGroupCreated(ctx, instanceID)
 	}
 	m.invalidateGroupListCache(instanceID)
 	return buildGroupDetail(created), nil
