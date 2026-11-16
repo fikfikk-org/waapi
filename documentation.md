@@ -61,6 +61,12 @@ flowchart TD
         O3 -->|"receipt delivery (DM)"| O7["delivered"]
         O7 -->|"receipt read/played (DM)"| O8["read"]
     end
+    subgraph MediaUpload
+        M1["POST /v2/media (stream)"] -->|"sniff 64KiB + O_TMPFILE + drop-behind"| M2["active (uploads, TTL 24h)"]
+        M2 -->|"kirim outbox berkali-kali"| M3["reused oleh banyak penerima"]
+        M2 -->|"lewat 24h"| M4["expired (ditolak 410)"]
+        M4 -->|"pruner tiap jam"| M5["dihapus"]
+    end
 ```
 
 ## Aturan per Entitas
@@ -122,7 +128,7 @@ flowchart TD
 | id | ID unik ULID 26 karakter yang monotonik secara waktu | Identitas pesan keluar internal untuk pelacakan & pembatalan |
 | instance_id | Pemilik instance WhatsApp | Antrean, laju kirim, dan kunci idempotensi terisolasi per instance |
 | recipient | Nomor E.164 atau JID kanonik (`@s.whatsapp.net` / `@g.us`) | Awalan `0` otomatis dinormalisasi ke kode negara `62` |
-| type | Jenis pesan keluar (saat ini aktif untuk `text`) | Media masih memakai jalur langsung sebelum integrasi penuh |
+| type | `text`, `image`, `video`, `audio`, `document`, `sticker` | Voice note memakai `type: "audio"` + `media.ptt: true` (kompatibel dengan upload `?kind=ptt`) |
 | status | `queued`, `sending`, `sent`, `delivered`, `read`, `failed`, `expired`, `cancelled` | Menggambarkan siklus penuh pesan keluar sampai receipt |
 | priority | Hanya menerima `normal` (`0`) atau `urgent` (`10`) | Pesan `urgent` didahulukan saat scheduler mengklaim antrean |
 | not_before | Batas paling awal pesan boleh diklaim scheduler | Dipakai untuk penjadwalan tunda atau backoff retry |
@@ -138,6 +144,17 @@ flowchart TD
 |---|---|---|
 | token_bucket | Pembatasan laju kirim per instance memakai Token Bucket (kapasitas burst 3 token) | Mengatur kecepatan pengosongan antrean outbox sesuai kuota menit instance |
 | dynamic_rate | Perubahan konfigurasi laju kirim instance diterapkan seketika | Memperbarui kecepatan pengisian token tanpa restart daemon |
+
+### Media Engine & Upload Descriptor (`uploads` di `journal.db`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| id | ID unik ULID awalan `upl_` | Dipakai ulang lintas banyak pesan/penerima tanpa upload ulang ke CDN |
+| kind | `image`, `video`, `audio`, `ptt`, `document`, `sticker` | Menentukan kunci HKDF enkripsi WhatsApp & aturan sniffing format |
+| mimetype | Hasil sniffing header 64 KiB (`OggS` -> `audio/ogg`) | Sticker wajib `image/webp`; PTT wajib OGG Opus (`OpusHead` offset 28); GIF pada `image` ditolak |
+| size & sha256 | Panjang plaintext & digest SHA-256 hex lowercase | Disertakan pada `ETag` saat unduh ulang media |
+| dimensi & durasi | `width`, `height` dari header JPEG/PNG/WebP (tanpa decode piksel), `seconds` opsional | Bila header melewati 64 KiB, dimensi dikosongkan (`0`) |
+| expires_at | `created_at + 24 jam` | Dipakai untuk validasi awal kirim (`upload_expired`) dan safety net eksekusi outbox (`media_expired`) |
 
 ## Transisi Status Instance
 
@@ -175,6 +192,14 @@ flowchart TD
 | sent | delivered | Tanda terima delivery diterima dari WhatsApp (chat DM) |
 | sent / delivered | read | Tanda terima dibaca atau diputar diterima dari WhatsApp (chat DM) |
 
+## Transisi Status Upload Media
+
+| Dari | Ke | Pemicu |
+|---|---|---|
+| active (`uploads`) | active (`reused`) | Dipakai ulang berkali-kali oleh job outbox lintas banyak penerima tanpa upload ulang ke CDN |
+| active (`uploads`) | expired | Melewati batas `expires_at` (`created_at + 24 jam`); ditolak `410 upload_expired` di HTTP atau gagal permanen `media_expired` saat eksekusi |
+| expired | dihapus | Tugas pembersihan `UploadStore.Prune` berjalan tiap jam bersama pruner |
+
 ## Batasan Bisnis & Trigger
 
 | Aturan | Detail |
@@ -205,4 +230,9 @@ flowchart TD
 | Pemulihan lease outbox | Pengawas latar belakang memeriksa pesan berstatus `sending` yang melewati masa lease tiap 60 detik (dan saat startup) untuk dikembalikan ke `queued` |
 | Monotonik receipt & non-journal grup | Status tanda terima pesan DM hanya bergerak maju (`sent` -> `delivered` -> `read`); receipt chat grup tetap menaikkan counter pengiriman/pembacaan outbox meski mode journal hanya mencatat DM |
 | Pembersihan & batas antrean outbox | Penambahan antrean ditolak jika antrean `queued` instance mencapai batas kuota; tugas pembersihan tiap jam memangkas pesan final outbox yang melewati retensi |
+| Pipeline media satu-pass & temp anonim | Unggahan berjalan dalam satu pass (sniff 64 KiB -> limit -> enkripsi ke satu file temp `O_TMPFILE` / delete-on-close -> drop-behind per 4 MiB saat upload, tanpa decode piksel atau file plaintext di disk); `WAAPI_MEDIA_DROPBEHIND=off` mematikan drop-behind; konkurensi dibatasi 2 transfer aktif (`mediaSem`) |
+| Proteksi SSRF & fetch URL eksternal | `netguard` mengecek seluruh IP hasil DNS sebelum dial (CGNAT, IPv4-mapped, NAT64, 6to4, loopback, RFC1918, unspecified) memakai shared transport (`IdleConnTimeout` 30s) & maks 3 redirect HTTPS; pelanggaran SSRF gagal permanen seketika, kegagalan jaringan/HTTP transien di-retry maks 3x (`media_fetch_failed`) |
+| Media resurrection (404/410 CDN) | Unduhan event journal yang gagal 404/410 memicu `SendMediaRetryReceipt`, menunggu `events.MediaRetry` maks 30s (maks 16 penunggu), mendekripsi path baru, lalu mengunduh ulang; kegagalan membalas `410 media_gone` |
+| Proteksi memori & deadline media | Endpoint media menolak dengan `503 memory_pressure` (`Retry-After: 15`) saat governor level `Red`, dan memperpanjang deadline baca/tulis hingga 10 menit untuk transfer berkas besar |
+| Pembersihan `uploads` berkala | Tugas pembersihan tiap jam di pruner menghapus descriptor `uploads` yang melampaui masa berlaku 24 jam |
 

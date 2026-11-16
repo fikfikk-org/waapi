@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -601,7 +603,7 @@ func (s *Service) runScheduler(ctx context.Context, instanceID string, wake <-ch
 		}
 
 		maxAttempts := 8
-		if code == "send_failed" {
+		if code == "send_failed" || code == "media_fetch_failed" {
 			maxAttempts = 3
 		}
 		if !transient || attempts >= maxAttempts {
@@ -668,18 +670,29 @@ func (s *Service) afterFinalTransition(ctx context.Context, job *Job, st Status)
 
 func (s *Service) validateAndNormalize(req EnqueueRequest) (Spec, int64, time.Duration, error) {
 	spec := req.Spec
-	if spec.Type != "text" {
-		return Spec{}, 0, 0, fmt.Errorf("%w: tipe pesan %q belum didukung pada tahap ini", ErrInvalidSpec, spec.Type)
-	}
+	spec.Type = strings.ToLower(strings.TrimSpace(spec.Type))
+
 	parsedTo, err := jid.ParseRecipient(spec.To)
 	if err != nil {
 		return Spec{}, 0, 0, err
 	}
 	spec.To = parsedTo.String()
 
-	if strings.TrimSpace(spec.Text) == "" {
-		return Spec{}, 0, 0, fmt.Errorf("%w: field text wajib diisi", ErrInvalidSpec)
+	switch spec.Type {
+	case "text":
+		if strings.TrimSpace(spec.Text) == "" {
+			return Spec{}, 0, 0, fmt.Errorf("%w: field text wajib diisi", ErrInvalidSpec)
+		}
+	case "image", "video", "audio", "document", "sticker":
+		normMedia, mErr := validateMediaSpec(spec.Type, spec.Media)
+		if mErr != nil {
+			return Spec{}, 0, 0, mErr
+		}
+		spec.Media = normMedia
+	default:
+		return Spec{}, 0, 0, fmt.Errorf("%w: tipe pesan %q tidak didukung", ErrInvalidSpec, spec.Type)
 	}
+
 	if spec.ReplyTo != nil && strings.TrimSpace(spec.ReplyTo.ID) == "" {
 		return Spec{}, 0, 0, fmt.Errorf("%w: reply_to.id wajib diisi", ErrInvalidSpec)
 	}
@@ -707,6 +720,45 @@ func (s *Service) validateAndNormalize(req EnqueueRequest) (Spec, int64, time.Du
 		ttl = s.opt.DefaultTTL
 	}
 	return spec, sendAtMS, ttl, nil
+}
+
+func validateMediaSpec(msgType string, m *MediaRef) (*MediaRef, error) {
+	if m == nil {
+		return nil, fmt.Errorf("%w: objek media wajib diisi untuk tipe %s", ErrInvalidSpec, msgType)
+	}
+	cp := *m
+	cp.UploadID = strings.TrimSpace(cp.UploadID)
+	cp.URL = strings.TrimSpace(cp.URL)
+	if (cp.UploadID == "") == (cp.URL == "") {
+		return nil, fmt.Errorf("%w: isi tepat satu antara media.upload_id atau media.url", ErrInvalidSpec)
+	}
+	if cp.URL != "" {
+		u, err := url.Parse(cp.URL)
+		if err != nil || !strings.EqualFold(u.Scheme, "https") || strings.TrimSpace(u.Host) == "" {
+			return nil, fmt.Errorf("%w: media.url harus berupa URL https yang valid", ErrInvalidSpec)
+		}
+	}
+	if cp.PTT && msgType != "audio" {
+		return nil, fmt.Errorf("%w: media.ptt hanya valid untuk tipe audio", ErrInvalidSpec)
+	}
+	if cp.GIF && msgType != "video" {
+		return nil, fmt.Errorf("%w: media.gif hanya valid untuk tipe video", ErrInvalidSpec)
+	}
+	if cp.Thumbnail != "" {
+		if msgType != "image" && msgType != "video" {
+			return nil, fmt.Errorf("%w: media.thumbnail hanya didukung untuk image atau video", ErrInvalidSpec)
+		}
+		clean := strings.TrimSpace(cp.Thumbnail)
+		raw, err := base64.StdEncoding.DecodeString(clean)
+		if err != nil {
+			return nil, fmt.Errorf("%w: media.thumbnail harus berupa base64 yang valid", ErrInvalidSpec)
+		}
+		if len(raw) > 16<<10 {
+			return nil, fmt.Errorf("%w: ukuran thumbnail melebihi batas 16 KiB", ErrInvalidSpec)
+		}
+		cp.Thumbnail = clean
+	}
+	return &cp, nil
 }
 
 func computeReqHash(spec Spec, sendAtMS int64, priority int, ttl time.Duration) ([]byte, error) {

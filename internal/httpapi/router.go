@@ -14,6 +14,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
+	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/wa"
 )
@@ -74,12 +75,40 @@ func WithOutbox(svc *outbox.Service) ServerOption {
 	}
 }
 
+// WithMedia memasang Pipeline Media Engine v2 dan UploadStore untuk unggah/unduh media v1 dan v2.
+func WithMedia(pipe *media.Pipeline, uploads *media.UploadStore) ServerOption {
+	return func(s *Server) {
+		if pipe != nil {
+			s.mediaPipe = pipe
+		}
+		if uploads != nil {
+			s.uploadStore = uploads
+		}
+	}
+}
+
+func withMediaDriver(drv mediaTransport, waiter *media.RetryWaiter) ServerOption {
+	return func(s *Server) {
+		if drv != nil {
+			s.mediaDriver = drv
+		}
+		if waiter != nil {
+			s.retryWaiter = waiter
+		}
+	}
+}
+
 func withV1WaitTimeout(d time.Duration) ServerOption {
 	return func(s *Server) {
 		if d > 0 {
 			s.v1WaitTimeout = d
 		}
 	}
+}
+
+type mediaTransport interface {
+	UploaderFor(instanceID string) (media.Uploader, error)
+	DownloaderFor(instanceID string) (media.Downloader, media.RetryReceiptSender, error)
 }
 
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
@@ -89,6 +118,10 @@ type Server struct {
 	appDB         *sql.DB
 	journal       *journal.Journal
 	outbox        *outbox.Service
+	mediaPipe     *media.Pipeline
+	uploadStore   *media.UploadStore
+	retryWaiter   *media.RetryWaiter
+	mediaDriver   mediaTransport
 	gov           governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -119,6 +152,12 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	if s.journal == nil && w != nil {
 		s.journal = w.Journal()
 	}
+	if s.mediaDriver == nil && w != nil {
+		s.mediaDriver = w
+	}
+	if s.retryWaiter == nil && w != nil {
+		s.retryWaiter = w.RetryWaiter()
+	}
 	if s.sseMax <= 0 {
 		if envMax := strings.TrimSpace(os.Getenv("WAAPI_SSE_MAX")); envMax != "" {
 			if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
@@ -146,9 +185,12 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("POST /v1/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleDownloadMedia))
 	s.handle("GET /v2/instances/{id}/events", auth.ScopeEventsRead, s.withInstanceAuth(s.handleGetEvents))
 	s.handle("GET /v2/instances/{id}/events/stream", auth.ScopeEventsRead, s.withInstanceAuth(s.handleEventsStream))
+	s.handle("GET /v2/instances/{id}/events/{seq}/media", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2DownloadEventMedia))
 	s.handle("POST /v2/instances/{id}/messages", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2SendMessage))
 	s.handle("GET /v2/instances/{id}/messages/{msg_id}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetMessage))
 	s.handle("DELETE /v2/instances/{id}/messages/{msg_id}", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2CancelMessage))
+	s.handle("POST /v2/instances/{id}/media", auth.ScopeMediaWrite, s.withInstanceAuth(s.handleV2UploadMedia))
+	s.handle("POST /v2/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2DownloadMedia))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

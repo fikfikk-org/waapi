@@ -768,6 +768,11 @@ func (i *Instance) handleEvent(rawEvt any) {
 		return
 	}
 	switch evt := rawEvt.(type) {
+	case *events.MediaRetry:
+		if i.mgr != nil && i.mgr.retryWaiter != nil {
+			i.mgr.retryWaiter.Deliver(evt)
+		}
+		return
 	case *events.Message:
 		// Di V2 seluruh event pesan mengalir lewat journal.db melalui handleEventV2.
 		_ = extractMessage(evt)
@@ -784,7 +789,12 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 		return true
 	}
 
-	switch rawEvt.(type) {
+	switch evt := rawEvt.(type) {
+	case *events.MediaRetry:
+		if i.mgr != nil && i.mgr.retryWaiter != nil {
+			i.mgr.retryWaiter.Deliver(evt)
+		}
+		return true
 	case *events.HistorySync:
 		// Drop seluruh history sync agar tidak memakan RAM maupun disk.
 		return true

@@ -90,7 +90,11 @@ func (i *Instance) EnqueueMedia(ctx context.Context, in MediaInput) (SendResult,
 	if mime == "" {
 		mime = detectedMime
 	}
-	msg := buildMediaE2EMessage(in.MediaType, mime, in.Caption, in.Filename, up)
+	spec, rec := buildFallbackMediaMessage(in.MediaType, mime, in.Caption, in.Filename, up)
+	msg, err := composeMediaMessage(*spec, rec)
+	if err != nil {
+		return SendResult{}, err
+	}
 	return i.sendDirect(ctx, toJID, msg, false, len(in.Caption))
 }
 

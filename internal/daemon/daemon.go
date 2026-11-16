@@ -21,6 +21,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
+	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/sdnotify"
@@ -185,10 +186,20 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	wh := webhook.NewDispatcher(st, nil, 0)
 	wh.SetTargetCache(tc)
 
+	uploadStore := media.NewUploadStore(j.DB())
+	mediaPipe := media.NewPipeline(media.Limits{
+		MediaMaxBytes:    cfg.MediaMaxBytes,
+		DocumentMaxBytes: cfg.DocumentMaxBytes,
+		TmpDir:           cfg.TmpDir(),
+		DropBehindOff:    strings.EqualFold(cfg.MediaDropbehind, "off"),
+	})
+	retryWaiter := media.NewRetryWaiter()
+
 	waMgr, err := wa.NewManager(ctx, cfg, st, wh,
 		wa.WithJournal(j),
 		wa.WithTargetCache(tc),
 		wa.WithWebhookService(whSvc),
+		wa.WithMedia(mediaPipe, uploadStore, retryWaiter),
 	)
 	if err != nil {
 		whSvc.Stop()
@@ -211,6 +222,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		HourlyTask: func(pCtx context.Context) {
 			if _, pErr := outboxSvc.PruneOutbox(pCtx, time.Now(), 7*24*time.Hour, 1000); pErr != nil && ctx.Err() == nil {
 				slog.Warn("pruner outbox gagal", "err", pErr)
+			}
+			if _, uErr := uploadStore.Prune(pCtx, time.Now()); uErr != nil && ctx.Err() == nil {
+				slog.Warn("pruner uploads gagal", "err", uErr)
 			}
 		},
 	})
@@ -249,7 +263,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,

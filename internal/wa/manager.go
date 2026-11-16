@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
+	"github.com/fikfikk-org/waapi/internal/media"
+	"github.com/fikfikk-org/waapi/internal/netguard"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/webhook"
@@ -61,6 +64,15 @@ func WithOutbox(svc *outbox.Service, gov *outbox.TokenBucketGovernor) ManagerOpt
 	}
 }
 
+// WithMedia memasang Pipeline media v2, UploadStore, dan RetryWaiter ke Manager.
+func WithMedia(pipe *media.Pipeline, uploads *media.UploadStore, waiter *media.RetryWaiter) ManagerOption {
+	return func(m *Manager) {
+		m.mediaPipe = pipe
+		m.uploadStore = uploads
+		m.retryWaiter = waiter
+	}
+}
+
 // Manager mengelola siklus hidup seluruh instance WhatsApp di dalam satu proses daemon.
 type Manager struct {
 	cfg         *config.Config
@@ -73,6 +85,11 @@ type Manager struct {
 	targetCache *webhook.TargetCache
 	outbox      *outbox.Service
 	outboxGov   *outbox.TokenBucketGovernor
+	mediaPipe   *media.Pipeline
+	mediaOnce   sync.Once
+	uploadStore *media.UploadStore
+	retryWaiter *media.RetryWaiter
+	mediaHTTP   *http.Client
 	waLog       waLog.Logger
 	pairingSem  *semaphore.Weighted
 	mediaSem    *semaphore.Weighted
@@ -112,6 +129,7 @@ func NewManager(ctx context.Context, cfg *config.Config, st *store.Store, wh *we
 		container:  container,
 		webhook:    wh,
 		waLog:      waLogger,
+		mediaHTTP:  netguard.NewClient(netguard.Policy{}, 60*time.Second),
 		pairingSem: semaphore.NewWeighted(1), // maksimal 1 proses pairing dalam satu waktu
 		mediaSem:   semaphore.NewWeighted(2), // maksimal 2 stream media aktif bersamaan
 		instances:  make(map[string]*Instance),
@@ -279,6 +297,9 @@ func (m *Manager) Close() error {
 
 	for _, inst := range list {
 		inst.Close()
+	}
+	if m.mediaHTTP != nil {
+		m.mediaHTTP.CloseIdleConnections()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

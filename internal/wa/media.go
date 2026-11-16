@@ -3,128 +3,138 @@ package wa
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/media"
+	"github.com/fikfikk-org/waapi/internal/netguard"
+	"github.com/fikfikk-org/waapi/internal/outbox"
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"google.golang.org/protobuf/proto"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // ErrMediaTooLarge dikembalikan jika ukuran stream melampaui batas yang diizinkan.
-var ErrMediaTooLarge = errors.New("ukuran media melebihi batas maksimum")
+var ErrMediaTooLarge = media.ErrMediaTooLarge
 
 // ErrInvalidMediaType dikembalikan jika tipe media tidak dikenali.
-var ErrInvalidMediaType = errors.New("tipe media tidak valid (gunakan image, video, audio, atau document)")
+var ErrInvalidMediaType = media.ErrInvalidKind
 
-// bufPool menyediakan buffer 64 KB yang dipakai ulang untuk operasi copy stream media.
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 64<<10)
-		return &b
-	},
-}
-
-// MediaInput merangkum parameter pengiriman pesan media.
+// MediaInput merangkum parameter pengiriman pesan media untuk kompatibilitas v1 langsung.
 type MediaInput struct {
 	To        string
-	MediaType string // image | video | audio | document
+	MediaType string // image | video | audio | document | sticker
 	Caption   string
 	Filename  string
 	MimeType  string
 	Reader    io.Reader
 }
 
-// parseMediaType memetakan string tipe media ke konstanta whatsmeow.MediaType dan mmsType.
-func parseMediaType(kind string) (whatsmeow.MediaType, string, error) {
-	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "image":
-		return whatsmeow.MediaImage, "image", nil
-	case "video":
-		return whatsmeow.MediaVideo, "video", nil
-	case "audio":
-		return whatsmeow.MediaAudio, "audio", nil
-	case "document":
-		return whatsmeow.MediaDocument, "document", nil
-	case "sticker":
-		return whatsmeow.MediaImage, "sticker", nil
-	default:
-		return "", "", ErrInvalidMediaType
-	}
+type httpStatusError struct {
+	status int
 }
 
-// UploadStream menyalin stream ke file sementara, mengunggah via UploadReader, lalu menghapus file.
+func (e httpStatusError) Error() string {
+	return fmt.Sprintf("server media mengembalikan HTTP %d", e.status)
+}
+
+func (e httpStatusError) transient() bool {
+	return e.status == http.StatusRequestTimeout ||
+		e.status == http.StatusTooEarly ||
+		e.status == http.StatusTooManyRequests ||
+		e.status >= http.StatusInternalServerError
+}
+
+func (m *Manager) ensureMediaPipeline() *media.Pipeline {
+	if m == nil {
+		return media.NewPipeline(media.Limits{})
+	}
+	if m.mediaPipe != nil {
+		return m.mediaPipe
+	}
+	m.mediaOnce.Do(func() {
+		if m.mediaPipe == nil {
+			var limits media.Limits
+			if m.cfg != nil {
+				limits = media.Limits{
+					MediaMaxBytes:    m.cfg.MediaMaxBytes,
+					DocumentMaxBytes: m.cfg.DocumentMaxBytes,
+					TmpDir:           m.cfg.TmpDir(),
+					DropBehindOff:    strings.EqualFold(m.cfg.MediaDropbehind, "off"),
+				}
+			}
+			m.mediaPipe = media.NewPipeline(limits)
+		}
+	})
+	return m.mediaPipe
+}
+
+func (m *Manager) mediaHTTPClient() *http.Client {
+	if m != nil && m.mediaHTTP != nil {
+		return m.mediaHTTP
+	}
+	return netguard.NewClient(netguard.Policy{}, 60*time.Second)
+}
+
+// UploaderFor mengembalikan Uploader whatsmeow yang sedang tersambung untuk instance tertentu.
+func (m *Manager) UploaderFor(instanceID string) (media.Uploader, error) {
+	if m == nil {
+		return nil, ErrNotConnected
+	}
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return nil, ErrNotConnected
+	}
+	cli := inst.getClient()
+	if cli == nil || !cli.IsConnected() {
+		return nil, ErrNotConnected
+	}
+	return cli, nil
+}
+
+// DownloaderFor mengembalikan Downloader dan pengirim MediaRetryReceipt milik instance yang tersambung.
+func (m *Manager) DownloaderFor(instanceID string) (media.Downloader, media.RetryReceiptSender, error) {
+	if m == nil {
+		return nil, nil, ErrNotConnected
+	}
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return nil, nil, ErrNotConnected
+	}
+	cli := inst.getClient()
+	if cli == nil || !cli.IsConnected() {
+		return nil, nil, ErrNotConnected
+	}
+	return cli, cli.SendMediaRetryReceipt, nil
+}
+
+// RetryWaiter mengembalikan waiter notifikasi MediaRetry yang terdaftar pada Manager.
+func (m *Manager) RetryWaiter() *media.RetryWaiter {
+	if m == nil {
+		return nil
+	}
+	return m.retryWaiter
+}
+
+func (i *Instance) mediaPipeline() *media.Pipeline {
+	if i != nil && i.mgr != nil {
+		return i.mgr.ensureMediaPipeline()
+	}
+	return media.NewPipeline(media.Limits{})
+}
+
+// UploadStream mengunggah stream plaintext dalam satu pass melalui media.Pipeline tanpa menyentuh file plaintext di disk.
 func (i *Instance) UploadStream(ctx context.Context, r io.Reader, kind string) (whatsmeow.UploadResponse, string, uint64, error) {
-	mt, _, err := parseMediaType(kind)
+	k, err := media.ValidateKind(kind)
 	if err != nil {
 		return whatsmeow.UploadResponse{}, "", 0, err
 	}
-	maxBytes := i.mgr.cfg.MediaMaxBytes
-	if strings.EqualFold(kind, "document") {
-		maxBytes = i.mgr.cfg.DocumentMaxBytes
-	}
-
-	if err := i.mgr.mediaSem.Acquire(ctx, 1); err != nil {
-		return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("antrian media penuh: %w", err)
-	}
-	defer i.mgr.mediaSem.Release(1)
-
-	plain, err := os.CreateTemp(i.mgr.cfg.TmpDir(), "plain-*")
-	if err != nil {
-		return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("buat temp plain: %w", err)
-	}
-	plainName := plain.Name()
-	defer func() {
-		_ = plain.Close()
-		_ = os.Remove(plainName)
-	}()
-
-	enc, err := os.CreateTemp(i.mgr.cfg.TmpDir(), "enc-*")
-	if err != nil {
-		return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("buat temp enc: %w", err)
-	}
-	encName := enc.Name()
-	defer func() {
-		_ = enc.Close()
-		_ = os.Remove(encName)
-	}()
-
-	bp := bufPool.Get().(*[]byte)
-	defer bufPool.Put(bp)
-
-	// Salin dengan batas maxBytes+1 untuk mendeteksi file berlebih tanpa memuatnya ke RAM
-	n, err := io.CopyBuffer(plain, io.LimitReader(r, maxBytes+1), *bp)
-	if err != nil {
-		return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("salin media ke temp: %w", err)
-	}
-	if n > maxBytes {
-		return whatsmeow.UploadResponse{}, "", 0, ErrMediaTooLarge
-	}
-
-	headLen := 512
-	if int64(headLen) > n {
-		headLen = int(n)
-	}
-	head := (*bp)[:headLen]
-	if headLen > 0 {
-		if _, err := plain.ReadAt(head, 0); err != nil && !errors.Is(err, io.EOF) {
-			return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("baca header media: %w", err)
-		}
-	}
-	mime := http.DetectContentType(head)
-	if _, err := plain.Seek(0, io.SeekStart); err != nil {
-		return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("seek temp plain: %w", err)
-	}
-
 	cli := i.getClient()
 	if cli == nil || !cli.IsConnected() {
 		return whatsmeow.UploadResponse{}, "", 0, ErrNotConnected
@@ -132,109 +142,19 @@ func (i *Instance) UploadStream(ctx context.Context, r io.Reader, kind string) (
 
 	upCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	resp, err := cli.UploadReader(upCtx, plain, enc, mt)
+	res, err := i.mediaPipeline().Upload(upCtx, cli, r, k, media.Hint{})
 	if err != nil {
-		return whatsmeow.UploadResponse{}, "", 0, fmt.Errorf("unggah media ke WhatsApp: %w", err)
+		return whatsmeow.UploadResponse{}, "", 0, err
 	}
-	return resp, mime, uint64(n), nil
+	return res.Resp, res.Meta.Mimetype, uint64(res.Meta.Size), nil
 }
 
-// buildMediaE2EMessage merakit *waE2E.Message dari hasil UploadResponse.
-func buildMediaE2EMessage(kind, mime, caption, filename string, up whatsmeow.UploadResponse) *waE2E.Message {
-	switch strings.ToLower(kind) {
-	case "image":
-		return &waE2E.Message{
-			ImageMessage: &waE2E.ImageMessage{
-				URL:           proto.String(up.URL),
-				DirectPath:    proto.String(up.DirectPath),
-				MediaKey:      up.MediaKey,
-				Mimetype:      proto.String(mime),
-				FileEncSHA256: up.FileEncSHA256,
-				FileSHA256:    up.FileSHA256,
-				FileLength:    proto.Uint64(up.FileLength),
-				Caption:       proto.String(caption),
-			},
-		}
-	case "video":
-		return &waE2E.Message{
-			VideoMessage: &waE2E.VideoMessage{
-				URL:           proto.String(up.URL),
-				DirectPath:    proto.String(up.DirectPath),
-				MediaKey:      up.MediaKey,
-				Mimetype:      proto.String(mime),
-				FileEncSHA256: up.FileEncSHA256,
-				FileSHA256:    up.FileSHA256,
-				FileLength:    proto.Uint64(up.FileLength),
-				Caption:       proto.String(caption),
-			},
-		}
-	case "audio":
-		return &waE2E.Message{
-			AudioMessage: &waE2E.AudioMessage{
-				URL:           proto.String(up.URL),
-				DirectPath:    proto.String(up.DirectPath),
-				MediaKey:      up.MediaKey,
-				Mimetype:      proto.String(mime),
-				FileEncSHA256: up.FileEncSHA256,
-				FileSHA256:    up.FileSHA256,
-				FileLength:    proto.Uint64(up.FileLength),
-			},
-		}
-	default:
-		if filename == "" {
-			filename = "attachment"
-		}
-		return &waE2E.Message{
-			DocumentMessage: &waE2E.DocumentMessage{
-				URL:           proto.String(up.URL),
-				DirectPath:    proto.String(up.DirectPath),
-				MediaKey:      up.MediaKey,
-				Mimetype:      proto.String(mime),
-				FileEncSHA256: up.FileEncSHA256,
-				FileSHA256:    up.FileSHA256,
-				FileLength:    proto.Uint64(up.FileLength),
-				FileName:      proto.String(filename),
-				Title:         proto.String(filename),
-				Caption:       proto.String(caption),
-			},
-		}
-	}
-}
-
-// DownloadMediaToWriter mengunduh media dari CDN WhatsApp ke file sementara lalu menyalinnya ke w.
+// DownloadMediaToWriter mengunduh media masuk dari WhatsApp ke file temp anonim melalui media.Pipeline lalu menyalinnya ke w.
 func (i *Instance) DownloadMediaToWriter(ctx context.Context, desc MediaDescriptor, w io.Writer) error {
-	mt, mmsType, err := parseMediaType(desc.MediaType)
+	pDesc, err := toPipelineDescriptor(desc)
 	if err != nil {
 		return err
 	}
-	mediaKey, err := base64.StdEncoding.DecodeString(desc.MediaKey)
-	if err != nil {
-		return fmt.Errorf("media_key base64 tidak valid: %w", err)
-	}
-	encHash, err := base64.StdEncoding.DecodeString(desc.FileEncSHA256)
-	if err != nil {
-		return fmt.Errorf("file_enc_sha256 base64 tidak valid: %w", err)
-	}
-	fileHash, err := base64.StdEncoding.DecodeString(desc.FileSHA256)
-	if err != nil {
-		return fmt.Errorf("file_sha256 base64 tidak valid: %w", err)
-	}
-
-	if err := i.mgr.mediaSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("antrian media penuh: %w", err)
-	}
-	defer i.mgr.mediaSem.Release(1)
-
-	tmp, err := os.CreateTemp(i.mgr.cfg.TmpDir(), "dl-*")
-	if err != nil {
-		return fmt.Errorf("buat temp download: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-	}()
-
 	cli := i.getClient()
 	if cli == nil || !cli.IsConnected() {
 		return ErrNotConnected
@@ -242,75 +162,69 @@ func (i *Instance) DownloadMediaToWriter(ctx context.Context, desc MediaDescript
 
 	dlCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	if err := cli.DownloadMediaWithPathToFile(dlCtx, desc.DirectPath, encHash, fileHash, mediaKey, mt, mmsType, false, tmp); err != nil {
-		return fmt.Errorf("unduh media dari WhatsApp: %w", err)
-	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
-	bp := bufPool.Get().(*[]byte)
-	defer bufPool.Put(bp)
-	_, err = io.CopyBuffer(w, tmp, *bp)
+	_, err = i.mediaPipeline().Download(dlCtx, cli, pDesc, w)
 	return err
 }
 
-// OpenSafeHTTPSStream membuka stream unduhan dari URL eksternal dengan proteksi anti-SSRF.
-func OpenSafeHTTPSStream(ctx context.Context, rawURL string) (io.ReadCloser, error) {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" {
-		return nil, errors.New("url harus menggunakan skema https yang valid")
+func toPipelineDescriptor(desc MediaDescriptor) (media.MediaDescriptor, error) {
+	k, err := media.ValidateKind(desc.MediaType)
+	if err != nil {
+		return media.MediaDescriptor{}, err
 	}
+	mediaKey, err := base64.StdEncoding.DecodeString(desc.MediaKey)
+	if err != nil {
+		return media.MediaDescriptor{}, fmt.Errorf("media_key base64 tidak valid: %w", err)
+	}
+	encHash, err := base64.StdEncoding.DecodeString(desc.FileEncSHA256)
+	if err != nil {
+		return media.MediaDescriptor{}, fmt.Errorf("file_enc_sha256 base64 tidak valid: %w", err)
+	}
+	fileHash, err := base64.StdEncoding.DecodeString(desc.FileSHA256)
+	if err != nil {
+		return media.MediaDescriptor{}, fmt.Errorf("file_sha256 base64 tidak valid: %w", err)
+	}
+	return media.MediaDescriptor{
+		Mimetype:      desc.Mimetype,
+		DirectPath:    desc.DirectPath,
+		MediaKey:      mediaKey,
+		FileEncSHA256: encHash,
+		FileSHA256:    fileHash,
+		FileLength:    desc.FileLength,
+		MediaType:     k,
+		Filename:      desc.Filename,
+	}, nil
+}
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil || len(ips) == 0 {
-				return nil, fmt.Errorf("resolusi DNS gagal untuk %s", host)
-			}
-			for _, ip := range ips {
-				if isBlockedIP(ip.IP) {
-					return nil, errors.New("alamat IP tujuan termasuk jaringan privat/terlarang (anti-SSRF)")
-				}
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-		},
+func fetchSafeMediaStream(ctx context.Context, client *http.Client, rawURL string) (io.ReadCloser, error) {
+	u, err := netguard.ValidateHTTPSURL(rawURL)
+	if err != nil {
+		return nil, err
 	}
-	client := &http.Client{
-		Timeout:   60 * time.Second,
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 || !strings.EqualFold(req.URL.Scheme, "https") {
-				return errors.New("redirect tidak diizinkan")
-			}
-			return nil
-		},
-	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("unduh url media: %w", err)
+		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("server media mengembalikan HTTP %d", resp.StatusCode)
+		return nil, httpStatusError{status: resp.StatusCode}
 	}
 	return resp.Body, nil
 }
 
-// isBlockedIP menolak loopback, private RFC1918/RFC4193, link-local, dan unspecified IP.
+// isBlockedIP membungkus netguard.IsBlocked agar kompatibel dengan unit test v1.
 func isBlockedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	if ip == nil {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	return netguard.IsBlocked(addr)
 }
 
 // SweepStaleTemp menghapus file media sementara yang berumur lebih dari maxAge saat startup.
@@ -330,3 +244,53 @@ func SweepStaleTemp(tmpDir string, maxAge time.Duration) {
 	}
 }
 
+// FetchSafeMediaForTest tidak digunakan di produksi; membantu wrapper internal menjaga helper media.
+func buildFallbackMediaMessage(kind, mime, caption, filename string, up whatsmeow.UploadResponse) (*outbox.Spec, media.UploadRecord) {
+	k := media.Kind(strings.ToLower(strings.TrimSpace(kind)))
+	return &outbox.Spec{
+			Type: string(k),
+			Media: &outbox.MediaRef{
+				Caption:  caption,
+				Filename: filename,
+			},
+		}, media.UploadRecord{
+			Kind:     k,
+			Mimetype: mime,
+			Size:     int64(up.FileLength),
+			Filename: filename,
+			Resp:     up,
+		}
+}
+
+// parseMessageInfoForRetry menyusun types.MessageInfo dari MessageV2 tersimpan guna keperluan MediaRetryReceipt.
+func ParseMessageInfoFromV2(chatRaw string, msg MessageV2, senderRaw string, evTS int64) types.MessageInfo {
+	chatTarget := strings.TrimSpace(msg.ChatRaw)
+	if chatTarget == "" {
+		chatTarget = strings.TrimSpace(msg.Chat)
+	}
+	if chatTarget == "" {
+		chatTarget = strings.TrimSpace(chatRaw)
+	}
+	chatJID, _ := types.ParseJID(chatTarget)
+
+	senderTarget := strings.TrimSpace(senderRaw)
+	if senderTarget == "" {
+		senderTarget = strings.TrimSpace(msg.From)
+	}
+	senderJID, _ := types.ParseJID(senderTarget)
+
+	ts := msg.Timestamp
+	if ts <= 0 {
+		ts = evTS
+	}
+	return types.MessageInfo{
+		ID:        types.MessageID(msg.ID),
+		Timestamp: time.Unix(ts, 0),
+		MessageSource: types.MessageSource{
+			Chat:     chatJID,
+			Sender:   senderJID,
+			IsFromMe: msg.IsFromMe,
+			IsGroup:  msg.IsGroup,
+		},
+	}
+}

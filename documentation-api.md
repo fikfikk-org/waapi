@@ -7,18 +7,19 @@
 
 | HTTP | code | Arti |
 |---|---|---|
-| 400 | invalid_request / invalid_number / invalid_spec | Payload, nomor, atau spesifikasi pesan outbox tidak valid |
+| 400 | invalid_request / invalid_number / invalid_spec | Payload, nomor, URL non-HTTPS/SSRF, atau spesifikasi pesan outbox tidak valid |
 | 401 | unauthorized | Key tidak ada, salah, atau dicabut |
 | 403 | forbidden_instance | Key tidak punya akses ke instance |
-| 404 | instance_not_found / message_not_found | Instance atau pesan outbox tidak ditemukan |
+| 404 | instance_not_found / message_not_found / event_not_found / upload_not_found | Instance, pesan outbox, event journal, atau descriptor upload tidak ditemukan |
 | 409 | instance_not_paired / message_not_cancellable | Instance belum di-pairing atau status pesan bukan `queued` saat pembatalan |
-| 410 | media_gone | Media referensi outbox sudah kedaluwarsa |
-| 413 | media_too_large | Media melebihi batas |
+| 410 | upload_expired / media_gone | Descriptor `upload_id` kedaluwarsa (>24 jam) atau media sudah tidak tersedia (termasuk setelah media resurrection) |
+| 413 | media_too_large | Media melebihi batas (16 MiB media, 64 MiB dokumen, 1 MiB sticker) |
+| 415 | unsupported_media / ptt_requires_ogg_opus / sticker_requires_webp | Format media tidak didukung (mis. GIF sebagai `image`), PTT wajib OGG Opus, sticker wajib WebP |
 | 422 | idempotency_key_reused | Header `Idempotency-Key` dipakai ulang untuk tujuan atau isi pesan berbeda |
 | 429 | queue_full | Antrian kirim penuh (ada `retry_after` & header `Retry-After`) |
 | 429 | sse_limit | Batas koneksi SSE konkuren tercapai (disertai header `Retry-After: 10`) |
 | 502 | send_failed | Pengiriman gagal permanen (`failed`/`expired`/`cancelled`) saat `wait=sent` |
-| 503 | not_ready | Daemon tidak siap (DB gagal atau tekanan memori level `Red`) |
+| 503 | not_ready / memory_pressure | Daemon tidak siap (DB gagal atau tekanan memori level `Red`; endpoint media menyertakan `Retry-After: 15`) |
 | 503 | instance_not_connected | Instance belum/tidak tersambung |
 | 504 | send_timeout | WhatsApp tidak merespons dalam batas tunggu (v2 menyertakan `details: { id, status_url }`) |
 
@@ -147,24 +148,24 @@
 | Field | Detail |
 |---|---|
 | Method + Endpoint | POST /v1/instances/{id}/messages/media |
-| Auth Required | Yes (X-API-Key) |
-| Headers | X-API-Key, Content-Type: multipart/form-data |
+| Auth Required | Yes (X-API-Key, scope `messages:send`) |
+| Headers | X-API-Key, Content-Type: multipart/form-data, Idempotency-Key (opsional) |
 | Query Params | - |
-| Request Body | to (wajib) · type (wajib: image/video/audio/document) · caption (opsional) · filename (opsional) · file (binary, wajib, harus part terakhir) |
-| Response | 200 message_id, to, timestamp · 413 · 429 · 503 |
-| Notes | Di-stream ke file sementara, RAM konstan; maks 16 MB / 64 MB dokumen |
+| Request Body | to (wajib) · type (wajib: image/video/audio/ptt/document/sticker) · caption (opsional) · filename (opsional) · file (binary, wajib, harus part terakhir setelah `to` & `type`) |
+| Response | 200 message_id, to, timestamp · 413 · 415 · 429 · 502 · 503 `memory_pressure` / `instance_not_connected` · 504 |
+| Notes | Mengunggah stream lewat pipeline satu-pass -> `UploadStore` -> `outbox.Enqueue` + `Wait(sent, 60s)` (fallback ke `EnqueueMedia` bila outbox tidak terpasang); deadline baca/tulis 10 menit |
 
 ## POST /v1/instances/{id}/messages/media-url
 
 | Field | Detail |
 |---|---|
 | Method + Endpoint | POST /v1/instances/{id}/messages/media-url |
-| Auth Required | Yes (X-API-Key) |
-| Headers | X-API-Key, Content-Type: application/json |
+| Auth Required | Yes (X-API-Key, scope `messages:send`) |
+| Headers | X-API-Key, Content-Type: application/json, Idempotency-Key (opsional) |
 | Query Params | - |
 | Request Body | to (wajib) · type (wajib) · url (wajib, https) · filename (opsional) · caption (opsional) |
-| Response | 200 message_id, to, timestamp · 400 · 413 |
-| Notes | Hanya https, IP privat diblokir (anti-SSRF), timeout unduh 60 detik |
+| Response | 200 message_id, to, timestamp · 400 · 413 · 502 · 503 `memory_pressure` · 504 |
+| Notes | Hanya https, IP privat/terlarang diblokir `netguard` secara permanen tanpa retry, timeout unduh 60 detik; dieksekusi via durable outbox + `Wait(60s)` |
 
 ## POST /v1/instances/{id}/contacts/check
 
@@ -183,12 +184,12 @@
 | Field | Detail |
 |---|---|
 | Method + Endpoint | POST /v1/instances/{id}/media/download |
-| Auth Required | Yes (X-API-Key) |
+| Auth Required | Yes (X-API-Key, scope `messages:read`) |
 | Headers | X-API-Key, Content-Type: application/json |
 | Query Params | - |
 | Request Body | Objek `media` dari payload webhook: direct_path, media_key, file_enc_sha256, file_sha256, file_length, media_type, mimetype |
-| Response | 200 stream biner dengan Content-Type asli |
-| Notes | Media tidak disimpan; diunduh on-demand lalu file sementara dihapus |
+| Response | 200 stream biner dengan `Content-Type`, `Content-Length`, `ETag`, dan `Content-Disposition` (dokumen) · 503 `memory_pressure` |
+| Notes | Media tidak disimpan; diunduh on-demand ke file temp anonim via `Pipeline.Download` tanpa resurrection lalu file langsung dihapus saat close |
 
 ## GET /v2/instances/{id}/events
 
@@ -214,17 +215,53 @@
 | Response | 200 `text/event-stream` (`id: <seq>`, `event: <type>`, `data: <envelope v2 JSON>`; heartbeat `: ping` tiap 25 detik) · 400 · 403 · 404 · 429 `sse_limit` · 503 |
 | Notes | Kuota koneksi SSE dibatasi `WAAPI_SSE_MAX` (header `Retry-After: 10` saat penuh); write deadline per frame 30 detik via `http.ResponseController` untuk memutus klien lambat tanpa mematikan stream idle |
 
+## POST /v2/instances/{id}/media
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/media |
+| Auth Required | Yes (X-API-Key, scope `media:write`) |
+| Headers | X-API-Key, Content-Type: multipart/form-data |
+| Query Params | `kind` (wajib: `image`, `video`, `audio`, `ptt`, `document`, `sticker`) · `filename` (opsional) · `mimetype` (opsional) · `seconds` (uint32, opsional) |
+| Request Body | Multipart part `file` (stream biner) |
+| Response | 201 `{ upload_id, kind, mimetype, size, sha256, width, height, seconds, expires_at }` · 400 · 413 · 415 · 503 `memory_pressure` |
+| Notes | Upload satu-pass (temp anonim + drop-behind per 4 MiB); `sha256` hex lowercase, `expires_at` Unix detik (+24 jam); deadline baca/tulis 10 menit |
+
+## GET /v2/instances/{id}/events/{seq}/media
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/events/{seq}/media |
+| Auth Required | Yes (X-API-Key, scope `messages:read`) |
+| Headers | X-API-Key |
+| Query Params | - |
+| Request Body | - |
+| Response | 200 stream biner (`Content-Type`, `Content-Length`, `ETag: "<hex>"`, `Content-Disposition` untuk dokumen) · 404 `event_not_found` · 410 `media_gone` · 503 `memory_pressure` |
+| Notes | Jika CDN merespons 404/410, otomatis menjalankan media resurrection (`SendMediaRetryReceipt` + tunggu `MediaRetry` maks 30s) lalu mengunduh ulang dengan `DirectPath` baru |
+
+## POST /v2/instances/{id}/media/download
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/media/download |
+| Auth Required | Yes (X-API-Key, scope `messages:read`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | Descriptor media v1 (`direct_path`, `media_key`, `file_enc_sha256`, `file_sha256`, `file_length`, `media_type`, `mimetype`, `filename?`) |
+| Response | 200 stream biner (`Content-Type`, `Content-Length`, `ETag`, `Content-Disposition` untuk dokumen) · 400 · 503 `memory_pressure` |
+| Notes | Alias v2 resmi untuk descriptor v1 tanpa media resurrection |
+
 ## POST /v2/instances/{id}/messages
 
 | Field | Detail |
 |---|---|
 | Method + Endpoint | POST /v2/instances/{id}/messages |
-| Auth Required | Yes (X-API-Key) |
+| Auth Required | Yes (X-API-Key, scope `messages:send`) |
 | Headers | X-API-Key, Content-Type: application/json, Idempotency-Key (opsional) |
 | Query Params | - |
-| Request Body | to (string, wajib) · type (string, saat ini `text`) · text (string, wajib untuk `text`) · reply_to (`{ id, sender? }`, opsional) · mentions (`[]string`, opsional) · typing (bool, opsional) · send_at (RFC3339, opsional) · priority (`normal` \| `urgent`, default `normal`) · ttl (Go duration, opsional) · wait (`none` \| `sent`, default `none`) |
-| Response | `wait=none`: 202 (baru) / 200 (idempoten hit) `{ id, wa_message_id, status, to, not_before, status_url }` · `wait=sent`: 200 objek detail pesan · 400 · 409 · 422 · 429 · 502 · 504 |
-| Notes | Seluruh timestamp JSON berformat Unix detik. Saat `wait=sent` (batas 30 detik), gagal mengembalikan `502 send_failed` dan timeout mengembalikan `504 send_timeout` berisi `details: { id, status_url }` |
+| Request Body | to (string, wajib) · type (`text` \| `image` \| `video` \| `audio` \| `document` \| `sticker`) · text (wajib untuk `text`) · media (`{ upload_id \| url, caption?, filename?, thumbnail?, ptt?, gif?, seconds? }`, wajib untuk 5 tipe media) · reply_to (`{ id, sender? }`, opsional) · mentions (`[]string`, opsional) · typing (bool, opsional) · send_at (RFC3339, opsional) · priority (`normal` \| `urgent`, default `normal`) · ttl (Go duration, opsional) · wait (`none` \| `sent`, default `none`) |
+| Response | `wait=none`: 202 (baru) / 200 (idempoten hit) `{ id, wa_message_id, status, to, not_before, status_url }` · `wait=sent`: 200 objek detail pesan · 400 · 404 `upload_not_found` · 409 · 410 `upload_expired` · 422 · 429 · 502 · 504 |
+| Notes | `upload_id` divalidasi langsung di handler HTTP dan diperiksa ulang saat eksekusi (`media_expired`); thumbnail base64 maks 16 KiB; voice note memakai `type: "audio"` + `media.ptt: true`; seluruh timestamp JSON bernilai Unix detik |
 
 ## GET /v2/instances/{id}/messages/{msg_id}
 
@@ -279,11 +316,11 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Tugas | Frekuensi | Tujuan | Efek samping |
 |---|---|---|---|
 | Migrasi `webhook_outbox` legacy | Sekali saat startup | Pindahkan backlog v1 ke `journal.db` | Kosongkan baris `webhook_outbox` (tabel tetap dipertahankan) |
-| Scheduler outbox per instance | Berbasis sinyal & timer `not_before` | Klaim dan kirim pesan teks dari tabel `outbox` sesuai token rate limit saat instance tersambung | Perbarui status `sending`/`sent`/`failed`/`expired`, `wa_message_id`, serta tulis event `outbox` ke `journal.db` |
+| Scheduler outbox per instance | Berbasis sinyal & timer `not_before` | Klaim dan kirim pesan (`text`, `image`, `video`, `audio`, `document`, `sticker`) dari tabel `outbox` serta unduh `media.url` saat eksekusi | Perbarui status `sending`/`sent`/`failed`/`expired`, `wa_message_id`, serta tulis event `outbox` ke `journal.db` |
 | Outbox lease recovery | Saat startup & tiap 60 detik | Kembalikan pekerjaan `sending` yang lease-nya kedaluwarsa (crash/kill) | Ubah status kembali ke `queued` dan bangunkan scheduler instance |
 | Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
-| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox` tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox` kadaluwarsa, & inkremen `dropped_undelivered_total` |
+| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox` serta `uploads` tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox` & descriptor `uploads` kedaluwarsa, serta inkremen `dropped_undelivered_total` |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
 

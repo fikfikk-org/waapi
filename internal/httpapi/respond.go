@@ -7,7 +7,11 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/jid"
+	"github.com/fikfikk-org/waapi/internal/journal"
+	"github.com/fikfikk-org/waapi/internal/media"
+	"github.com/fikfikk-org/waapi/internal/netguard"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/wa"
@@ -55,6 +59,20 @@ func writeMappedError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "instance_not_found", "instance tidak ditemukan", 0)
+	case errors.Is(err, journal.ErrNotFound):
+		writeError(w, http.StatusNotFound, "event_not_found", "event tidak ditemukan", 0)
+	case errors.Is(err, media.ErrUploadNotFound):
+		writeError(w, http.StatusNotFound, "upload_not_found", "upload_id tidak ditemukan", 0)
+	case errors.Is(err, media.ErrUploadExpired):
+		writeError(w, http.StatusGone, "upload_expired", "upload media sudah kedaluwarsa", 0)
+	case errors.Is(err, media.ErrMediaGone):
+		writeError(w, http.StatusGone, "media_gone", "media tidak lagi tersedia pada server maupun pengirim", 0)
+	case errors.Is(err, media.ErrPTTRequiresOggOpus):
+		writeError(w, http.StatusUnsupportedMediaType, "ptt_requires_ogg_opus", err.Error(), 0)
+	case errors.Is(err, media.ErrStickerRequiresWebP):
+		writeError(w, http.StatusUnsupportedMediaType, "sticker_requires_webp", err.Error(), 0)
+	case errors.Is(err, media.ErrUnsupportedMedia):
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media", err.Error(), 0)
 	case errors.Is(err, outbox.ErrNotFound):
 		writeError(w, http.StatusNotFound, "message_not_found", "pesan tidak ditemukan", 0)
 	case errors.Is(err, outbox.ErrNotPaired):
@@ -75,14 +93,23 @@ func writeMappedError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "instance_not_connected", "instance sedang tidak tersambung", 0)
 	case errors.Is(err, wa.ErrQueueFull):
 		writeError(w, http.StatusTooManyRequests, "queue_full", "antrian kirim penuh, coba lagi", 3)
-	case errors.Is(err, wa.ErrMediaTooLarge):
+	case errors.Is(err, wa.ErrMediaTooLarge), errors.Is(err, media.ErrMediaTooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, "media_too_large", err.Error(), 0)
 	case errors.Is(err, wa.ErrInvalidRecipient), errors.Is(err, jid.ErrInvalidRecipient):
 		writeError(w, http.StatusBadRequest, "invalid_number", err.Error(), 0)
-	case errors.Is(err, wa.ErrInvalidMediaType):
+	case errors.Is(err, wa.ErrInvalidMediaType), errors.Is(err, media.ErrInvalidKind),
+		errors.Is(err, netguard.ErrBlockedIP), errors.Is(err, netguard.ErrNonHTTPS), errors.Is(err, netguard.ErrTooManyRedirects):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), 0)
 	default:
 		writeError(w, http.StatusBadGateway, "send_failed", err.Error(), 0)
 	}
+}
+
+func (s *Server) rejectIfRed(w http.ResponseWriter) bool {
+	if s != nil && s.gov != nil && s.gov.Level() == governor.Red {
+		writeError(w, http.StatusServiceUnavailable, "memory_pressure", "daemon berada dalam tekanan memori level Red", 15)
+		return true
+	}
+	return false
 }
 

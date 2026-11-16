@@ -26,6 +26,7 @@ type v2SendMessageRequest struct {
 	ReplyTo  *outbox.ReplyRef `json:"reply_to"`
 	Mentions []string         `json:"mentions"`
 	Typing   bool             `json:"typing"`
+	Media    *outbox.MediaRef `json:"media"`
 	SendAt   string           `json:"send_at"`
 	Priority string           `json:"priority"`
 	TTL      string           `json:"ttl"`
@@ -117,16 +118,30 @@ func (s *Server) handleV2SendMessage(w http.ResponseWriter, r *http.Request, _ *
 	}
 
 	instID := r.PathValue("id")
+	msgType := strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Media != nil && strings.TrimSpace(req.Media.UploadID) != "" && s.uploadStore != nil && isCanonicalOutboxMediaType(msgType) {
+		rec, uErr := s.uploadStore.Get(r.Context(), instID, strings.TrimSpace(req.Media.UploadID), time.Now())
+		if uErr != nil {
+			writeMappedError(w, uErr)
+			return
+		}
+		if !wa.IsUploadKindCompatible(rec.Kind, msgType) {
+			writeError(w, http.StatusBadRequest, "invalid_spec", "jenis upload tidak sesuai dengan tipe pesan", 0)
+			return
+		}
+	}
+
 	job, created, err := s.outbox.Enqueue(r.Context(), outbox.EnqueueRequest{
 		InstanceID: instID,
 		IdemKey:    strings.TrimSpace(r.Header.Get("Idempotency-Key")),
 		Spec: outbox.Spec{
-			Type:     strings.TrimSpace(req.Type),
+			Type:     msgType,
 			To:       req.To,
 			Text:     req.Text,
 			ReplyTo:  req.ReplyTo,
 			Mentions: req.Mentions,
 			Typing:   req.Typing,
+			Media:    req.Media,
 		},
 		SendAt:   sendAt,
 		Priority: priority,
@@ -283,4 +298,13 @@ func outboxOriginFromContext(ctx context.Context, kind string) outbox.Origin {
 		keyID = km.ID
 	}
 	return outbox.Origin{Kind: kind, KeyID: keyID}
+}
+
+func isCanonicalOutboxMediaType(t string) bool {
+	switch t {
+	case "image", "video", "audio", "document", "sticker":
+		return true
+	default:
+		return false
+	}
 }
