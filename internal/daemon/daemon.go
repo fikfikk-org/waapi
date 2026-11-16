@@ -187,6 +187,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	wh.SetTargetCache(tc)
 
 	uploadStore := media.NewUploadStore(j.DB())
+	pollStore := wa.NewPollStore(j.DB())
 	mediaPipe := media.NewPipeline(media.Limits{
 		MediaMaxBytes:    cfg.MediaMaxBytes,
 		DocumentMaxBytes: cfg.DocumentMaxBytes,
@@ -200,6 +201,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		wa.WithTargetCache(tc),
 		wa.WithWebhookService(whSvc),
 		wa.WithMedia(mediaPipe, uploadStore, retryWaiter),
+		wa.WithPolls(pollStore),
 	)
 	if err != nil {
 		whSvc.Stop()
@@ -263,7 +265,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithGovernor(governor.AlwaysGreen), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,

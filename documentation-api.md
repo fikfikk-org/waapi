@@ -259,9 +259,9 @@
 | Auth Required | Yes (X-API-Key, scope `messages:send`) |
 | Headers | X-API-Key, Content-Type: application/json, Idempotency-Key (opsional) |
 | Query Params | - |
-| Request Body | to (string, wajib) · type (`text` \| `image` \| `video` \| `audio` \| `document` \| `sticker`) · text (wajib untuk `text`) · media (`{ upload_id \| url, caption?, filename?, thumbnail?, ptt?, gif?, seconds? }`, wajib untuk 5 tipe media) · reply_to (`{ id, sender? }`, opsional) · mentions (`[]string`, opsional) · typing (bool, opsional) · send_at (RFC3339, opsional) · priority (`normal` \| `urgent`, default `normal`) · ttl (Go duration, opsional) · wait (`none` \| `sent`, default `none`) |
+| Request Body | to (string, wajib) · type (`text` \| `image` \| `video` \| `audio` \| `document` \| `sticker` \| `location` \| `contact` \| `poll` \| `reaction` \| `edit` \| `revoke`) · text (1–60.000 byte untuk `text`) · media (`{ upload_id \| url, ... }`) · location (`{ lat, lng, name?, address? }`) · contacts (`[{ name, phones?, vcard? }]`, 1–10 kontak) · poll (`{ name, options, selectable }`, 2–12 opsi unik) · reaction (`{ message_id, sender?, emoji }`) · edit (`{ message_id, text }`) · revoke (`{ message_id, sender? }`) · reply_to (`{ id, sender? }`, opsional) · mentions (`[]string`, opsional) · typing (bool, opsional) · send_at (RFC3339, opsional) · priority (`normal` \| `urgent`, default `normal`) · ttl (Go duration, opsional) · wait (`none` \| `sent`, default `none`) |
 | Response | `wait=none`: 202 (baru) / 200 (idempoten hit) `{ id, wa_message_id, status, to, not_before, status_url }` · `wait=sent`: 200 objek detail pesan · 400 · 404 `upload_not_found` · 409 · 410 `upload_expired` · 422 · 429 · 502 · 504 |
-| Notes | `upload_id` divalidasi langsung di handler HTTP dan diperiksa ulang saat eksekusi (`media_expired`); thumbnail base64 maks 16 KiB; voice note memakai `type: "audio"` + `media.ptt: true`; seluruh timestamp JSON bernilai Unix detik |
+| Notes | `upload_id` divalidasi langsung di handler HTTP dan diperiksa ulang saat eksekusi (`media_expired`); thumbnail base64 maks 16 KiB; voice note memakai `type: "audio"` + `media.ptt: true`; panjang teks `1–60.000 byte` divalidasi saat enqueue; seluruh timestamp JSON bernilai Unix detik |
 
 ## GET /v2/instances/{id}/messages/{msg_id}
 
@@ -287,6 +287,66 @@
 | Response | 200 detail pesan berstatus `cancelled` · 404 `message_not_found` · 409 `message_not_cancellable` · 503 |
 | Notes | Hanya dapat membatalkan pesan outbox yang masih berstatus `queued` |
 
+## POST /v2/instances/{id}/chats/{jid}/read
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/chats/{jid}/read |
+| Auth Required | Yes (X-API-Key, scope `messages:send`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | message_ids (`[]string`, 1–50 ID, wajib) · sender (string, opsional untuk pesan grup) · played (bool, opsional, untuk `ReceiptTypePlayed`) |
+| Response | 204 No Content · 400 `invalid_request` · 503 `instance_not_connected` |
+| Notes | Memanggil `cli.MarkRead` dengan `time.Now()` serta `types.ReceiptTypePlayed` bila `played: true` |
+
+## POST /v2/instances/{id}/presence
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/presence |
+| Auth Required | Yes (X-API-Key, scope `messages:send`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | state (`available` \| `unavailable`, wajib) |
+| Response | 204 No Content · 400 `invalid_request` · 503 `instance_not_connected` |
+| Notes | Diperlukan `available` agar server WhatsApp mengirim update presence lawan bicara |
+
+## POST /v2/instances/{id}/chats/{jid}/presence
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/chats/{jid}/presence |
+| Auth Required | Yes (X-API-Key, scope `messages:send`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | state (`composing` \| `recording` \| `paused`, wajib) |
+| Response | 204 No Content · 400 `invalid_request` · 503 `instance_not_connected` |
+| Notes | `recording` memetakan ke `ChatPresenceComposing` dengan media audio |
+
+## POST /v2/instances/{id}/presence/subscribe
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/presence/subscribe |
+| Auth Required | Yes (X-API-Key, scope `messages:read`) |
+| Headers | X-API-Key, Content-Type: application/json |
+| Query Params | - |
+| Request Body | jid (string nomor atau JID target, wajib) |
+| Response | 204 No Content · 400 `invalid_request` (termasuk jika melebihi batas 100 JID) · 503 `instance_not_connected` |
+| Notes | Target disimpan di RAM (maks 100 JID unik/instance) dan otomatis di-subscribe ulang saat supervisor `online` |
+
+## GET /v2/instances/{id}/polls/{wa_id}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/polls/{wa_id} |
+| Auth Required | Yes (X-API-Key, scope `messages:read`) |
+| Headers | X-API-Key |
+| Query Params | `chat` (string JID/nomor chat, **wajib**) |
+| Request Body | - |
+| Response | 200 `{ poll_id, chat, name, selectable, options: [{ name, votes, voters }], total_voters }` · 400 `invalid_request` · 404 `message_not_found` |
+| Notes | Daftar `voters` dibatasi maks 100 per opsi; pemilih yang mencabut pilihan (`selected: []`) tidak dihitung di `total_voters` |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -294,7 +354,7 @@
 | Method + Endpoint | POST ke `webhook_url` instance (`User-Agent: waapi-webhook/2.0`) |
 | Headers | Mode `waapi`: `X-WA-Event`, `X-WA-Instance`, `X-WA-Timestamp`, `X-WA-Event-Id`, `X-WA-Delivery-Attempt`, `X-WA-Signature` (`sha256=` HMAC `timestamp.body`). Mode `standard`: `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>` Standard Webhooks) |
 | Body | Envelope v2 (`v: 2`, `id`, `event`, `instance`, `timestamp`, `data`) dibaca bertahap dari `journal.db` |
-| Event | message, receipt, undecryptable, connection, pairing, outbox (dan `test` untuk `waapi webhook test`). Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik) |
+| Event | message, receipt, undecryptable, connection, pairing, outbox, poll_vote, presence, chat_presence (dan `test` untuk `waapi webhook test`). Payload `outbox`: `{ id, wa_message_id, to, type, status, attempts, timestamp, error? }` (`status`: `sent\|failed\|expired`, `timestamp` Unix detik). Payload `poll_vote`: `{ poll_id, chat, voter, voter_pn?, selected, selected_hashes, poll_known, timestamp }`. Payload `presence`: `{ from, from_pn?, unavailable, last_seen? }`. Payload `chat_presence`: `{ chat, sender, state, media? }` |
 | Notes | Pengiriman berurutan per `lane = part % webhook_lanes` (default 4 lane). Jadwal retry `0, 5s, 15s, 45s, 2m, 5m, 15m, 30m, 1h...` (±20% jitter) hingga `webhook_max_attempts` (default 12), menghormati `Retry-After` (maks 1h); `410 Gone` mem-pause target (`gone`); `4xx` lainnya maks 3 percobaan lalu dipindah ke `webhook_dead` (DLQ). Target dibaca dari `TargetCache` memori |
 
 ## Control Plane (CLI only, Unix socket)
@@ -316,7 +376,8 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Tugas | Frekuensi | Tujuan | Efek samping |
 |---|---|---|---|
 | Migrasi `webhook_outbox` legacy | Sekali saat startup | Pindahkan backlog v1 ke `journal.db` | Kosongkan baris `webhook_outbox` (tabel tetap dipertahankan) |
-| Scheduler outbox per instance | Berbasis sinyal & timer `not_before` | Klaim dan kirim pesan (`text`, `image`, `video`, `audio`, `document`, `sticker`) dari tabel `outbox` serta unduh `media.url` saat eksekusi | Perbarui status `sending`/`sent`/`failed`/`expired`, `wa_message_id`, serta tulis event `outbox` ke `journal.db` |
+| Scheduler outbox per instance | Berbasis sinyal & timer `not_before` | Klaim dan kirim semua tipe pesan v2 (`text`, media, `location`, `contact`, `poll`, `reaction`, `edit`, `revoke`) serta unduh `media.url` | Simpan `polls` keluar sebelum `SendMessage`, perbarui status outbox, dan tulis event `outbox` ke `journal.db` |
+| Re-subscribe presence | Saat supervisor instance masuk state `online` | Berlangganan ulang hingga 100 JID presence yang terdaftar di RAM instance | Memanggil `cli.SubscribePresence` per JID agar pembaruan status tetap mengalir pasca-reconnect |
 | Outbox lease recovery | Saat startup & tiap 60 detik | Kembalikan pekerjaan `sending` yang lease-nya kedaluwarsa (crash/kill) | Ubah status kembali ke `queued` dan bangunkan scheduler instance |
 | Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |

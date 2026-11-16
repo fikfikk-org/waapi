@@ -23,6 +23,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/store"
 	"github.com/fikfikk-org/waapi/internal/webhook"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"golang.org/x/sync/semaphore"
 )
@@ -73,6 +74,13 @@ func WithMedia(pipe *media.Pipeline, uploads *media.UploadStore, waiter *media.R
 	}
 }
 
+// WithPolls memasang PollStore untuk menyimpan polling masuk/keluar serta suara terdekripsi ke journal.db.
+func WithPolls(ps *PollStore) ManagerOption {
+	return func(m *Manager) {
+		m.pollStore = ps
+	}
+}
+
 // Manager mengelola siklus hidup seluruh instance WhatsApp di dalam satu proses daemon.
 type Manager struct {
 	cfg         *config.Config
@@ -89,6 +97,7 @@ type Manager struct {
 	mediaOnce   sync.Once
 	uploadStore *media.UploadStore
 	retryWaiter *media.RetryWaiter
+	pollStore   *PollStore
 	mediaHTTP   *http.Client
 	waLog       waLog.Logger
 	pairingSem  *semaphore.Weighted
@@ -521,6 +530,65 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 		m.webhookSvc.OnTargetChanged(id)
 	}
 	return m.store.DeleteInstance(ctx, id)
+}
+
+// PollStore mengembalikan PollStore yang terpasang pada Manager.
+func (m *Manager) PollStore() *PollStore {
+	if m == nil {
+		return nil
+	}
+	return m.pollStore
+}
+
+// MarkRead menandai satu atau lebih pesan chat telah dibaca atau diputar (played).
+func (m *Manager) MarkRead(ctx context.Context, instanceID string, chat, sender types.JID, ids []types.MessageID, played bool) error {
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return store.ErrNotFound
+	}
+	cli := inst.getClient()
+	if cli == nil || !cli.IsConnected() {
+		return ErrNotConnected
+	}
+	if played {
+		return cli.MarkRead(ctx, ids, time.Now(), chat, sender, types.ReceiptTypePlayed)
+	}
+	return cli.MarkRead(ctx, ids, time.Now(), chat, sender)
+}
+
+// SendPresence memperbarui status online/offline instance pada server WhatsApp.
+func (m *Manager) SendPresence(ctx context.Context, instanceID string, state types.Presence) error {
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return store.ErrNotFound
+	}
+	cli := inst.getClient()
+	if cli == nil || !cli.IsConnected() {
+		return ErrNotConnected
+	}
+	return cli.SendPresence(ctx, state)
+}
+
+// SendChatPresence mengirim indikator mengetik atau merekam suara ke sebuah chat.
+func (m *Manager) SendChatPresence(ctx context.Context, instanceID string, chat types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error {
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return store.ErrNotFound
+	}
+	cli := inst.getClient()
+	if cli == nil || !cli.IsConnected() {
+		return ErrNotConnected
+	}
+	return cli.SendChatPresence(ctx, chat, state, media)
+}
+
+// SubscribePresence mendaftarkan pemantauan status online/offline untuk JID tertentu (maks 100 JID per instance).
+func (m *Manager) SubscribePresence(ctx context.Context, instanceID string, target types.JID) error {
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return store.ErrNotFound
+	}
+	return inst.SubscribePresence(ctx, target)
 }
 
 // CountByStatus menghitung jumlah instance per status untuk laporan doctor.

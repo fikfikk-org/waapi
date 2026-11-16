@@ -73,7 +73,7 @@ func writeMappedError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnsupportedMediaType, "sticker_requires_webp", err.Error(), 0)
 	case errors.Is(err, media.ErrUnsupportedMedia):
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media", err.Error(), 0)
-	case errors.Is(err, outbox.ErrNotFound):
+	case errors.Is(err, outbox.ErrNotFound), errors.Is(err, wa.ErrPollNotFound):
 		writeError(w, http.StatusNotFound, "message_not_found", "pesan tidak ditemukan", 0)
 	case errors.Is(err, outbox.ErrNotPaired):
 		writeError(w, http.StatusConflict, "instance_not_paired", "instance belum di-pairing", 0)
@@ -97,7 +97,7 @@ func writeMappedError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusRequestEntityTooLarge, "media_too_large", err.Error(), 0)
 	case errors.Is(err, wa.ErrInvalidRecipient), errors.Is(err, jid.ErrInvalidRecipient):
 		writeError(w, http.StatusBadRequest, "invalid_number", err.Error(), 0)
-	case errors.Is(err, wa.ErrInvalidMediaType), errors.Is(err, media.ErrInvalidKind),
+	case errors.Is(err, wa.ErrInvalidMediaType), errors.Is(err, media.ErrInvalidKind), errors.Is(err, wa.ErrPresenceSubLimit),
 		errors.Is(err, netguard.ErrBlockedIP), errors.Is(err, netguard.ErrNonHTTPS), errors.Is(err, netguard.ErrTooManyRedirects):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), 0)
 	default:

@@ -27,6 +27,12 @@ type v2SendMessageRequest struct {
 	Mentions []string         `json:"mentions"`
 	Typing   bool             `json:"typing"`
 	Media    *outbox.MediaRef `json:"media"`
+	Location *outbox.Location `json:"location"`
+	Contacts []outbox.Contact `json:"contacts"`
+	Poll     *outbox.PollSpec `json:"poll"`
+	Reaction *outbox.Reaction `json:"reaction"`
+	Edit     *outbox.Edit     `json:"edit"`
+	Revoke   *outbox.Revoke   `json:"revoke"`
 	SendAt   string           `json:"send_at"`
 	Priority string           `json:"priority"`
 	TTL      string           `json:"ttl"`
@@ -142,6 +148,12 @@ func (s *Server) handleV2SendMessage(w http.ResponseWriter, r *http.Request, _ *
 			Mentions: req.Mentions,
 			Typing:   req.Typing,
 			Media:    req.Media,
+			Location: req.Location,
+			Contacts: req.Contacts,
+			Poll:     req.Poll,
+			Reaction: req.Reaction,
+			Edit:     req.Edit,
+			Revoke:   req.Revoke,
 		},
 		SendAt:   sendAt,
 		Priority: priority,

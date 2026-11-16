@@ -24,7 +24,7 @@ type MessageV2 struct {
 	Reaction       *ReactionInfo    `json:"reaction,omitempty"`
 	Edit           *EditInfo        `json:"edit,omitempty"`
 	Revoke         *RevokeInfo      `json:"revoke,omitempty"`
-	Quoted         *QuotedInfo      `json:"quoted,omitempty"`
+	Quoted         *QuotedPayload   `json:"quoted,omitempty"`
 	Mentions       []string         `json:"mentions,omitempty"`
 	Flags          MsgFlags         `json:"flags,omitempty"`
 }
@@ -70,8 +70,8 @@ type RevokeInfo struct {
 	TargetID string `json:"target_id"`
 }
 
-// QuotedInfo menyimpan ringkasan pesan yang dikutip (reply).
-type QuotedInfo struct {
+// QuotedPayload menyimpan ringkasan pesan yang dikutip (reply) di payload journal.
+type QuotedPayload struct {
 	ID          string `json:"id"`
 	Participant string `json:"participant,omitempty"`
 	Type        string `json:"type"`
@@ -108,4 +108,20 @@ type UndecryptableV2 struct {
 	Timestamp       int64  `json:"timestamp"`
 	IsUnavailable   bool   `json:"is_unavailable,omitempty"`
 	DecryptFailMode string `json:"decrypt_fail_mode,omitempty"`
+}
+
+// PresenceV2 adalah representasi event status online/terakhir-dilihat pengguna di journal v2.
+type PresenceV2 struct {
+	From        string `json:"from"`
+	FromPN      string `json:"from_pn,omitempty"`
+	Unavailable bool   `json:"unavailable"`
+	LastSeen    int64  `json:"last_seen,omitempty"`
+}
+
+// ChatPresenceV2 adalah representasi event status mengetik/merekam di suatu chat pada journal v2.
+type ChatPresenceV2 struct {
+	Chat   string `json:"chat"`
+	Sender string `json:"sender"`
+	State  string `json:"state"`
+	Media  string `json:"media,omitempty"`
 }

@@ -4,11 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -73,7 +72,7 @@ func generateOfflineMessageID(ownUser string) string {
 	return whatsmeow.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(sum[:9]))
 }
 
-// Execute mengeksekusi pengiriman satu job outbox (text maupun media) ke WhatsApp memakai WAID deterministik.
+// Execute mengeksekusi pengiriman satu job outbox ke WhatsApp memakai WAID deterministik.
 func (m *Manager) Execute(ctx context.Context, job *outbox.Job) (outbox.ExecResult, error) {
 	if m == nil || job == nil {
 		return outbox.ExecResult{}, toSendError(whatsmeow.ErrNotConnected)
@@ -87,44 +86,68 @@ func (m *Manager) Execute(ctx context.Context, job *outbox.Job) (outbox.ExecResu
 		return outbox.ExecResult{}, toSendError(whatsmeow.ErrNotConnected)
 	}
 
+	deps := &realComposeDeps{
+		mgr:        m,
+		inst:       inst,
+		cli:        cli,
+		instanceID: job.InstanceID,
+	}
+	return m.executeWithSender(ctx, job, deps, cli.SendMessage)
+}
+
+type sendMessageFn func(ctx context.Context, to types.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+
+func (m *Manager) executeWithSender(ctx context.Context, job *outbox.Job, deps ComposeDeps, sendFn sendMessageFn) (outbox.ExecResult, error) {
+	if m == nil || job == nil {
+		return outbox.ExecResult{}, toSendError(whatsmeow.ErrNotConnected)
+	}
 	toJID, err := jid.ParseRecipient(job.Spec.To)
 	if err != nil {
 		return outbox.ExecResult{}, toSendError(err)
 	}
 
-	var msg *waE2E.Message
-	switch job.Spec.Type {
-	case "text":
-		msg = composeTextMessage(job.Spec)
-	case "image", "video", "audio", "document", "sticker":
-		rec, mErr := m.resolveMediaRecord(ctx, cli, job)
-		if mErr != nil {
-			return outbox.ExecResult{}, mErr
+	msg, err := Compose(ctx, deps, job.Spec)
+	if err != nil {
+		return outbox.ExecResult{}, err
+	}
+
+	// Simpan definisi polling keluar ke journal.db SEBELUM SendMessage agar vote masuk selalu punya acuan opsi.
+	if strings.EqualFold(strings.TrimSpace(job.Spec.Type), "poll") && m.pollStore != nil && job.Spec.Poll != nil {
+		creator := ""
+		if own := deps.OwnJID(); !own.IsEmpty() {
+			creator = own.ToNonAD().String()
 		}
-		var cErr error
-		msg, cErr = composeMediaMessage(job.Spec, rec)
-		if cErr != nil {
-			return outbox.ExecResult{}, cErr
+		opts := make([]string, len(job.Spec.Poll.Options))
+		for idx, o := range job.Spec.Poll.Options {
+			opts[idx] = strings.TrimSpace(o)
 		}
-	default:
-		return outbox.ExecResult{}, &outbox.SendError{
-			Transient: false,
-			Code:      "invalid_spec",
-			Err:       outbox.ErrInvalidSpec,
+		if pErr := m.pollStore.SavePoll(ctx, Poll{
+			InstanceID: job.InstanceID,
+			Chat:       toJID.String(),
+			WAID:       job.WAID,
+			Creator:    creator,
+			Name:       strings.TrimSpace(job.Spec.Poll.Name),
+			Options:    opts,
+			Selectable: job.Spec.Poll.Selectable,
+			CreatedAt:  time.Now().Unix(),
+		}); pErr != nil {
+			return outbox.ExecResult{}, &outbox.SendError{Transient: true, Code: "send_failed", Err: pErr}
 		}
 	}
 
 	if job.Spec.Typing {
-		typingLen := len(job.Spec.Text)
-		if typingLen == 0 && job.Spec.Media != nil {
-			typingLen = len(job.Spec.Media.Caption)
-		}
-		if err := sendTypingCadence(ctx, cli, toJID, typingLen); err != nil {
-			return outbox.ExecResult{}, toSendError(err)
+		if rc, ok := deps.(*realComposeDeps); ok && rc.cli != nil {
+			typingLen := len(job.Spec.Text)
+			if typingLen == 0 && job.Spec.Media != nil {
+				typingLen = len(job.Spec.Media.Caption)
+			}
+			if err := sendTypingCadence(ctx, rc.cli, toJID, typingLen); err != nil {
+				return outbox.ExecResult{}, toSendError(err)
+			}
 		}
 	}
 
-	resp, err := cli.SendMessage(ctx, toJID, msg, whatsmeow.SendRequestExtra{
+	resp, err := sendFn(ctx, toJID, msg, whatsmeow.SendRequestExtra{
 		ID: types.MessageID(job.WAID),
 	})
 	if err != nil {
@@ -133,62 +156,133 @@ func (m *Manager) Execute(ctx context.Context, job *outbox.Job) (outbox.ExecResu
 	return outbox.ExecResult{ServerTS: resp.Timestamp}, nil
 }
 
-func (m *Manager) resolveMediaRecord(ctx context.Context, cli *whatsmeow.Client, job *outbox.Job) (media.UploadRecord, error) {
-	if job.Spec.Media == nil {
-		return media.UploadRecord{}, &outbox.SendError{Transient: false, Code: "invalid_spec", Err: outbox.ErrInvalidSpec}
+type realComposeDeps struct {
+	mgr        *Manager
+	inst       *Instance
+	cli        *whatsmeow.Client
+	instanceID string
+}
+
+func (d *realComposeDeps) BuildPollCreation(name string, optionNames []string, selectableOptionCount int) *waE2E.Message {
+	return d.cli.BuildPollCreation(name, optionNames, selectableOptionCount)
+}
+
+func (d *realComposeDeps) BuildReaction(chat, sender types.JID, id types.MessageID, reaction string) *waE2E.Message {
+	return d.cli.BuildReaction(chat, sender, id, reaction)
+}
+
+func (d *realComposeDeps) BuildEdit(chat types.JID, id types.MessageID, newContent *waE2E.Message) *waE2E.Message {
+	return d.cli.BuildEdit(chat, id, newContent)
+}
+
+func (d *realComposeDeps) BuildRevoke(chat, sender types.JID, id types.MessageID) *waE2E.Message {
+	return d.cli.BuildRevoke(chat, sender, id)
+}
+
+func (d *realComposeDeps) OwnJID() types.JID {
+	if d.cli != nil && d.cli.Store != nil && d.cli.Store.ID != nil {
+		return d.cli.Store.ID.ToNonAD()
 	}
-	ref := job.Spec.Media
-	if ref.UploadID != "" {
-		if m.uploadStore == nil {
-			return media.UploadRecord{}, &outbox.SendError{Transient: false, Code: "media_expired", Err: outbox.ErrMediaExpired}
+	if d.inst != nil {
+		if raw := strings.TrimSpace(d.inst.getJID()); raw != "" {
+			if parsed, err := types.ParseJID(raw); err == nil {
+				return parsed.ToNonAD()
+			}
 		}
-		rec, err := m.uploadStore.Get(ctx, job.InstanceID, ref.UploadID, time.Now())
+	}
+	return types.EmptyJID
+}
+
+func (d *realComposeDeps) Media(ctx context.Context, ref outbox.MediaRef, kind string) (media.Uploaded, error) {
+	if ref.UploadID != "" {
+		if d.mgr.uploadStore == nil {
+			return media.Uploaded{}, &outbox.SendError{Transient: false, Code: "media_expired", Err: outbox.ErrMediaExpired}
+		}
+		rec, err := d.mgr.uploadStore.Get(ctx, d.instanceID, ref.UploadID, time.Now())
 		if err != nil {
 			if errors.Is(err, media.ErrUploadExpired) || errors.Is(err, media.ErrUploadNotFound) {
-				return media.UploadRecord{}, &outbox.SendError{Transient: false, Code: "media_expired", Err: outbox.ErrMediaExpired}
+				return media.Uploaded{}, &outbox.SendError{Transient: false, Code: "media_expired", Err: outbox.ErrMediaExpired}
 			}
-			return media.UploadRecord{}, &outbox.SendError{Transient: true, Code: "send_failed", Err: err}
+			return media.Uploaded{}, &outbox.SendError{Transient: true, Code: "send_failed", Err: err}
 		}
-		if !IsUploadKindCompatible(rec.Kind, job.Spec.Type) {
-			return media.UploadRecord{}, &outbox.SendError{Transient: false, Code: "invalid_spec", Err: outbox.ErrInvalidSpec}
+		if !IsUploadKindCompatible(rec.Kind, canonicalKindForMessageType(kind)) {
+			return media.Uploaded{}, &outbox.SendError{Transient: false, Code: "invalid_spec", Err: outbox.ErrInvalidSpec}
 		}
-		return *rec, nil
+		return media.Uploaded{
+			Resp: rec.Resp,
+			Meta: media.Meta{
+				Mimetype: rec.Mimetype,
+				Size:     rec.Size,
+				Width:    rec.Width,
+				Height:   rec.Height,
+				Seconds:  rec.Seconds,
+				PTT:      rec.PTT,
+				Filename: rec.Filename,
+			},
+		}, nil
 	}
 
-	// Unduh dari media.url saat eksekusi lalu alirkan langsung ke pipeline upload satu-pass.
 	fetchCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
-	stream, err := fetchSafeMediaStream(fetchCtx, m.mediaHTTPClient(), ref.URL)
+	stream, err := fetchSafeMediaStream(fetchCtx, d.mgr.mediaHTTPClient(), ref.URL)
 	if err != nil {
-		return media.UploadRecord{}, classifyMediaFetchError(err)
+		return media.Uploaded{}, classifyMediaFetchError(err)
 	}
 	defer stream.Close()
 
-	kind := media.Kind(job.Spec.Type)
-	if job.Spec.Type == "audio" && ref.PTT {
-		kind = media.KindPTT
+	k := media.Kind(kind)
+	if k == "audio" && ref.PTT {
+		k = media.KindPTT
 	}
-	uploaded, err := m.ensureMediaPipeline().Upload(fetchCtx, cli, stream, kind, media.Hint{
+	uploaded, err := d.mgr.ensureMediaPipeline().Upload(fetchCtx, d.cli, stream, k, media.Hint{
 		Filename: ref.Filename,
 		Seconds:  ref.Seconds,
 	})
 	if err != nil {
-		return media.UploadRecord{}, classifyMediaUploadError(err)
+		return media.Uploaded{}, classifyMediaUploadError(err)
+	}
+	return uploaded, nil
+}
+
+func (d *realComposeDeps) Quoted(ctx context.Context, chat, waID string) (QuotedInfo, bool) {
+	if d.mgr == nil || d.mgr.journal == nil || waID == "" {
+		return QuotedInfo{}, false
+	}
+	ev, err := d.mgr.journal.FindByWAID(ctx, d.instanceID, chat, waID)
+	if err != nil || ev == nil {
+		return QuotedInfo{}, false
 	}
 
-	return media.UploadRecord{
-		InstanceID: job.InstanceID,
-		Kind:       kind,
-		Mimetype:   uploaded.Meta.Mimetype,
-		Size:       uploaded.Meta.Size,
-		Resp:       uploaded.Resp,
-		Width:      uploaded.Meta.Width,
-		Height:     uploaded.Meta.Height,
-		Seconds:    uploaded.Meta.Seconds,
-		PTT:        uploaded.Meta.PTT,
-		Filename:   uploaded.Meta.Filename,
-	}, nil
+	var msg MessageV2
+	if err := json.Unmarshal(ev.Payload, &msg); err != nil {
+		return QuotedInfo{}, false
+	}
+
+	sender := ev.Sender
+	if msg.IsFromMe {
+		if own := d.OwnJID(); !own.IsEmpty() {
+			sender = own.String()
+		}
+	} else if sender == "" {
+		sender = msg.From
+	}
+
+	var quotedMsg *waE2E.Message
+	if msg.Text != "" {
+		quotedMsg = &waE2E.Message{Conversation: proto.String(msg.Text)}
+	}
+	return QuotedInfo{
+		Sender:  sender,
+		Message: quotedMsg,
+	}, true
+}
+
+func canonicalKindForMessageType(kind string) string {
+	if kind == string(media.KindPTT) {
+		return "audio"
+	}
+	return kind
 }
 
 // IsUploadKindCompatible memeriksa kecocokan kind descriptor upload terhadap type pesan outbox.
@@ -234,11 +328,11 @@ func classifyMediaUploadError(err error) error {
 	}
 }
 
-func buildContextInfo(spec outbox.Spec) *waE2E.ContextInfo {
+func composeTextMessage(spec outbox.Spec) *waE2E.Message {
 	hasReply := spec.ReplyTo != nil && strings.TrimSpace(spec.ReplyTo.ID) != ""
 	hasMentions := len(spec.Mentions) > 0
 	if !hasReply && !hasMentions {
-		return nil
+		return &waE2E.Message{Conversation: proto.String(spec.Text)}
 	}
 	ci := &waE2E.ContextInfo{}
 	if hasReply {
@@ -250,16 +344,6 @@ func buildContextInfo(spec outbox.Spec) *waE2E.ContextInfo {
 	if hasMentions {
 		ci.MentionedJID = spec.Mentions
 	}
-	return ci
-}
-
-func composeTextMessage(spec outbox.Spec) *waE2E.Message {
-	ci := buildContextInfo(spec)
-	if ci == nil {
-		return &waE2E.Message{
-			Conversation: proto.String(spec.Text),
-		}
-	}
 	return &waE2E.Message{
 		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
 			Text:        proto.String(spec.Text),
@@ -269,137 +353,22 @@ func composeTextMessage(spec outbox.Spec) *waE2E.Message {
 }
 
 func composeMediaMessage(spec outbox.Spec, rec media.UploadRecord) (*waE2E.Message, error) {
-	ci := buildContextInfo(spec)
-	var mSpec outbox.MediaRef
-	if spec.Media != nil {
-		mSpec = *spec.Media
+	var ci *waE2E.ContextInfo
+	hasReply := spec.ReplyTo != nil && strings.TrimSpace(spec.ReplyTo.ID) != ""
+	hasMentions := len(spec.Mentions) > 0
+	if hasReply || hasMentions {
+		ci = &waE2E.ContextInfo{}
+		if hasReply {
+			ci.StanzaID = proto.String(spec.ReplyTo.ID)
+			if spec.ReplyTo.Sender != "" {
+				ci.Participant = proto.String(spec.ReplyTo.Sender)
+			}
+		}
+		if hasMentions {
+			ci.MentionedJID = spec.Mentions
+		}
 	}
-
-	var thumb []byte
-	if mSpec.Thumbnail != "" {
-		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(mSpec.Thumbnail))
-		if err != nil {
-			return nil, &outbox.SendError{Transient: false, Code: "invalid_spec", Err: fmt.Errorf("thumbnail base64 tidak valid: %w", err)}
-		}
-		if len(raw) > 16<<10 {
-			return nil, &outbox.SendError{Transient: false, Code: "invalid_spec", Err: errors.New("ukuran thumbnail melebihi batas 16 KiB")}
-		}
-		thumb = raw
-	}
-
-	fileLen := rec.Resp.FileLength
-	if fileLen == 0 && rec.Size > 0 {
-		fileLen = uint64(rec.Size)
-	}
-
-	switch strings.ToLower(strings.TrimSpace(spec.Type)) {
-	case "image":
-		return &waE2E.Message{
-			ImageMessage: &waE2E.ImageMessage{
-				URL:           proto.String(rec.Resp.URL),
-				DirectPath:    proto.String(rec.Resp.DirectPath),
-				MediaKey:      rec.Resp.MediaKey,
-				Mimetype:      proto.String(rec.Mimetype),
-				FileEncSHA256: rec.Resp.FileEncSHA256,
-				FileSHA256:    rec.Resp.FileSHA256,
-				FileLength:    proto.Uint64(fileLen),
-				Width:         optUint32(rec.Width),
-				Height:        optUint32(rec.Height),
-				Caption:       optString(mSpec.Caption),
-				JPEGThumbnail: thumb,
-				ContextInfo:   ci,
-			},
-		}, nil
-
-	case "video":
-		secs := mSpec.Seconds
-		if secs == 0 {
-			secs = rec.Seconds
-		}
-		return &waE2E.Message{
-			VideoMessage: &waE2E.VideoMessage{
-				URL:              proto.String(rec.Resp.URL),
-				DirectPath:       proto.String(rec.Resp.DirectPath),
-				MediaKey:         rec.Resp.MediaKey,
-				Mimetype:         proto.String(rec.Mimetype),
-				FileEncSHA256:    rec.Resp.FileEncSHA256,
-				FileSHA256:       rec.Resp.FileSHA256,
-				FileLength:       proto.Uint64(fileLen),
-				Seconds:          optUint32(secs),
-				GifPlayback:      optBool(mSpec.GIF),
-				StreamingSidecar: rec.Resp.StreamingSidecar,
-				Width:            optUint32(rec.Width),
-				Height:           optUint32(rec.Height),
-				Caption:          optString(mSpec.Caption),
-				JPEGThumbnail:    thumb,
-				ContextInfo:      ci,
-			},
-		}, nil
-
-	case "audio":
-		secs := mSpec.Seconds
-		if secs == 0 {
-			secs = rec.Seconds
-		}
-		ptt := mSpec.PTT || rec.PTT
-		return &waE2E.Message{
-			AudioMessage: &waE2E.AudioMessage{
-				URL:           proto.String(rec.Resp.URL),
-				DirectPath:    proto.String(rec.Resp.DirectPath),
-				MediaKey:      rec.Resp.MediaKey,
-				Mimetype:      proto.String(rec.Mimetype),
-				FileEncSHA256: rec.Resp.FileEncSHA256,
-				FileSHA256:    rec.Resp.FileSHA256,
-				FileLength:    proto.Uint64(fileLen),
-				Seconds:       optUint32(secs),
-				PTT:           optBool(ptt),
-				ContextInfo:   ci,
-			},
-		}, nil
-
-	case "document":
-		name := media.SanitizeFilename(mSpec.Filename)
-		if name == "" {
-			name = media.SanitizeFilename(rec.Filename)
-		}
-		if name == "" {
-			name = "attachment"
-		}
-		return &waE2E.Message{
-			DocumentMessage: &waE2E.DocumentMessage{
-				URL:           proto.String(rec.Resp.URL),
-				DirectPath:    proto.String(rec.Resp.DirectPath),
-				MediaKey:      rec.Resp.MediaKey,
-				Mimetype:      proto.String(rec.Mimetype),
-				FileEncSHA256: rec.Resp.FileEncSHA256,
-				FileSHA256:    rec.Resp.FileSHA256,
-				FileLength:    proto.Uint64(fileLen),
-				FileName:      proto.String(name),
-				Title:         proto.String(name),
-				Caption:       optString(mSpec.Caption),
-				ContextInfo:   ci,
-			},
-		}, nil
-
-	case "sticker":
-		return &waE2E.Message{
-			StickerMessage: &waE2E.StickerMessage{
-				URL:           proto.String(rec.Resp.URL),
-				DirectPath:    proto.String(rec.Resp.DirectPath),
-				MediaKey:      rec.Resp.MediaKey,
-				Mimetype:      proto.String("image/webp"),
-				FileEncSHA256: rec.Resp.FileEncSHA256,
-				FileSHA256:    rec.Resp.FileSHA256,
-				FileLength:    proto.Uint64(fileLen),
-				Width:         optUint32(rec.Width),
-				Height:        optUint32(rec.Height),
-				ContextInfo:   ci,
-			},
-		}, nil
-
-	default:
-		return nil, &outbox.SendError{Transient: false, Code: "invalid_spec", Err: outbox.ErrInvalidSpec}
-	}
+	return buildMediaE2EFromRecord(spec, rec, ci)
 }
 
 func optString(s string) *string {

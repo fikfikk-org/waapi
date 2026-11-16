@@ -17,6 +17,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/wa"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type ctxKey int
@@ -98,6 +99,23 @@ func withMediaDriver(drv mediaTransport, waiter *media.RetryWaiter) ServerOption
 	}
 }
 
+// WithPolls memasang PollStore untuk melayani endpoint rekap suara polling.
+func WithPolls(ps *wa.PollStore) ServerOption {
+	return func(s *Server) {
+		if ps != nil {
+			s.pollStore = ps
+		}
+	}
+}
+
+func withChatDriver(drv chatTransport) ServerOption {
+	return func(s *Server) {
+		if drv != nil {
+			s.chatDriver = drv
+		}
+	}
+}
+
 func withV1WaitTimeout(d time.Duration) ServerOption {
 	return func(s *Server) {
 		if d > 0 {
@@ -111,6 +129,13 @@ type mediaTransport interface {
 	DownloaderFor(instanceID string) (media.Downloader, media.RetryReceiptSender, error)
 }
 
+type chatTransport interface {
+	MarkRead(ctx context.Context, instanceID string, chat, sender types.JID, ids []types.MessageID, played bool) error
+	SendPresence(ctx context.Context, instanceID string, state types.Presence) error
+	SendChatPresence(ctx context.Context, instanceID string, chat types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error
+	SubscribePresence(ctx context.Context, instanceID string, target types.JID) error
+}
+
 // Server menyatukan router HTTP publik dengan auth manager dan instance manager.
 type Server struct {
 	auth          *auth.Manager
@@ -122,6 +147,8 @@ type Server struct {
 	uploadStore   *media.UploadStore
 	retryWaiter   *media.RetryWaiter
 	mediaDriver   mediaTransport
+	pollStore     *wa.PollStore
+	chatDriver    chatTransport
 	gov           governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -158,6 +185,12 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	if s.retryWaiter == nil && w != nil {
 		s.retryWaiter = w.RetryWaiter()
 	}
+	if s.pollStore == nil && w != nil {
+		s.pollStore = w.PollStore()
+	}
+	if s.chatDriver == nil && w != nil {
+		s.chatDriver = w
+	}
 	if s.sseMax <= 0 {
 		if envMax := strings.TrimSpace(os.Getenv("WAAPI_SSE_MAX")); envMax != "" {
 			if n, err := strconv.Atoi(envMax); err == nil && n > 0 {
@@ -191,6 +224,11 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("DELETE /v2/instances/{id}/messages/{msg_id}", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2CancelMessage))
 	s.handle("POST /v2/instances/{id}/media", auth.ScopeMediaWrite, s.withInstanceAuth(s.handleV2UploadMedia))
 	s.handle("POST /v2/instances/{id}/media/download", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2DownloadMedia))
+	s.handle("POST /v2/instances/{id}/chats/{jid}/read", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2MarkRead))
+	s.handle("POST /v2/instances/{id}/chats/{jid}/presence", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2ChatPresence))
+	s.handle("POST /v2/instances/{id}/presence", auth.ScopeMessagesSend, s.withInstanceAuth(s.handleV2Presence))
+	s.handle("POST /v2/instances/{id}/presence/subscribe", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2SubscribePresence))
+	s.handle("GET /v2/instances/{id}/polls/{wa_id}", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2GetPollTally))
 
 	s.handler = recoverMiddleware(s.mux)
 	return s

@@ -2,6 +2,7 @@ package wa
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -85,6 +86,9 @@ type Instance struct {
 	pairMu        sync.Mutex
 	pairing       *PairSession
 	driverFactory func(*Instance, context.Context) (pairDriver, error)
+
+	presMu   sync.Mutex
+	presSubs map[string]struct{}
 }
 
 func newInstance(m *Manager, meta store.Instance) *Instance {
@@ -820,6 +824,14 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 		Receipts: i.cachedSettings().JournalReceipts,
 		LID:      i.lidResolver(),
 	}
+
+	if msgEvt, isMsg := rawEvt.(*events.Message); isMsg && msgEvt != nil && msgEvt.Message != nil {
+		unwrapped, _, _ := unwrapE2EMessage(msgEvt.Message, false, false)
+		if msgEvt.Message.GetPollUpdateMessage() != nil || (unwrapped != nil && unwrapped.GetPollUpdateMessage() != nil) {
+			return i.handlePollUpdateEvent(ctx, msgEvt, nc, j)
+		}
+	}
+
 	obsCtx := withObserverInstanceID(ctx, i.id)
 	ev, ok := NormalizeEvent(ctx, i.id, rawEvt, nc)
 	if !ok {
@@ -843,6 +855,11 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 	if i.mgr != nil {
 		hooks = i.mgr.collectHooks(obsCtx, ev, rawEvt)
 	}
+	if msgEvt, isMsg := rawEvt.(*events.Message); isMsg && i.mgr != nil && i.mgr.pollStore != nil {
+		if hook := i.pollCreationTxHook(msgEvt, ev); hook != nil {
+			hooks = append(hooks, hook)
+		}
+	}
 	res, err := j.Append(ctx, ev, hooks...)
 	if err != nil {
 		slog.Warn("gagal menyimpan event masuk ke journal", "instance", i.id, "type", ev.Type, "err", err)
@@ -850,6 +867,92 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 	}
 	ev.Seq = res.Seq
 	return true
+}
+
+func (i *Instance) handlePollUpdateEvent(ctx context.Context, evt *events.Message, nc NormalizeContext, j *journal.Journal) bool {
+	cli := i.getClient()
+	if cli == nil || j == nil {
+		return false
+	}
+	vote, err := cli.DecryptPollVote(ctx, evt)
+	if err != nil {
+		slog.Warn("gagal mendekripsi suara polling masuk", "instance", i.id, "msg_id", evt.Info.ID, "err", err)
+		return true
+	}
+
+	addr := resolveAddresses(ctx, evt.Info.MessageSource, nc.LID)
+	ts := eventUnixTS(evt.Info.Timestamp, nc.Now)
+	var flags uint32
+	if nc.Offline {
+		flags |= journal.FlagOffline
+	}
+	var pollID string
+	if pu := evt.Message.GetPollUpdateMessage(); pu != nil {
+		pollID = pu.GetPollCreationMessageKey().GetID()
+	} else if unwrapped, _, _ := unwrapE2EMessage(evt.Message, false, false); unwrapped != nil && unwrapped.GetPollUpdateMessage() != nil {
+		pollID = unwrapped.GetPollUpdateMessage().GetPollCreationMessageKey().GetID()
+	}
+	ev := &journal.Event{
+		InstanceID: i.id,
+		Type:       "poll_vote",
+		Chat:       addr.chatCanon,
+		Sender:     addr.senderRaw,
+		WAID:       evt.Info.ID,
+		DedupeKey:  "pv:" + evt.Info.Chat.String() + ":" + addr.senderRaw + ":" + evt.Info.ID,
+		TS:         ts,
+		ReceivedAt: nc.Now.UnixMilli(),
+		Flags:      flags,
+	}
+
+	ps := i.mgr.pollStore
+	if ps == nil {
+		ps = NewPollStore(j.DB())
+	}
+	if _, err := ps.RecordVoteAndAppend(ctx, j, ev, pollID, addr.senderPN, vote.GetSelectedOptions(), nil); err != nil {
+		slog.Warn("gagal menyimpan event poll_vote ke journal", "instance", i.id, "poll_id", pollID, "err", err)
+		return false
+	}
+	return true
+}
+
+func (i *Instance) pollCreationTxHook(msgEvt *events.Message, ev *journal.Event) journal.TxHook {
+	if msgEvt == nil || msgEvt.Message == nil || ev == nil || i.mgr == nil || i.mgr.pollStore == nil {
+		return nil
+	}
+	unwrapped, _, _ := unwrapE2EMessage(msgEvt.Message, false, false)
+	if unwrapped == nil {
+		return nil
+	}
+	poll := firstNonNilPoll(
+		unwrapped.GetPollCreationMessage(),
+		unwrapped.GetPollCreationMessageV2(),
+		unwrapped.GetPollCreationMessageV3(),
+		unwrapped.GetPollCreationMessageV5(),
+		unwrapped.GetPollCreationMessageV6(),
+	)
+	if poll == nil {
+		return nil
+	}
+	opts := make([]string, 0, len(poll.GetOptions()))
+	for _, o := range poll.GetOptions() {
+		if o != nil {
+			opts = append(opts, o.GetOptionName())
+		}
+	}
+	ps := i.mgr.pollStore
+	p := Poll{
+		InstanceID: i.id,
+		Chat:       ev.Chat,
+		WAID:       ev.WAID,
+		Creator:    ev.Sender,
+		Name:       poll.GetName(),
+		Options:    opts,
+		Selectable: int(poll.GetSelectableOptionsCount()),
+		CreatedAt:  ev.TS,
+	}
+	return func(ctx context.Context, tx *sql.Tx, _ int64) error {
+		return ps.SavePollTx(ctx, tx, p)
+	}
 }
 
 func (i *Instance) syncSupervisorState(snap StateSnapshot) {
@@ -912,9 +1015,78 @@ func (i *Instance) syncSupervisorState(snap StateSnapshot) {
 		cancel()
 	}
 
-	if snap.State == StateOnline && i.mgr != nil && i.mgr.outbox != nil {
-		i.mgr.outbox.NotifyReady(i.id)
+	if snap.State == StateOnline {
+		if i.mgr != nil && i.mgr.outbox != nil {
+			i.mgr.outbox.NotifyReady(i.id)
+		}
+		i.resubscribePresenceAsync()
 	}
+}
+
+const maxPresenceSubscribeJIDs = 100
+
+// SubscribePresence mendaftarkan target JID ke daftar langganan presence (maks 100 per instance) dan mengirim node ke WhatsApp.
+func (i *Instance) SubscribePresence(ctx context.Context, target types.JID) error {
+	cli := i.getClient()
+	if cli == nil || !cli.IsConnected() {
+		return ErrNotConnected
+	}
+	norm := target.ToNonAD()
+	key := norm.String()
+
+	i.presMu.Lock()
+	if i.presSubs == nil {
+		i.presSubs = make(map[string]struct{})
+	}
+	if _, exists := i.presSubs[key]; !exists {
+		if len(i.presSubs) >= maxPresenceSubscribeJIDs {
+			i.presMu.Unlock()
+			return ErrPresenceSubLimit
+		}
+		i.presSubs[key] = struct{}{}
+	}
+	i.presMu.Unlock()
+
+	return cli.SubscribePresence(ctx, norm)
+}
+
+func (i *Instance) resubscribePresenceAsync() {
+	i.presMu.Lock()
+	if len(i.presSubs) == 0 {
+		i.presMu.Unlock()
+		return
+	}
+	targets := make([]types.JID, 0, len(i.presSubs))
+	for raw := range i.presSubs {
+		if jid, err := types.ParseJID(raw); err == nil {
+			targets = append(targets, jid)
+		}
+	}
+	i.presMu.Unlock()
+
+	if len(targets) == 0 {
+		return
+	}
+	baseCtx := i.baseCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+		defer cancel()
+		cli := i.getClient()
+		if cli == nil || !cli.IsConnected() {
+			return
+		}
+		for _, target := range targets {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := cli.SubscribePresence(ctx, target); err != nil {
+				slog.Warn("gagal re-subscribe presence setelah reconnect", "instance", i.id, "target", target.String(), "err", err)
+			}
+		}
+	}()
 }
 
 func (i *Instance) clearJIDAndStatus(status string) {

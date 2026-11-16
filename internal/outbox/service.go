@@ -680,8 +680,8 @@ func (s *Service) validateAndNormalize(req EnqueueRequest) (Spec, int64, time.Du
 
 	switch spec.Type {
 	case "text":
-		if strings.TrimSpace(spec.Text) == "" {
-			return Spec{}, 0, 0, fmt.Errorf("%w: field text wajib diisi", ErrInvalidSpec)
+		if tErr := ValidateTextBody(spec.Text); tErr != nil {
+			return Spec{}, 0, 0, tErr
 		}
 	case "image", "video", "audio", "document", "sticker":
 		normMedia, mErr := validateMediaSpec(spec.Type, spec.Media)
@@ -689,6 +689,30 @@ func (s *Service) validateAndNormalize(req EnqueueRequest) (Spec, int64, time.Du
 			return Spec{}, 0, 0, mErr
 		}
 		spec.Media = normMedia
+	case "location":
+		if lErr := ValidateLocation(spec.Location); lErr != nil {
+			return Spec{}, 0, 0, lErr
+		}
+	case "contact":
+		if cErr := ValidateContacts(spec.Contacts); cErr != nil {
+			return Spec{}, 0, 0, cErr
+		}
+	case "poll":
+		if pErr := ValidatePoll(spec.Poll); pErr != nil {
+			return Spec{}, 0, 0, pErr
+		}
+	case "reaction":
+		if rErr := ValidateReaction(spec.Reaction); rErr != nil {
+			return Spec{}, 0, 0, rErr
+		}
+	case "edit":
+		if eErr := ValidateEdit(spec.Edit); eErr != nil {
+			return Spec{}, 0, 0, eErr
+		}
+	case "revoke":
+		if rvErr := ValidateRevoke(spec.Revoke); rvErr != nil {
+			return Spec{}, 0, 0, rvErr
+		}
 	default:
 		return Spec{}, 0, 0, fmt.Errorf("%w: tipe pesan %q tidak didukung", ErrInvalidSpec, spec.Type)
 	}

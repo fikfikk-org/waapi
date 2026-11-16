@@ -67,6 +67,11 @@ flowchart TD
         M2 -->|"lewat 24h"| M4["expired (ditolak 410)"]
         M4 -->|"pruner tiap jam"| M5["dihapus"]
     end
+    subgraph PollLifecycle
+        PL1["Poll Creation (masuk TxHook / keluar pra-SendMessage)"] -->|"tersimpan di polls"| PL2["active (polls)"]
+        PL2 -->|"PollUpdateMessage -> DecryptPollVote + SHA-256"| PL3["poll_votes di-upsert + event poll_vote"]
+        PL3 -->|"pemilih ubah pilihan / unvote []"| PL3
+    end
 ```
 
 ## Aturan per Entitas
@@ -128,7 +133,7 @@ flowchart TD
 | id | ID unik ULID 26 karakter yang monotonik secara waktu | Identitas pesan keluar internal untuk pelacakan & pembatalan |
 | instance_id | Pemilik instance WhatsApp | Antrean, laju kirim, dan kunci idempotensi terisolasi per instance |
 | recipient | Nomor E.164 atau JID kanonik (`@s.whatsapp.net` / `@g.us`) | Awalan `0` otomatis dinormalisasi ke kode negara `62` |
-| type | `text`, `image`, `video`, `audio`, `document`, `sticker` | Voice note memakai `type: "audio"` + `media.ptt: true` (kompatibel dengan upload `?kind=ptt`) |
+| type | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, `contact`, `poll`, `reaction`, `edit`, `revoke` | Voice note memakai `type: "audio"` + `media.ptt: true`; `text` & `edit` dibatasi `1–60.000 byte` |
 | status | `queued`, `sending`, `sent`, `delivered`, `read`, `failed`, `expired`, `cancelled` | Menggambarkan siklus penuh pesan keluar sampai receipt |
 | priority | Hanya menerima `normal` (`0`) atau `urgent` (`10`) | Pesan `urgent` didahulukan saat scheduler mengklaim antrean |
 | not_before | Batas paling awal pesan boleh diklaim scheduler | Dipakai untuk penjadwalan tunda atau backoff retry |
@@ -155,6 +160,20 @@ flowchart TD
 | size & sha256 | Panjang plaintext & digest SHA-256 hex lowercase | Disertakan pada `ETag` saat unduh ulang media |
 | dimensi & durasi | `width`, `height` dari header JPEG/PNG/WebP (tanpa decode piksel), `seconds` opsional | Bila header melewati 64 KiB, dimensi dikosongkan (`0`) |
 | expires_at | `created_at + 24 jam` | Dipakai untuk validasi awal kirim (`upload_expired`) dan safety net eksekusi outbox (`media_expired`) |
+
+### Polls & Votes (`polls` & `poll_votes` di `journal.db`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `(instance_id, chat, wa_id)` | Kunci primer polling (`WITHOUT ROWID`) | Menyimpan `creator`, `name`, JSON array `options` berurutan asli, `selectable`, dan `created_at` |
+| `poll_votes` | Kunci primer `(instance_id, chat, wa_id, voter)` | Suara baru langsung menggantikan suara sebelumnya; array `[]` berarti pemilih mencabut suaranya |
+| Pemetaan hash suara | SHA-256 32 byte atas tiap nama opsi | Polling tak dikenal tetap dicatat ke journal sebagai `poll_vote` dengan `poll_known: false` & `selected_hashes` hex |
+
+### Presence Subscribe (RAM per Instance)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `presSubs` | Set target JID di RAM, maksimal `100` JID per instance | Duplikat bersifat idempoten; JID ke-101 ditolak; otomatis di-subscribe ulang saat supervisor kembali `online` |
 
 ## Transisi Status Instance
 
@@ -200,6 +219,14 @@ flowchart TD
 | active (`uploads`) | expired | Melewati batas `expires_at` (`created_at + 24 jam`); ditolak `410 upload_expired` di HTTP atau gagal permanen `media_expired` saat eksekusi |
 | expired | dihapus | Tugas pembersihan `UploadStore.Prune` berjalan tiap jam bersama pruner |
 
+## Transisi Status Polling & Suara
+
+| Dari | Ke | Pemicu |
+|---|---|---|
+| masuk / keluar | tercatat (`polls`) | Polling masuk lewat `TxHook` journal; polling keluar disimpan tepat sebelum `SendMessage` |
+| tercatat (`polls`) | terpilih (`poll_votes`) | `PollUpdateMessage` terdekripsi oleh `DecryptPollVote` lalu hash SHA-256 dicocokkan dengan opsi |
+| terpilih (`poll_votes`) | diperbarui / batal (`[]`) | Pemilih mengganti opsi atau membatalkan seluruh pilihan (dikeluarkan dari `total_voters`) |
+
 ## Batasan Bisnis & Trigger
 
 | Aturan | Detail |
@@ -235,4 +262,7 @@ flowchart TD
 | Media resurrection (404/410 CDN) | Unduhan event journal yang gagal 404/410 memicu `SendMediaRetryReceipt`, menunggu `events.MediaRetry` maks 30s (maks 16 penunggu), mendekripsi path baru, lalu mengunduh ulang; kegagalan membalas `410 media_gone` |
 | Proteksi memori & deadline media | Endpoint media menolak dengan `503 memory_pressure` (`Retry-After: 15`) saat governor level `Red`, dan memperpanjang deadline baca/tulis hingga 10 menit untuk transfer berkas besar |
 | Pembersihan `uploads` berkala | Tugas pembersihan tiap jam di pruner menghapus descriptor `uploads` yang melampaui masa berlaku 24 jam |
+| Compose murni & quoted reply (R15) | `Compose` menyusun seluruh tipe pesan secara murni terhadap `ComposeDeps`; pesan reply melengkapi `Participant` dan `QuotedMessage` (bila teks kutipan ada) dari lookup `journal.db`; `reaction` tanpa `sender` mencoba lookup pengirim target terlebih dahulu sebelum fallback ke JID sendiri; `revoke` tanpa `sender` memakai JID sendiri; vCard menerapkan escape RFC 6350 dan menuliskan seluruh nomor `phones` |
+| Polling tahan kegagalan & dekripsi suara | Polling keluar ditulis ke `polls` sebelum `SendMessage`; `PollUpdateMessage` didekripsi oleh `DecryptPollVote` lalu dicatat hanya sebagai `event="poll_vote"` (tidak tercatat ganda sebagai `message`); gagal dekripsi mencatat log WARN dan tetap meng-ack WhatsApp |
+| Presence & subscription reconnect | Status `presence` / `chat_presence` masuk dinormalisasi ke `journal.db` tanpa dedupe key (`last_seen` Unix detik); daftar `SubscribePresence` dibatasi maks 100 JID per instance dan disinkronkan ulang saat koneksi mencapai state `online` |
 

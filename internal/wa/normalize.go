@@ -45,6 +45,10 @@ func NormalizeEvent(ctx context.Context, instanceID string, raw any, nc Normaliz
 		return normalizeReceiptEvent(ctx, instanceID, e, nc)
 	case *events.UndecryptableMessage:
 		return normalizeUndecryptableEvent(ctx, instanceID, e, nc)
+	case *events.Presence:
+		return normalizePresenceEvent(ctx, instanceID, e, nc)
+	case *events.ChatPresence:
+		return normalizeChatPresenceEvent(ctx, instanceID, e, nc)
 	default:
 		return nil, false
 	}
@@ -147,6 +151,11 @@ func normalizeMessageEvent(ctx context.Context, instanceID string, e *events.Mes
 
 	msg, isEph, isVO := unwrapE2EMessage(e.Message, e.IsEphemeral, e.IsViewOnce || e.IsViewOnceV2 || e.IsViewOnceV2Extension)
 	if msg == nil {
+		return nil, false
+	}
+
+	// PollUpdateMessage ditangani khusus oleh handler suara polling agar tidak tercatat ganda sebagai message unknown.
+	if e.Message.GetPollUpdateMessage() != nil || msg.GetPollUpdateMessage() != nil {
 		return nil, false
 	}
 
@@ -443,7 +452,7 @@ func applyContextInfo(ci *waE2E.ContextInfo, p *MessageV2) {
 				p.Truncated = true
 			}
 		}
-		p.Quoted = &QuotedInfo{
+		p.Quoted = &QuotedPayload{
 			ID:          ci.GetStanzaID(),
 			Participant: ci.GetParticipant(),
 			Type:        qType,
@@ -657,6 +666,79 @@ func eventUnixTS(t, fallback time.Time) int64 {
 		return fallback.Unix()
 	}
 	return t.Unix()
+}
+
+func normalizePresenceEvent(ctx context.Context, instanceID string, e *events.Presence, nc NormalizeContext) (*journal.Event, bool) {
+	if e == nil || e.From.IsEmpty() {
+		return nil, false
+	}
+	fromNonAD := e.From.ToNonAD()
+	fromStr := fromNonAD.String()
+	var fromPN string
+	switch fromNonAD.Server {
+	case types.DefaultUserServer:
+		fromPN = fromStr
+	case types.HiddenUserServer:
+		if nc.LID != nil {
+			if pn, ok := nc.LID.PNForLID(ctx, fromNonAD); ok && !pn.IsEmpty() {
+				fromPN = pn.ToNonAD().String()
+			}
+		}
+	}
+
+	var lastSeen int64
+	if !e.LastSeen.IsZero() {
+		lastSeen = e.LastSeen.Unix()
+	}
+	body := PresenceV2{
+		From:        fromStr,
+		FromPN:      fromPN,
+		Unavailable: e.Unavailable,
+		LastSeen:    lastSeen,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, false
+	}
+	chatCanon := fromStr
+	if fromPN != "" {
+		chatCanon = fromPN
+	}
+	return &journal.Event{
+		InstanceID: instanceID,
+		Type:       "presence",
+		Chat:       chatCanon,
+		Sender:     fromStr,
+		TS:         nc.Now.Unix(),
+		ReceivedAt: nc.Now.UnixMilli(),
+		Payload:    payload,
+	}, true
+}
+
+func normalizeChatPresenceEvent(ctx context.Context, instanceID string, e *events.ChatPresence, nc NormalizeContext) (*journal.Event, bool) {
+	if e == nil || e.Chat.IsEmpty() {
+		return nil, false
+	}
+	addr := resolveAddresses(ctx, e.MessageSource, nc.LID)
+	body := ChatPresenceV2{
+		Chat:   addr.chatCanon,
+		Sender: addr.senderRaw,
+		State:  string(e.State),
+		Media:  string(e.Media),
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, false
+	}
+	return &journal.Event{
+		InstanceID: instanceID,
+		Type:       "chat_presence",
+		Chat:       addr.chatCanon,
+		Sender:     addr.senderRaw,
+		TS:         nc.Now.Unix(),
+		ReceivedAt: nc.Now.UnixMilli(),
+		Payload:    payload,
+	}, true
 }
 
 // truncateUTF8 memotong string pada batas maksimal byte tanpa memutus rune UTF-8 di tengah.
