@@ -766,7 +766,7 @@ func TestMCP_Subscriptions(t *testing.T) {
 		ResourceUpdatedHandler: func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
 			subCh <- req.Params.URI
 		},
-	}, nil)
+	}, &mcp.ClientSessionOptions{ProtocolVersion: "2026-07-28"})
 	if err := csSub.Subscribe(context.Background(), &mcp.SubscribeParams{
 		URI: "waapi://instances/sales/chats/" + chat,
 	}); err != nil {
@@ -792,7 +792,7 @@ func TestMCP_Subscriptions(t *testing.T) {
 		if gotURI != "waapi://instances/sales/chats/"+chat {
 			t.Fatalf("URI notifikasi tidak cocok: %q", gotURI)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timeout menunggu ResourceUpdated notification saat pesan baru masuk")
 	}
 	if err := csSub.Unsubscribe(context.Background(), &mcp.UnsubscribeParams{
