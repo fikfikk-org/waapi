@@ -43,12 +43,18 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	}
 	os.Stdout = w
 
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		// Kuras pipe secara paralel agar penulisan > 4 KiB di Windows tidak deadlock.
+		_, _ = io.Copy(&buf, r)
+		close(done)
+	}()
+
 	runErr := fn()
 	_ = w.Close()
 	os.Stdout = old
-
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
+	<-done
 	_ = r.Close()
 	return buf.String(), runErr
 }

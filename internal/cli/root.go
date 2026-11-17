@@ -15,7 +15,7 @@ import (
 )
 
 // Version diisi saat build melalui -ldflags "-X github.com/fikfikk-org/waapi/internal/cli.Version=..."
-var Version = "1.0.2"
+var Version = "2.0.0"
 
 // Execute mengeksekusi argumen baris perintah waapi.
 func Execute(args []string) error {
@@ -91,6 +91,8 @@ func Execute(args []string) error {
 		return runMCP(ctx, ctrl, rest)
 	case "hook":
 		return runHook(ctx, ctrl, rest)
+	case "backup":
+		return runBackup(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
 	case "update", "self-update":
@@ -159,7 +161,7 @@ func runUninstall(ctx context.Context, cfg *config.Config, args []string) error 
 }
 
 func printHelp() {
-	fmt.Print(`waapi — Private WhatsApp API Gateway (Headless, < 100 MB RAM)
+	fmt.Print(`waapi — Private WhatsApp API Gateway (Headless, Profil lean / < 100 MB RAM)
 
 PENGGUNAAN:
   waapi <perintah> [argumen]
@@ -168,7 +170,7 @@ PERINTAH UTAMA (INSTANCE):
   waapi list                                   Daftar semua instance WhatsApp
   waapi add <id> [--rate 20] [--no-autostart]  Buat instance baru
   waapi show <id>                              Detail status satu instance
-  waapi edit <id> [opsi]                       Ubah rate limit / webhook / autostart instance
+  waapi edit <id> [opsi]                       Ubah rate limit / webhook / autostart / settings
   waapi pair <id> [--phone 62812xxx]           Tautkan nomor via QR ASCII atau 8-digit kode
   waapi restart <id>                           Sambungkan ulang instance
   waapi recycle <id>                           Segarkan penuh client & cache SQLite instance
@@ -176,35 +178,38 @@ PERINTAH UTAMA (INSTANCE):
   waapi logout <id>                            Unlink perangkat dari WhatsApp
   waapi rm <id> [--yes]                        Logout dan hapus instance beserta datanya
 
-MANAJEMEN API KEY:
+MANAJEMEN API KEY & AUDIT:
   waapi key list                               Daftar seluruh API key
-  waapi key add --name <nama> [opsi]           Buat API key baru (--scopes/--expires/--rate/--policy)
+  waapi key add --name <nama> [opsi]           Buat API key baru (--instance/--scopes/--expires/--rate/--policy)
   waapi key show <key-id>                      Lihat metadata, scope, expiry, & policy key
   waapi key rotate <key-id> [--grace 24h]      Rotasi API key dengan grace period key lama
   waapi key rm <key-id>                        Cabut (revoke) API key
-  waapi audit [--since 24h] [--action pola]    Lihat catatan audit aksi administratif
+  waapi audit [--since 24h] [--action pola]    Lihat catatan audit aksi administratif (--limit N --json)
 
-MANAJEMEN WEBHOOK:
-  waapi webhook set <id> <url> [--from ...]    Pasang URL webhook (--from now|retained)
+WEBHOOK, PESAN, EVENT & CONTEXT:
+  waapi webhook set <id> <url> [opsi]          Pasang URL webhook (--events csv --from now|retained)
   waapi webhook unset <id>                     Hapus URL webhook dari instance
   waapi webhook resume <id>                    Lanjutkan webhook setelah pause 410 Gone
   waapi webhook dlq <id> ls|replay|purge       Kelola antrean dead-letter webhook
   waapi webhook test <id>                      Kirim event uji coba ke webhook
-  waapi events <id> [--after N] [--follow]     Baca/pantau stream event journal (SSE --follow)
-  waapi send <id> <to> <text> [--wait] [--idem KEY]  Kirim pesan teks lewat durable outbox
+  waapi events <id> [opsi]                     Baca/pantau stream event journal (--after N --types csv --limit N --follow --json)
+  waapi send <id> <to> <text> [opsi]           Kirim pesan teks lewat durable outbox (--wait --idem KEY --typing --json)
   waapi health <id> [--json]                   Lihat skor kesehatan akun Guardian, kuota & faktor
-  waapi context <id> on|off|purge [opsi]       Kelola context store FTS5 opt-in per instance
-  waapi hook <ls|add|rm|enable|disable|logs|test>  Kelola dan uji coba rule reactive hooks per instance
-  waapi mcp [--key KEY_ID] [--max-inflight 8]  Bridge MCP stdio ke control.sock (/control/mcp)
+  waapi context <id> on|off|purge [opsi]       Kelola context store FTS5 opt-in per instance (--purge --chat JID --json)
 
-DAEMON, UPDATE & DIAGNOSTIK:
+OTOMASI HOOKS & AI AGENT (MCP):
+  waapi hook ls|add|rm|enable|disable|logs|test  Kelola & uji coba rule reactive hooks per instance
+  waapi mcp [--key KEY_ID] [--max-inflight 8]    Bridge MCP stdio ke control.sock (/control/mcp)
+
+DAEMON, BACKUP, UPDATE & DIAGNOSTIK:
+  waapi backup [--out dir] [--json]            Snapshot atomik VACUUM INTO (app.db, journal.db, wa.db)
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
   waapi doctor --deep [--json]                 Cek anatomi memori penuh (procfs, cgroup, THP, SQLite)
   waapi debug pprof <profil> [-o file]         Ambil profil pprof (heap|goroutine|goroutineleak|profile)
   waapi logs [<id>]                            Pantau log service systemd (journalctl)
   waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
-  waapi update | waapi update:latest           Update ke versi terbaru (otomatis backup versi lama)
-  waapi update <versi> | waapi update:v1.0.0   Pasang versi spesifik dari GitHub Releases
+  waapi update | waapi update:latest           Update ke versi terbaru (--force --insecure-no-verify)
+  waapi update <versi> | waapi update:v2.0.0   Pasang versi spesifik dari GitHub Releases
   waapi rollback [<versi>]                     Kembalikan ke versi sebelumnya atau ke versi tertentu
   waapi versions                               Lihat daftar rilis GitHub & backup lokal
   waapi uninstall [--purge]                    Hapus service & binary (--purge untuk hapus data)
@@ -214,9 +219,10 @@ DAEMON, UPDATE & DIAGNOSTIK:
 OPSI EDIT INSTANCE (waapi edit <id>):
   --rate <n>              Batas kirim pesan per menit (contoh: --rate 30)
   --webhook <url>         URL tujuan webhook (kosongkan "" untuk menghapus)
-  --events <csv>          Filter event: message,receipt,connection
+  --events <csv>          Filter event: message,receipt,connection,...
   --autostart <bool>      true atau false
   --rotate-secret         Putar ulang secret HMAC webhook
+  --set <key=value>       Patch parsial InstanceSettings (boleh berulang)
 `)
 }
 
