@@ -23,6 +23,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
+	"github.com/fikfikk-org/waapi/internal/mcpserver"
 	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/outbox"
@@ -308,6 +309,23 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		},
 	})
 
+	mcpSrv := mcpserver.New(mcpserver.Deps{
+		Auth:      authMgr,
+		Instances: waMgr,
+		WA:        waMgr,
+		Outbox:    outboxSvc,
+		Journal:   j,
+		CtxStore:  ctxStore,
+		Policy:    policyEnf,
+		Governor:  gov,
+		Health:    guard.Health,
+	}, mcpserver.Config{
+		Enabled:        cfg.MCP != "off",
+		AllowedOrigins: cfg.MCPAllowedOrigins,
+		Version:        daemonBuildVersion,
+	})
+	defer mcpSrv.Close()
+
 	ctrlSrv := control.NewServer(cfg, st, authMgr, waMgr, wh,
 		control.WithJournal(j),
 		control.WithWebhookService(whSvc, dead),
@@ -316,6 +334,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		control.WithGovernor(gov),
 		control.WithAuditLog(auditLog),
 		control.WithContextStore(ctxStore),
+		control.WithMCP(mcpSrv),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
@@ -349,7 +368,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithContextStore(ctxStore), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithContextStore(ctxStore), httpapi.WithMCP(mcpSrv), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -444,6 +463,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	_ = pubHTTP.Shutdown(shutCtx)
 	_ = ctrlHTTP.Shutdown(shutCtx)
+	mcpSrv.Close()
 	outboxSvc.Stop()
 	_ = waMgr.Close()
 	guard.Stop()

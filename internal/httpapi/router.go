@@ -19,6 +19,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
+	"github.com/fikfikk-org/waapi/internal/mcpserver"
 	"github.com/fikfikk-org/waapi/internal/media"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/policy"
@@ -84,6 +85,15 @@ func WithContextStore(cs *ctxstore.Store) ServerOption {
 	return func(s *Server) {
 		if cs != nil {
 			s.ctxStore = cs
+		}
+	}
+}
+
+// WithMCP memasang server MCP stateless pada endpoint POST /mcp.
+func WithMCP(ms *mcpserver.Server) ServerOption {
+	return func(s *Server) {
+		if ms != nil {
+			s.mcp = ms
 		}
 	}
 }
@@ -227,6 +237,7 @@ type Server struct {
 	policyEnforcer *policy.Enforcer
 	audit          *auth.AuditLog
 	ctxStore       *ctxstore.Store
+	mcp            *mcpserver.Server
 	gov            governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -339,6 +350,7 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("GET /v2/instances/{id}/chats", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextChats))
 	s.handle("GET /v2/instances/{id}/chats/{jid}/messages", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextMessages))
 	s.handle("GET /v2/instances/{id}/search", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextSearch))
+	s.handle("POST /mcp", auth.ScopeMCP, s.handleMCP)
 
 	s.handler = requestIDAndRecoverMiddleware(s.mux)
 	return s
@@ -393,6 +405,21 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if s.mcp != nil && !s.mcp.CheckOrigin(r) {
+		writeError(w, http.StatusForbidden, "origin_forbidden", "header Origin tidak diizinkan oleh kebijakan WAAPI_MCP_ALLOWED_ORIGINS", 0)
+		return
+	}
+	s.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		if s.mcp == nil {
+			writeError(w, http.StatusNotFound, "not_found", "layanan MCP belum aktif", 0)
+			return
+		}
+		meta, _ := r.Context().Value(keyMetaCtx).(*auth.KeyMeta)
+		s.mcp.ServeVerified(w, r, meta)
+	})(w, r)
 }
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {

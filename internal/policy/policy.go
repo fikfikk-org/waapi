@@ -96,12 +96,23 @@ func New(keys KeyPolicyLookup, contacts ContactView) *Enforcer {
 	}
 }
 
+// resolvePolicy memilih KeyPolicy efektif: prioritas Origin.Policy (override/kontrol), lalu LookupPolicy per KeyID.
+func (e *Enforcer) resolvePolicy(origin outbox.Origin) (auth.KeyPolicy, bool) {
+	if e == nil || strings.EqualFold(origin.Kind, "system") {
+		return auth.KeyPolicy{}, false
+	}
+	if origin.Policy != nil {
+		return *origin.Policy, true
+	}
+	if e.keys == nil || strings.TrimSpace(origin.KeyID) == "" {
+		return auth.KeyPolicy{}, false
+	}
+	return e.keys.LookupPolicy(origin.KeyID)
+}
+
 // CheckSend mengevaluasi seluruh aturan KeyPolicy pada jalur enqueue outbox.
 func (e *Enforcer) CheckSend(ctx context.Context, instanceID string, origin outbox.Origin, spec outbox.Spec) error {
-	if e == nil || e.keys == nil || strings.EqualFold(origin.Kind, "system") || strings.TrimSpace(origin.KeyID) == "" {
-		return nil
-	}
-	pol, ok := e.keys.LookupPolicy(origin.KeyID)
+	pol, ok := e.resolvePolicy(origin)
 	if !ok {
 		return nil
 	}
@@ -143,7 +154,11 @@ func (e *Enforcer) CheckSend(ctx context.Context, instanceID string, origin outb
 	}
 
 	if pol.MaxSendsPerHour > 0 {
-		if !e.allowHourlySend(origin.KeyID, pol.MaxSendsPerHour, time.Now()) {
+		bucketKey := strings.TrimSpace(origin.KeyID)
+		if bucketKey == "" {
+			bucketKey = "control"
+		}
+		if !e.allowHourlySend(bucketKey, pol.MaxSendsPerHour, time.Now()) {
 			return newPolicyError(http.StatusTooManyRequests, "policy_rate_limited", 60, ErrPolicyRate)
 		}
 	}
@@ -153,14 +168,11 @@ func (e *Enforcer) CheckSend(ctx context.Context, instanceID string, origin outb
 
 // CheckDestructive memvalidasi kebijakan destructive untuk operasi berbahaya seperti remove peserta atau leave grup.
 func (e *Enforcer) CheckDestructive(origin outbox.Origin, action string) error {
-	if e == nil || e.keys == nil || strings.EqualFold(origin.Kind, "system") || strings.TrimSpace(origin.KeyID) == "" {
-		return nil
-	}
 	act := strings.ToLower(strings.TrimSpace(action))
 	if act != "revoke" && act != "remove" && act != "leave" {
 		return nil
 	}
-	pol, ok := e.keys.LookupPolicy(origin.KeyID)
+	pol, ok := e.resolvePolicy(origin)
 	if !ok {
 		return nil
 	}

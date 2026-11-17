@@ -213,5 +213,18 @@ func TestPolicyCheckSend_Tabel(t *testing.T) {
 		if err := enf.CheckSend(ctx, "sales", outbox.Origin{KeyID: "k_rate"}, outbox.Spec{Type: "text", To: "628111222333", Text: "ok-lagi"}); err != nil {
 			t.Fatalf("kirim setelah 61 menit seharusnya diizinkan kembali, didapat %v", err)
 		}
+
+		// Origin.Policy memprioritaskan policy bawaan Origin (override MRTR & operator /control/mcp tanpa KeyID)
+		askOnly := auth.KeyPolicy{FirstContact: "ask", Destructive: "ask"}
+		if err := enf.CheckSend(ctx, "sales", outbox.Origin{Kind: "mcp", KeyID: "", Policy: &askOnly}, outbox.Spec{Type: "text", To: "628999888777", Text: "baru"}); !errors.Is(err, ErrFirstContactNeedsApproval) {
+			t.Fatalf("Origin tanpa KeyID dengan Policy wajib menuntut persetujuan first_contact: %v", err)
+		}
+		allowOnce := auth.KeyPolicy{FirstContact: "allow", Destructive: "allow"}
+		if err := enf.CheckSend(ctx, "sales", outbox.Origin{Kind: "mcp", KeyID: "k_fc_ask", Policy: &allowOnce}, outbox.Spec{Type: "text", To: "628999888777", Text: "disetujui"}); err != nil {
+			t.Fatalf("override Origin.Policy FirstContact=allow gagal: %v", err)
+		}
+		if err := enf.CheckDestructive(outbox.Origin{Kind: "mcp", KeyID: "", Policy: &askOnly}, "remove"); !errors.Is(err, ErrDestructiveNeedsApproval) {
+			t.Fatalf("CheckDestructive dengan Origin.Policy wajib menuntut persetujuan: %v", err)
+		}
 	})
 }

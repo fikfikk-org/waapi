@@ -550,6 +550,18 @@
 | Response | 200 `{ hits: [{ chat, id, from, from_me, timestamp, type, snippet, rank }] }` · 400 `invalid_request` · 409 `context_store_disabled` |
 | Notes | Pencarian FTS5 (`unicode61 remove_diacritics 2`) BM25; seluruh token dibungkus kutip ganda aman sintaks, `prefix=true` menambah `*` di token terakhir |
 
+## POST /mcp
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /mcp (beserta `GET` / `DELETE` Streamable HTTP MCP 2026-07-28) |
+| Auth Required | Yes (`Authorization: Bearer` / `X-API-Key`, scope `mcp`, dibatasi `instance_id` key bila terisi) |
+| Headers | `Authorization: Bearer wak_...` atau `X-API-Key`, `MCP-Protocol-Version` (`2026-07-28` / `2025-11-25`), `Mcp-Method`, `Mcp-Name`, `Mcp-Session-Id`, `Origin` (bila dikirim, wajib cocok `WAAPI_MCP_ALLOWED_ORIGINS`) |
+| Query Params | - |
+| Request Body | JSON-RPC 2.0 MCP (maks `1 MiB`), termasuk `initialize`, `server/discover`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `subscriptions/listen` |
+| Response | `200` (`application/json` atau `text/event-stream`) · `202` notifikasi · `403 origin_forbidden` / `scope_denied` · `404 mcp_disabled` · `429 mcp_overloaded` (semafor `8`) |
+| Notes | Lazy init pada request pertama; `X-Waapi-Principal` eksternal dihapus middleware; 15 tool terfilter per `KeyPolicy.Tools`; elisitasi MRTR / JSON-RPC error `-32042` + `approval_token` HMAC-SHA256 (`5m`) untuk `first_contact=ask` dan `destructive=ask`; langganan resource maks `32` URI global (`0` subscriber = `0` goroutine) |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -576,6 +588,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `GET /control/audit` (`?since=24h&action=...&limit=100`) membaca entri `audit_log` beserta actor UID (`SO_PEERCRED` Linux) / key ID (`waapi audit`).
 - `POST /control/backup` membuat backup atomik `VACUUM INTO` untuk `app.db`, `journal.db`, dan `wa.db` ke `backups/db-<versi>-<timestamp>/` (`0600`, retensi 3 backup terbaru); dipanggil otomatis oleh `waapi update` bila daemon hidup. Socket `control.sock` dibuat atomik lewat temp socket -> `chmod 0660` -> `rename`.
 - `POST /control/instances/{id}/context` (`{ enabled, purge? }`) mengaktifkan/mematikan context store sekaligus opsional mem-purge data instance, dan `POST /control/instances/{id}/context/purge` (`{ chat? }`) membersihkan satu chat atau seluruh instance (`waapi context <id> on|off [--purge]|purge [--chat jid]`, mencatat `audit_log`).
+- `/control/mcp` (`POST`/`GET`/`DELETE`) mengekspos server MCP Streamable HTTP ke `control.sock` dengan dukungan header `X-Waapi-Key-Id` opsional atau default policy operator lokal (`first_contact: ask`, `destructive: ask`); diakses dari CLI melalui bridge stdio `waapi mcp [--key KEY_ID] [--max-inflight 8]` (batas baris `1 MiB`, meneruskan `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/`Mcp-Session-Id`).
 
 ## Scheduled Tasks
 
@@ -596,4 +609,5 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Memory Governor loop | Tiap 5 detik | Sampel memori anonim cgroup/procfs + PSI dengan hysteresis bertahap | Atur `GOGC` (`25`/`BaseGOGC`), jalankan `PRAGMA shrink_memory` (`Yellow`), `FreeOSMemory()` (`Red`), pacing webhook `200 ms`, dan auto-recycle round-robin saat `Red >= 10m` & `WAAPI_AUTO_RECYCLE=on` |
 | Scheduled recycle harian | Tiap 30 detik cek `recycle_at` lokal | Refresh client `wa.Manager.Recycle` sekali sehari di luar jam sibuk | Dilewati untuk hari itu bila ada job `sending` atau aktivitas pesan 5 menit terakhir |
 | Boot binary pageout | 90 detik setelah start (bila `WAAPI_PAGEOUT_AFTER_BOOT` `cold` \| `pageout`) | Terapkan `SYS_MADVISE` pada mapping `r-xp`/`r--p` binary Linux (mati secara default) | Tandai halaman teks/rodata binary agar siap di-reclaim kernel |
+| Fanout subscription MCP | On-demand selama URI terlanggan > `0` (`0` subscriber = `0` goroutine) | Pantau notifikasi `journal.Subscribe` dan teruskan ke sesi MCP | Mengalirkan pembaruan resource `waapi://instances/{instance}/chats/{+chat}` & `.../health` (maks `32` URI global) |
 

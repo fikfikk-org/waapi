@@ -87,6 +87,8 @@ func Execute(args []string) error {
 		return runHealth(ctx, ctrl, rest)
 	case "context":
 		return runContext(ctx, ctrl, rest)
+	case "mcp":
+		return runMCP(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
 	case "update", "self-update":
@@ -190,6 +192,7 @@ MANAJEMEN WEBHOOK:
   waapi send <id> <to> <text> [--wait] [--idem KEY]  Kirim pesan teks lewat durable outbox
   waapi health <id> [--json]                   Lihat skor kesehatan akun Guardian, kuota & faktor
   waapi context <id> on|off|purge [opsi]       Kelola context store FTS5 opt-in per instance
+  waapi mcp [--key KEY_ID] [--max-inflight 8]  Bridge MCP stdio ke control.sock (/control/mcp)
 
 DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon

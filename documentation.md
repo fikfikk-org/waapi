@@ -102,6 +102,13 @@ flowchart TD
         CSON -->|"revoke pesan"| CSDEL["hapus baris + trigger FTS5 + sync chat"]
         CSON -->|"prune (cap/max_age) / context off --purge"| CSOFF
     end
+    subgraph MCPServer
+        M0["Lazy init (0 goroutine sebelum request pertama)"] -->|"request pertama ke /mcp atau /control/mcp"| M1["Server MCP stateless 2026-07-28 & 2025-11-25"]
+        M1 -->|"Origin & scope mcp lolos"| M2["Read (penanda untrusted) / Outbox origin=mcp"]
+        M2 -->|"first_contact=ask atau destructive=ask"| M3["MRTR InputRequired (-32042) token HMAC 5m"]
+        M3 -->|"disetujui + token valid"| M2
+        M1 -->|"subscribe resource (maks 32 URI)"| M4["Fanout journal aktif selama subscriber > 0"]
+    end
 ```
 
 ## Aturan per Entitas
@@ -270,6 +277,17 @@ flowchart TD
 | Auto-recycle & `recycle_at` | `Red >= 10m` + `WAAPI_AUTO_RECYCLE=on` me-recycle 1 instance round-robin (`>= 6j`/instance, cooldown `30m`); `recycle_at` (`HH:MM` lokal) jalan 1x/hari | Keduanya melewatkan instance dengan job `sending`; `recycle_at` juga melewatkan instance dengan aktivitas masuk/keluar dalam `5 menit` terakhir (dilewati untuk hari itu) |
 | Eksperimen pageout & THP | `WAAPI_PAGEOUT_AFTER_BOOT` (`off` default) hanya menyentuh mapping `r-xp`/`r--p` binary setelah 90s; `GODEBUG=disablethp=1` nonaktif default | `waapi doctor --deep` memberi rekomendasi `GODEBUG=disablethp=1` jika THP host terdeteksi `always` |
 
+### MCP Server Stateless (`POST /mcp` & `/control/mcp`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| Aktivasi & lazy init | `WAAPI_MCP=on` (default; `off` -> `404 mcp_disabled`), inisialisasi `*mcp.Server` ditunda hingga request pertama, `MaxRequestBodyBytes` `1 MiB`, semafor `8` request konkuren (`429 mcp_overloaded`) | Tanpa request MCP pertama = `0` goroutine MCP |
+| Validasi Origin & Host | Request tanpa header `Origin` (CLI/SDK/curl) diizinkan; jika header `Origin` dikirim, wajib cocok eksak (`scheme://host[:port]`) dengan `WAAPI_MCP_ALLOWED_ORIGINS` (kosong = `403 origin_forbidden`) | `DisableLocalhostProtection: true` agar aman di belakang reverse proxy TLS |
+| Propagasi Principal | Middleware HTTP menghapus paksa header eksternal `X-Waapi-Principal` lalu menerbitkan token nonce acak sekali pakai pasca-auth ke context `*auth.KeyMeta` | `/control/mcp` menerima `X-Waapi-Key-Id` opsional atau default operator lokal (`first_contact: ask`, `destructive: ask`) |
+| 15 Tool & Filter Policy | `list_instances`, `get_health`, `list_chats`, `get_conversation`, `search_messages`, `get_events`, `check_numbers`, `get_message_status`, `list_groups`, `get_group_info`, `send_message`, `react_message`, `mark_read`, `revoke_message`, `manage_group_participants` | Middleware `tools/list` & `tools/call` menyaring terhadap `KeyPolicy.Tools` (kosong = seluruh 10 `readOnly` + `send_message`, `react_message`, `mark_read`) |
+| Outbox, Untrusted & MRTR | Semua aksi kirim wajib melewati `outbox.Enqueue` (`Origin{Kind: "mcp"}`); pesan eksternal ditandai `untrusted: true`; `first_contact: ask` (`send_message`) dan `destructive: ask` (`revoke_message`, `manage_group_participants` `remove`) menuntut elisitasi atau `approval_token` HMAC-SHA256 (secret acak 32 byte, TTL `5m`, kode `-32042`) | Token terikat key ID, tool, instance, target, dan hash argumen |
+| Resource & Subscriptions | Template `waapi://instances/{instance}/chats/{+chat}` & `waapi://instances/{instance}/health`; `SubscribeHandler` + `subscriptions/listen` dibatasi maks `32` URI global | Fanout `journal.Subscribe` hanya aktif selama URI langganan > `0` |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -385,4 +403,5 @@ flowchart TD
 | Admission control & hardening governor | Pada level `Red`, endpoint berat (`POST /pair`, SSE `events/stream`, unggah/unduh media v1/v2, serta `POST /v2/messages` dengan `media.url`) ditolak `503 memory_pressure` (`Retry-After: 15`) dan `/readyz` kembali `503 not_ready`; kirim teks biasa & media `upload_id` tetap diizinkan; unit systemd menyertakan profil `lean` default serta skrip burn-in `scripts/burnin.sh` |
 | Penegakan Scope, Policy, Bearer & 5xx | REST API mendukung `Authorization: Bearer` setara `X-API-Key`, meneruskan `X-Request-Id` ke respons + `error.request_id`, menegakkan scope & rate limit per key, menyaring pengiriman outbox & aksi destruktif grup (`revoke`, `remove`, `leave`) via `PolicyChecker`, dan memastikan respons `5xx` memakai pesan generik tanpa detail error internal |
 | Pencatatan & pencarian Context Store FTS5 | Jika `context_store` aktif, pesan masuk ditulis atomik via `RecordHook` (`Journal.Append`), pesan keluar dicatat saat `StatusSent` di outbox, lookup `Quoted` memprioritaskan context store sebelum journal, pencarian FTS5 membungkus setiap token dengan tanda kutip ganda (opsional `prefix=true`), dan paginasi memakai cursor komposit `<ts>:<id>` / `<ts>:<chat>` kompatibel `<ts>` |
+| Keamanan & eksekusi MCP 2026-07-28 | Tanpa tool eksekusi OS/baca berkas lokal; semua aksi kirim MCP melalui `outbox.Enqueue` (`Origin{Kind: "mcp"}`) dengan penegakan `Guardian` & `KeyPolicy`; cache publik `30s` hanya untuk `server/discover` sedangkan operasi baca lain bertanda `private`; bridge `waapi mcp` meneruskan JSON-RPC stdio -> UDS dengan batas `1 MiB`/baris & konkurensi default `8` |
 

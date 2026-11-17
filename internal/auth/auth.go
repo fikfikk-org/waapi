@@ -28,6 +28,25 @@ var (
 	ErrKeyExpired = errors.New("API key telah kedaluwarsa")
 )
 
+type keyMetaCtxKey struct{}
+
+// WithKeyMeta menyisipkan metadata principal API key ke context request.
+func WithKeyMeta(ctx context.Context, km *KeyMeta) context.Context {
+	if km == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, keyMetaCtxKey{}, km)
+}
+
+// KeyMetaFromContext mengambil metadata principal API key dari context bila tersedia.
+func KeyMetaFromContext(ctx context.Context) (*KeyMeta, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	km, ok := ctx.Value(keyMetaCtxKey{}).(*KeyMeta)
+	return km, ok && km != nil
+}
+
 // CreateKeyRequest mengatur opsi pembuatan API key v2.
 type CreateKeyRequest struct {
 	Name       string
@@ -349,6 +368,23 @@ func (m *Manager) LookupPolicy(keyID string) (KeyPolicy, bool) {
 		return KeyPolicy{}, false
 	}
 	return km.Policy, true
+}
+
+// LookupByID mengembalikan KeyMeta aktif berdasarkan ID key untuk kontrol lokal atau validasi principal.
+func (m *Manager) LookupByID(keyID string) (*KeyMeta, error) {
+	if m == nil || keyID == "" {
+		return nil, ErrUnauthorized
+	}
+	m.mu.RLock()
+	km, ok := m.byID[keyID]
+	m.mu.RUnlock()
+	if !ok || km == nil {
+		return nil, ErrUnauthorized
+	}
+	if !km.ExpiresAt.IsZero() && !time.Now().Before(km.ExpiresAt) {
+		return nil, ErrKeyExpired
+	}
+	return km, nil
 }
 
 // AllowedInstance memeriksa apakah key berhak mengakses instanceID tertentu.

@@ -40,6 +40,14 @@ func NewClient(sock string) *Client {
 	}
 }
 
+// HTTPClient mengembalikan *http.Client yang terhubung ke control.sock untuk bridge streaming.
+func (c *Client) HTTPClient() *http.Client {
+	if c == nil {
+		return nil
+	}
+	return c.http
+}
+
 // DoJSON mengirim request JSON ke control socket dan men-decode hasilnya ke out.
 func (c *Client) DoJSON(ctx context.Context, method, path string, in, out any) error {
 	var body io.Reader

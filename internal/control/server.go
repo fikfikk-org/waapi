@@ -24,6 +24,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/guardian"
 	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
+	"github.com/fikfikk-org/waapi/internal/mcpserver"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/outbox"
 	"github.com/fikfikk-org/waapi/internal/store"
@@ -104,6 +105,15 @@ func WithContextStore(cs *ctxstore.Store) ServerOption {
 	}
 }
 
+// WithMCP memasang server MCP ke control plane untuk endpoint /control/mcp.
+func WithMCP(ms *mcpserver.Server) ServerOption {
+	return func(s *Server) {
+		if ms != nil {
+			s.mcpSrv = ms
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -119,6 +129,7 @@ type Server struct {
 	gov        governor.Source
 	audit      *auth.AuditLog
 	ctxStore   *ctxstore.Store
+	mcpSrv     *mcpserver.Server
 	startedAt  time.Time
 	version    string
 }
@@ -227,6 +238,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /control/instances/{id}/messages", s.handleSendMessage)
 	mux.HandleFunc("POST /control/instances/{id}/context", s.handleContextToggle)
 	mux.HandleFunc("POST /control/instances/{id}/context/purge", s.handleContextPurge)
+	mux.HandleFunc("/control/mcp", s.handleMCP)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
 	pprofMux := http.NewServeMux()
@@ -753,6 +765,14 @@ func (s *Server) handleGetHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rep)
+}
+
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if s.mcpSrv == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("layanan MCP belum aktif"))
+		return
+	}
+	s.mcpSrv.ControlHandler().ServeHTTP(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

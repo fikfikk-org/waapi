@@ -602,6 +602,15 @@ func (m *Manager) PollStore() *PollStore {
 	return m.pollStore
 }
 
+// CheckNumbers memeriksa apakah daftar nomor terdaftar di WhatsApp untuk instance terkait.
+func (m *Manager) CheckNumbers(ctx context.Context, instanceID string, numbers []string) ([]NumberCheckResult, error) {
+	inst, ok := m.Get(instanceID)
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return inst.CheckNumbers(ctx, numbers)
+}
+
 // MarkRead menandai satu atau lebih pesan chat telah dibaca atau diputar (played).
 func (m *Manager) MarkRead(ctx context.Context, instanceID string, chat, sender types.JID, ids []types.MessageID, played bool) error {
 	inst, ok := m.Get(instanceID)
