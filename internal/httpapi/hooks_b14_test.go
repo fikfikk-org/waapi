@@ -142,6 +142,14 @@ func TestV2HooksAPI_CRUDDryRunDanTrustedGuard(t *testing.T) {
 		t.Fatalf("PUT lewat REST wajib menurunkan trusted=0, got=%+v err=%v", saved, err)
 	}
 
+	// 6b. POST ai_reply saat WAAPI_AI_BASE_URL kosong wajib ditolak seketika
+	recAIDisabled := doReq(http.MethodPost, "/v2/instances/sales/hooks", `{
+		"id":"cs-ai-disabled","on":["message"],"do":[{"action":"ai_reply","system":"CS"}]
+	}`)
+	if recAIDisabled.Code != http.StatusBadRequest || !strings.Contains(recAIDisabled.Body.String(), "WAAPI_AI_BASE_URL") {
+		t.Fatalf("POST ai_reply tanpa WAAPI_AI_BASE_URL wajib 400: %d (%s)", recAIDisabled.Code, recAIDisabled.Body.String())
+	}
+
 	// 7. DELETE
 	recDel := doReq(http.MethodDelete, "/v2/instances/sales/hooks/faq-jam", "")
 	if recDel.Code != http.StatusOK {

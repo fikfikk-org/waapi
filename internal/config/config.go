@@ -295,6 +295,8 @@ func (c *Config) Normalize() {
 	if c.MCP == "" {
 		c.MCP = "on"
 	}
+	c.AIBaseURL = strings.TrimRight(strings.TrimSpace(c.AIBaseURL), "/")
+	c.AIModel = strings.TrimSpace(c.AIModel)
 	if c.AITimeout <= 0 {
 		c.AITimeout = 20 * time.Second
 	}

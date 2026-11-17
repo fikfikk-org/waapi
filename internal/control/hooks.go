@@ -93,7 +93,10 @@ func (s *Server) handleUpsertHook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Control plane mengizinkan trusted=true (boleh http ke 127.0.0.1 / localhost).
-	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{Trusted: true})
+	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{
+		Trusted:   true,
+		AIEnabled: s.hooks != nil && s.hooks.AIEnabled(),
+	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -257,7 +260,10 @@ func (s *Server) handleTestHookDryRun(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		comp, err = hooks.CompileWithOptions(rule, hooks.CompileOptions{Trusted: true})
+		comp, err = hooks.CompileWithOptions(rule, hooks.CompileOptions{
+			Trusted:   true,
+			AIEnabled: s.hooks != nil && s.hooks.AIEnabled(),
+		})
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return
@@ -278,7 +284,10 @@ func (s *Server) handleTestHookDryRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rule.ID = rec.ID
-		comp, err = hooks.CompileWithOptions(rule, hooks.CompileOptions{Trusted: rec.Trusted})
+		comp, err = hooks.CompileWithOptions(rule, hooks.CompileOptions{
+			Trusted:   rec.Trusted,
+			AIEnabled: s.hooks != nil && s.hooks.AIEnabled(),
+		})
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/ai"
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/control"
@@ -312,6 +313,15 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		},
 	})
 
+	// Client AI bernilai nil tanpa alokasi saat WAAPI_AI_BASE_URL kosong.
+	aiCli := ai.NewClient(ai.Config{
+		BaseURL:        cfg.AIBaseURL,
+		APIKey:         cfg.AIAPIKey,
+		Model:          cfg.AIModel,
+		Timeout:        cfg.AITimeout,
+		MaxConcurrency: cfg.AIMaxConcurrency,
+	})
+
 	hooksEng := hooks.NewEngine(hooks.EngineDeps{
 		AppStore: st,
 		Journal:  j,
@@ -320,6 +330,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		CtxStore: ctxStore,
 		Targets:  tc,
 		Governor: gov,
+		AI:       aiCli,
 	})
 	whSvc.SetGate(hooksEng.Gate())
 	hooksEng.Start(ctx)

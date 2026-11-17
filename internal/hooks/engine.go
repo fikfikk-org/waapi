@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/ai"
 	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/jid"
@@ -90,6 +91,7 @@ type EngineDeps struct {
 	Targets           WebhookTargetReader
 	Governor          governor.Source
 	Settings          InstanceSettingsReader
+	AI                *ai.Client
 	HTTPClientFactory func(trusted bool, timeout time.Duration) *http.Client
 	Now               func() time.Time
 }
@@ -135,6 +137,7 @@ type Engine struct {
 	targets  WebhookTargetReader
 	gov      governor.Source
 	settings InstanceSettingsReader
+	ai       *ai.Client
 	httpFact func(trusted bool, timeout time.Duration) *http.Client
 	now      func() time.Time
 
@@ -187,11 +190,17 @@ func NewEngine(deps EngineDeps) *Engine {
 		targets:  deps.Targets,
 		gov:      gov,
 		settings: settings,
+		ai:       deps.AI,
 		httpFact: httpFact,
 		now:      nowFn,
 		gate:     NewGate(runs, nowFn),
 		runtimes: make(map[string]*instanceRuntime),
 	}
+}
+
+// AIEnabled mengembalikan true bila client OpenAI-compatible aktif dikonfigurasi.
+func (e *Engine) AIEnabled() bool {
+	return e != nil && e.ai != nil
 }
 
 // Gate mengembalikan implementasi webhook.Gate untuk disambungkan ke deliverer webhook v2.
@@ -276,7 +285,7 @@ func (e *Engine) ReloadInstance(ctx context.Context, instanceID string) error {
 		if !r.IsEnabled() {
 			continue
 		}
-		c, cErr := CompileWithOptions(r, CompileOptions{Trusted: r.Trusted})
+		c, cErr := CompileWithOptions(r, CompileOptions{Trusted: r.Trusted, AIEnabled: e.AIEnabled()})
 		if cErr != nil {
 			slog.Warn("mengabaikan rule hook rusak saat reload", "instance", instanceID, "hook", r.ID, "err", cErr)
 			continue
@@ -500,12 +509,13 @@ func (e *Engine) processWithRuntime(ctx context.Context, rt *instanceRuntime, in
 		return nil
 	}
 
+	takeoverDur := settings.TakeoverPause.Duration()
+	if takeoverDur <= 0 {
+		takeoverDur = 30 * time.Minute
+	}
+
 	// Catat human takeover jika ada pesan from_me dari perangkat lain yang wa_id-nya tidak terdaftar di outbox.
 	if ev.Type == "message" && view.FromMe && !view.Offline && ev.WAID != "" && view.Chat != "" && e.outbox != nil {
-		takeoverDur := settings.TakeoverPause.Duration()
-		if takeoverDur <= 0 {
-			takeoverDur = 30 * time.Minute
-		}
 		if ev.ReceivedAt == 0 || now.Sub(time.UnixMilli(ev.ReceivedAt)) <= takeoverDur {
 			fromOutbox, checkErr := e.outbox.HasWAID(ctx, instanceID, ev.WAID)
 			if checkErr == nil && !fromOutbox {
@@ -547,6 +557,7 @@ func (e *Engine) processWithRuntime(ctx context.Context, rt *instanceRuntime, in
 			}
 		}
 
+		handoff := false
 		if !isReplay {
 			if isStale {
 				e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "skipped_stale", "", false, now)
@@ -559,11 +570,31 @@ func (e *Engine) processWithRuntime(ctx context.Context, rt *instanceRuntime, in
 			if !c.Match(view) {
 				continue
 			}
+			if c.HasAI && !view.FromMe && view.Chat != "" && matchesHandoffKeyword(view.Text, settings.AIHandoffKeywords) {
+				handoff = true
+				rt.setTakeoverUntil(view.Chat, now.Add(takeoverDur))
+				if !c.HasNonAIActions {
+					e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "skipped_takeover", "handoff", false, now)
+					continue
+				}
+			}
 			if c.Heavy && e.gov != nil && e.gov.Level() == governor.Red {
 				e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "skipped_pressure", "", false, now)
+				if c.HasAI && !handoff {
+					e.sendAIFallbackUnderPressure(ctx, instanceID, c, ev.Seq, view)
+				}
 				continue
 			}
-			if c.StaticSends > 0 && !rt.canAffordSendQuota(now, c.StaticSends) {
+			needQuota := c.StaticSends
+			if handoff && c.HasAI {
+				needQuota = 0
+				for _, ca := range c.Actions {
+					if ca.raw.Action == "reply" || ca.raw.Action == "send" || ca.raw.Action == "react" {
+						needQuota++
+					}
+				}
+			}
+			if needQuota > 0 && !rt.canAffordSendQuota(now, needQuota) {
 				e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "throttled", "instance_quota", false, now)
 				continue
 			}
@@ -571,19 +602,21 @@ func (e *Engine) processWithRuntime(ctx context.Context, rt *instanceRuntime, in
 				e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "throttled", "per_chat", false, now)
 				continue
 			}
-			if c.StaticSends > 0 {
-				rt.recordSendQuota(now, c.StaticSends)
+			if needQuota > 0 {
+				rt.recordSendQuota(now, needQuota)
 			}
 			e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "matched", "", false, now)
+		} else if c.HasAI && !view.FromMe && matchesHandoffKeyword(view.Text, settings.AIHandoffKeywords) {
+			handoff = true
 		}
 
-		suppressed, execErr := e.executeRuleActions(ctx, rt, instanceID, c, ev, view, loc, now, isReplay)
+		suppressed, execDetail, execErr := e.executeRuleActions(ctx, rt, instanceID, c, ev, view, loc, now, isReplay, handoff)
 		if execErr != nil {
 			e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "error", execErr.Error(), suppressed, now)
 			// Sesuai kontrak HTTPTimeout: error pada rule tidak menghentikan evaluasi rule berikutnya walau stop=true.
 			continue
 		}
-		e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "done", "", suppressed, now)
+		e.writeRun(ctx, instanceID, ev.Seq, c.Rule.ID, "done", execDetail, suppressed, now)
 		if c.Rule.Stop {
 			break
 		}
@@ -651,6 +684,9 @@ func (e *Engine) DryRun(ctx context.Context, instanceID string, c *Compiled, ev 
 			da.To = view.Chat
 		case "http":
 			da.URL = a.URL
+		case "ai_reply":
+			da.To = view.Chat
+			da.Text = a.FallbackText
 		}
 		actions = append(actions, da)
 	}
@@ -702,7 +738,12 @@ func (e *Engine) executeRuleActions(
 	loc *time.Location,
 	now time.Time,
 	isReplay bool,
-) (suppressed bool, err error) {
+	skipAI bool,
+) (suppressed bool, detail string, err error) {
+	if skipAI {
+		detail = "handoff"
+	}
+	aiOrd := 0
 	for idx, ca := range c.Actions {
 		a := ca.raw
 		idemBase := fmt.Sprintf("hook:%s:%d:%d", c.Rule.ID, ev.Seq, idx)
@@ -711,10 +752,10 @@ func (e *Engine) executeRuleActions(
 		switch a.Action {
 		case "reply":
 			if view.Chat == "" {
-				return suppressed, errors.New("event tidak memiliki target chat")
+				return suppressed, detail, errors.New("event tidak memiliki target chat")
 			}
 			if e.outbox == nil {
-				return suppressed, errors.New("service outbox belum siap")
+				return suppressed, detail, errors.New("service outbox belum siap")
 			}
 			spec := outbox.Spec{
 				Type:   "text",
@@ -732,20 +773,20 @@ func (e *Engine) executeRuleActions(
 				Origin:     origin,
 			}
 			if _, _, err := e.outbox.Enqueue(ctx, req); err != nil {
-				return suppressed, err
+				return suppressed, detail, err
 			}
 
 		case "send":
 			if e.outbox == nil {
-				return suppressed, errors.New("service outbox belum siap")
+				return suppressed, detail, errors.New("service outbox belum siap")
 			}
 			toStr := strings.TrimSpace(RenderTemplate(a.To, view, loc, now))
 			if toStr == "" {
-				return suppressed, errors.New("target send hasil template kosong")
+				return suppressed, detail, errors.New("target send hasil template kosong")
 			}
 			if ca.toHasTmpl {
 				if _, jErr := jid.ParseRecipient(toStr); jErr != nil {
-					return suppressed, fmt.Errorf("target send hasil template tidak valid: %w", jErr)
+					return suppressed, detail, fmt.Errorf("target send hasil template tidak valid: %w", jErr)
 				}
 			}
 			if _, _, err := e.outbox.Enqueue(ctx, outbox.EnqueueRequest{
@@ -758,15 +799,15 @@ func (e *Engine) executeRuleActions(
 				},
 				Origin: origin,
 			}); err != nil {
-				return suppressed, err
+				return suppressed, detail, err
 			}
 
 		case "react":
 			if view.Chat == "" || view.WAID == "" {
-				return suppressed, errors.New("event tidak memiliki target pesan untuk reaksi")
+				return suppressed, detail, errors.New("event tidak memiliki target pesan untuk reaksi")
 			}
 			if e.outbox == nil {
-				return suppressed, errors.New("service outbox belum siap")
+				return suppressed, detail, errors.New("service outbox belum siap")
 			}
 			if _, _, err := e.outbox.Enqueue(ctx, outbox.EnqueueRequest{
 				InstanceID: instanceID,
@@ -782,7 +823,7 @@ func (e *Engine) executeRuleActions(
 				},
 				Origin: origin,
 			}); err != nil {
-				return suppressed, err
+				return suppressed, detail, err
 			}
 
 		case "mark_read":
@@ -794,7 +835,7 @@ func (e *Engine) executeRuleActions(
 						senderJID, _ = types.ParseJID(view.Sender)
 					}
 					if err := e.wa.MarkRead(ctx, instanceID, chatJID, senderJID, []types.MessageID{types.MessageID(view.WAID)}, false); err != nil {
-						return suppressed, err
+						return suppressed, detail, err
 					}
 				}
 			}
@@ -810,11 +851,25 @@ func (e *Engine) executeRuleActions(
 				e.gate.MarkSuppressed(instanceID, ev.Seq)
 			}
 			if hErr != nil {
-				return suppressed, hErr
+				return suppressed, detail, hErr
+			}
+
+		case "ai_reply":
+			ord := aiOrd
+			aiOrd++
+			if skipAI {
+				continue
+			}
+			usedFB, aiErr := e.executeAIAction(ctx, instanceID, c, a, ev, view, ord)
+			if aiErr != nil {
+				return suppressed, detail, aiErr
+			}
+			if usedFB && detail == "" {
+				detail = "fallback"
 			}
 		}
 	}
-	return suppressed, nil
+	return suppressed, detail, nil
 }
 
 func (e *Engine) executeHTTPAction(

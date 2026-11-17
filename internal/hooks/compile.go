@@ -17,9 +17,10 @@ import (
 
 var hookIDRegex = regexp.MustCompile(`^[a-z0-9_-]{1,40}$`)
 
-// CompileOptions mengendalikan hak istimewa saat mengompilasi rule hook.
+// CompileOptions mengendalikan hak istimewa serta ketersediaan subsistem saat mengompilasi rule hook.
 type CompileOptions struct {
-	Trusted bool // true khusus rule dari control plane (CLI/UDS); false memaksa batas SSRF REST publik
+	Trusted   bool // true khusus rule dari control plane (CLI/UDS); false memaksa batas SSRF REST publik
+	AIEnabled bool // true apabila WAAPI_AI_BASE_URL aktif dikonfigurasi
 }
 
 type fieldKind uint8
@@ -169,19 +170,21 @@ type compiledAction struct {
 
 // Compiled menyimpan rule hasil validasi beserta AST kondisi & regex terkompilasi agar evaluasi cepat dan nol-alokasi.
 type Compiled struct {
-	Rule         Rule
-	Priority     int
-	Enabled      bool
-	RespectTake  bool
-	OnTypes      map[string]struct{}
-	HasWhen      bool
-	When         compiledCond
-	Actions      []compiledAction
-	Heavy        bool
-	CanSuppress  bool
-	StaticSends  int
-	Throttle     compiledThrottle
-	ActiveWindow activeHoursWindow
+	Rule            Rule
+	Priority        int
+	Enabled         bool
+	RespectTake     bool
+	OnTypes         map[string]struct{}
+	HasWhen         bool
+	When            compiledCond
+	Actions         []compiledAction
+	Heavy           bool
+	CanSuppress     bool
+	HasAI           bool
+	HasNonAIActions bool
+	StaticSends     int
+	Throttle        compiledThrottle
+	ActiveWindow    activeHoursWindow
 }
 
 // ParseRuleJSON membaca representasi JSON menjadi Rule dengan aman tanpa panic.
@@ -248,18 +251,23 @@ func CompileWithOptions(r Rule, opts CompileOptions) (*Compiled, error) {
 
 	comp.Actions = make([]compiledAction, 0, len(r.Do))
 	for i, a := range r.Do {
-		ca, heavy, suppresses, sends, err := compileAction(i, a, opts.Trusted)
+		ar, err := compileAction(i, a, opts)
 		if err != nil {
 			return nil, err
 		}
-		if heavy {
+		if ar.heavy {
 			comp.Heavy = true
 		}
-		if suppresses {
+		if ar.suppresses {
 			comp.CanSuppress = true
 		}
-		comp.StaticSends += sends
-		comp.Actions = append(comp.Actions, ca)
+		if ar.isAI {
+			comp.HasAI = true
+		} else {
+			comp.HasNonAIActions = true
+		}
+		comp.StaticSends += ar.staticSends
+		comp.Actions = append(comp.Actions, ar.ca)
 	}
 
 	if r.Throttle != nil && strings.TrimSpace(r.Throttle.PerChat) != "" {
@@ -442,51 +450,59 @@ func compileCondNode(c *Cond, depth int, path string, totalConds *int) (compiled
 	return leaf, nil
 }
 
-func compileAction(idx int, a Action, trusted bool) (ca compiledAction, heavy, suppresses bool, staticSends int, err error) {
+type actionCompileResult struct {
+	ca          compiledAction
+	heavy       bool
+	suppresses  bool
+	staticSends int
+	isAI        bool
+}
+
+func compileAction(idx int, a Action, opts CompileOptions) (res actionCompileResult, err error) {
 	prefix := fmt.Sprintf("do[%d]", idx)
-	ca.raw = a
+	ca := compiledAction{raw: a}
 	switch a.Action {
 	case "reply":
 		if err := validateTextBody(a.Text); err != nil {
-			return ca, false, false, 0, fmt.Errorf("%s.text: %w", prefix, err)
+			return res, fmt.Errorf("%s.text: %w", prefix, err)
 		}
-		return ca, true, false, 1, nil
+		return actionCompileResult{ca: ca, heavy: true, staticSends: 1}, nil
 	case "send":
 		toTrim := strings.TrimSpace(a.To)
 		if toTrim == "" {
-			return ca, false, false, 0, fmt.Errorf("%s.to: target penerima wajib diisi", prefix)
+			return res, fmt.Errorf("%s.to: target penerima wajib diisi", prefix)
 		}
 		if strings.Contains(toTrim, "{{") {
 			ca.toHasTmpl = true
 		} else if _, pErr := jid.ParseRecipient(toTrim); pErr != nil {
-			return ca, false, false, 0, fmt.Errorf("%s.to: format nomor/JID tidak valid: %w", prefix, pErr)
+			return res, fmt.Errorf("%s.to: format nomor/JID tidak valid: %w", prefix, pErr)
 		}
 		if err := validateTextBody(a.Text); err != nil {
-			return ca, false, false, 0, fmt.Errorf("%s.text: %w", prefix, err)
+			return res, fmt.Errorf("%s.text: %w", prefix, err)
 		}
-		return ca, true, false, 1, nil
+		return actionCompileResult{ca: ca, heavy: true, staticSends: 1}, nil
 	case "react":
 		em := strings.TrimSpace(a.Emoji)
 		if em == "" {
-			return ca, false, false, 0, fmt.Errorf("%s.emoji: emoji wajib diisi", prefix)
+			return res, fmt.Errorf("%s.emoji: emoji wajib diisi", prefix)
 		}
 		if utf8.RuneCountInString(em) > 16 {
-			return ca, false, false, 0, fmt.Errorf("%s.emoji: terlalu panjang", prefix)
+			return res, fmt.Errorf("%s.emoji: terlalu panjang", prefix)
 		}
-		return ca, true, false, 1, nil
+		return actionCompileResult{ca: ca, heavy: true, staticSends: 1}, nil
 	case "mark_read":
-		return ca, false, false, 0, nil
+		return actionCompileResult{ca: ca}, nil
 	case "suppress_webhook":
-		return ca, false, true, 0, nil
+		return actionCompileResult{ca: ca, suppresses: true}, nil
 	case "http":
 		if strings.TrimSpace(a.URL) == "" {
-			return ca, false, false, 0, fmt.Errorf("%s.url: URL endpoint wajib diisi", prefix)
+			return res, fmt.Errorf("%s.url: URL endpoint wajib diisi", prefix)
 		}
-		if _, urlErr := netguard.ValidateHookURL(a.URL, trusted); urlErr != nil {
-			return ca, false, false, 0, fmt.Errorf("%s.url: %w", prefix, urlErr)
+		if _, urlErr := netguard.ValidateHookURL(a.URL, opts.Trusted); urlErr != nil {
+			return res, fmt.Errorf("%s.url: %w", prefix, urlErr)
 		}
 		if a.TimeoutMs < 0 || a.TimeoutMs > MaxActionTimeoutMs {
-			return ca, false, false, 0, fmt.Errorf("%s.timeout_ms: harus berada antara 0 sampai %d ms", prefix, MaxActionTimeoutMs)
+			return res, fmt.Errorf("%s.timeout_ms: harus berada antara 0 sampai %d ms", prefix, MaxActionTimeoutMs)
 		}
 		toMs := a.TimeoutMs
 		if toMs == 0 {
@@ -496,13 +512,35 @@ func compileAction(idx int, a Action, trusted bool) (ca compiledAction, heavy, s
 		switch a.Include {
 		case "", "event", "conversation":
 		default:
-			return ca, false, false, 0, fmt.Errorf("%s.include: harus event atau conversation, didapat %q", prefix, a.Include)
+			return res, fmt.Errorf("%s.include: harus event atau conversation, didapat %q", prefix, a.Include)
 		}
-		return ca, true, a.ExpectReply, 0, nil
+		return actionCompileResult{ca: ca, heavy: true, suppresses: a.ExpectReply}, nil
+	case "ai_reply":
+		if !opts.AIEnabled {
+			return res, fmt.Errorf("%s.action: aksi ai_reply nonaktif (setel WAAPI_AI_BASE_URL untuk mengaktifkan)", prefix)
+		}
+		if a.ContextMessages < 0 || a.ContextMessages > MaxAIContextMessages {
+			return res, fmt.Errorf("%s.context_messages: harus berada antara 0 sampai %d", prefix, MaxAIContextMessages)
+		}
+		if a.MaxTokens < 0 || a.MaxTokens > MaxAITokens {
+			return res, fmt.Errorf("%s.max_tokens: harus berada antara 0 sampai %d", prefix, MaxAITokens)
+		}
+		if a.Temperature != nil {
+			temp := *a.Temperature
+			if math.IsNaN(temp) || math.IsInf(temp, 0) || temp < 0 || temp > 2 {
+				return res, fmt.Errorf("%s.temperature: harus berada antara 0 sampai 2", prefix)
+			}
+		}
+		if utf8.RuneCountInString(a.FallbackText) > aiReplyFallbackMaxRunes {
+			return res, fmt.Errorf("%s.fallback_text: panjang maksimal %d karakter", prefix, aiReplyFallbackMaxRunes)
+		}
+		return actionCompileResult{ca: ca, heavy: true, staticSends: 1, isAI: true}, nil
 	default:
-		return ca, false, false, 0, fmt.Errorf("%s.action: aksi %q tidak dikenal", prefix, a.Action)
+		return res, fmt.Errorf("%s.action: aksi %q tidak dikenal", prefix, a.Action)
 	}
 }
+
+const aiReplyFallbackMaxRunes = 4096
 
 func validateTextBody(txt string) error {
 	if strings.TrimSpace(txt) == "" {

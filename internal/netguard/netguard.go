@@ -61,9 +61,10 @@ func mustParsePrefixes(list []string) []netip.Prefix {
 
 // Policy mengendalikan pengecualian akses host atau IP privat pada koneksi keluar.
 type Policy struct {
-	AllowPrivate      bool     // true hanya untuk URL yang dikonfigurasi operator (webhook, AI base URL)
-	AllowLoopbackHTTP bool     // true khusus rule hooks trusted: izinkan HTTP/HTTPS ke host loopback murni
-	AllowHosts        []string // pengecualian eksplisit host tertentu (pengujian)
+	AllowPrivate          bool          // true hanya untuk URL yang dikonfigurasi operator (webhook, AI base URL)
+	AllowLoopbackHTTP     bool          // true khusus rule hooks trusted: izinkan HTTP/HTTPS ke host loopback murni
+	AllowHosts            []string      // pengecualian eksplisit host tertentu (pengujian)
+	ResponseHeaderTimeout time.Duration // override opsional ResponseHeaderTimeout (default 15s)
 }
 
 // IsLoopbackHost melaporkan apakah host adalah loopback murni (localhost, 127.0.0.1, ::1).
@@ -202,12 +203,16 @@ func (p Policy) DialContext(ctx context.Context, network, addr string) (net.Conn
 
 // NewTransport membuat *http.Transport dengan pool idle terkelola dan dialer anti-SSRF.
 func NewTransport(p Policy) *http.Transport {
+	hdrTimeout := p.ResponseHeaderTimeout
+	if hdrTimeout <= 0 {
+		hdrTimeout = 15 * time.Second
+	}
 	return &http.Transport{
 		DialContext:           p.DialContext,
 		IdleConnTimeout:       30 * time.Second,
 		MaxIdleConnsPerHost:   2,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		ResponseHeaderTimeout: hdrTimeout,
 		ForceAttemptHTTP2:     true,
 	}
 }

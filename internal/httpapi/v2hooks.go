@@ -134,7 +134,10 @@ func (s *Server) handleV2CreateHook(w http.ResponseWriter, r *http.Request, _ *w
 
 	// REST API wajib selalu memaksa Trusted: false meskipun body JSON mengirim trusted=true.
 	rule.Trusted = false
-	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{Trusted: false})
+	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{
+		Trusted:   false,
+		AIEnabled: s.hooks != nil && s.hooks.AIEnabled(),
+	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error(), 0)
 		return
@@ -198,7 +201,10 @@ func (s *Server) handleV2UpdateHook(w http.ResponseWriter, r *http.Request, _ *w
 
 	// Setiap pembaruan lewat HTTP REST wajib menurunkan trusted=0 agar tidak bisa menginjeksi URL lokal.
 	rule.Trusted = false
-	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{Trusted: false})
+	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{
+		Trusted:   false,
+		AIEnabled: s.hooks != nil && s.hooks.AIEnabled(),
+	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error(), 0)
 		return
@@ -298,7 +304,10 @@ func (s *Server) handleV2TestHook(w http.ResponseWriter, r *http.Request, _ *wa.
 		return
 	}
 	rule.ID = rec.ID
-	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{Trusted: rec.Trusted})
+	comp, err := hooks.CompileWithOptions(rule, hooks.CompileOptions{
+		Trusted:   rec.Trusted,
+		AIEnabled: s.hooks != nil && s.hooks.AIEnabled(),
+	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error(), 0)
 		return

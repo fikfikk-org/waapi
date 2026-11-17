@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestConfig_NormalizeNilaiNol memastikan Normalize mengisi default profil lean untuk field bernilai nol.
@@ -47,5 +48,32 @@ func TestConfig_DurasiTidakValid(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "WAAPI_OUTBOX_TTL") {
 		t.Fatalf("pesan error seharusnya menyebut WAAPI_OUTBOX_TTL, didapat: %v", err)
+	}
+}
+
+// TestConfig_AIDefaultDanNormalisasi memastikan env WAAPI_AI_* memiliki default aman serta pembersihan trailing slash Base URL.
+func TestConfig_AIDefaultDanNormalisasi(t *testing.T) {
+	t.Setenv("WAAPI_AI_BASE_URL", " http://127.0.0.1:11434/v1/ ")
+	t.Setenv("WAAPI_AI_API_KEY", "sk-rahasia")
+	t.Setenv("WAAPI_AI_MODEL", " qwen2.5:7b ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load dengan env WAAPI_AI_* gagal: %v", err)
+	}
+	if cfg.AIBaseURL != "http://127.0.0.1:11434/v1" {
+		t.Fatalf("AIBaseURL diharapkan tanpa trailing slash, didapat %q", cfg.AIBaseURL)
+	}
+	if cfg.AIAPIKey != "sk-rahasia" || cfg.AIModel != "qwen2.5:7b" {
+		t.Fatalf("AIAPIKey/AIModel tidak sesuai: key=%q model=%q", cfg.AIAPIKey, cfg.AIModel)
+	}
+	if cfg.AITimeout != 20*time.Second || cfg.AIMaxConcurrency != 2 {
+		t.Fatalf("default AI tidak sesuai: timeout=%v conc=%d", cfg.AITimeout, cfg.AIMaxConcurrency)
+	}
+
+	var zero Config
+	zero.Normalize()
+	if zero.AITimeout != 20*time.Second || zero.AIMaxConcurrency != 2 || zero.AIBaseURL != "" {
+		t.Fatalf("Normalize nilai nol AI tidak sesuai: %+v", zero)
 	}
 }

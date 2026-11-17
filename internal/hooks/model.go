@@ -24,6 +24,12 @@ const (
 	GateWaitTimeout         = 10 * time.Second
 	DefaultConversationMsgs = 20
 	DefaultHookRunsKeep     = 7 * 24 * time.Hour
+
+	MaxAIContextMessages     = 30
+	DefaultAIContextMessages = 10
+	MaxAITokens              = 1024
+	DefaultAIMaxTokens       = 300
+	DefaultAITemperature     = 0.3
 )
 
 // Rule merepresentasikan spesifikasi JSON satu rule deklaratif reactive hooks.
@@ -73,16 +79,30 @@ type Cond struct {
 
 // Action merepresentasikan satu aksi deklaratif yang dijalankan saat rule cocok.
 type Action struct {
-	Action      string `json:"action"`
-	Text        string `json:"text,omitempty"`
-	Quote       bool   `json:"quote,omitempty"`
-	Typing      bool   `json:"typing,omitempty"`
-	To          string `json:"to,omitempty"`
-	Emoji       string `json:"emoji,omitempty"`
-	URL         string `json:"url,omitempty"`
-	TimeoutMs   int    `json:"timeout_ms,omitempty"`
-	Include     string `json:"include,omitempty"`
-	ExpectReply bool   `json:"expect_reply,omitempty"`
+	Action          string   `json:"action"`
+	Text            string   `json:"text,omitempty"`
+	Quote           bool     `json:"quote,omitempty"`
+	Typing          bool     `json:"typing,omitempty"`
+	To              string   `json:"to,omitempty"`
+	Emoji           string   `json:"emoji,omitempty"`
+	URL             string   `json:"url,omitempty"`
+	TimeoutMs       int      `json:"timeout_ms,omitempty"`
+	Include         string   `json:"include,omitempty"`
+	ExpectReply     bool     `json:"expect_reply,omitempty"`
+	System          string   `json:"system,omitempty"`
+	ContextMessages int      `json:"context_messages,omitempty"`
+	MaxTokens       int      `json:"max_tokens,omitempty"`
+	Temperature     *float64 `json:"temperature,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	FallbackText    string   `json:"fallback_text,omitempty"`
+}
+
+// EffectiveTemperature mengembalikan nilai temperature ai_reply dengan bawaan 0.3 saat tidak diisi.
+func (a Action) EffectiveTemperature() float64 {
+	if a.Temperature == nil {
+		return DefaultAITemperature
+	}
+	return *a.Temperature
 }
 
 // Throttle mengatur batas laju eksekusi rule per chat (mis. "1/6h").

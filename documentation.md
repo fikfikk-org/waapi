@@ -117,6 +117,13 @@ flowchart TD
         HK1 -->|"lolos & cocok when"| HK5["Tulis matched -> Outbox/HTTP/MarkRead/Suppress -> done/error"]
         HK5 -->|"commit cursor + sinyal Gate"| HK6["Webhook Gate lanjut atau suppress (fail-open 10s)"]
     end
+    subgraph NativeAIResponder
+        AI0["WAAPI_AI_BASE_URL kosong (Client nil = 0 alokasi; ai_reply ditolak)"] -->|"WAAPI_AI_BASE_URL aktif"| AI1["Aksi ai_reply pada Reactive Hooks"]
+        AI1 -->|"ai_handoff_keywords cocok"| AI2["Aktifkan takeover chat; lewati AI & fallback; lanjut aksi non-AI"]
+        AI1 -->|"governor Red"| AI3["Catat skipped_pressure; kirim fallback_text bila terisi"]
+        AI1 -->|"lolos guard"| AI4["Rakit prompt (1000/8000 rune, dedupe trigger) -> Chat Completions (no tools)"]
+        AI4 -->|"balasan siap / fallback error"| AI5["Batas 4096 rune -> outbox.Enqueue (origin=ai, idempotent ai:<id>:<seq>)"]
+    end
 ```
 
 ## Aturan per Entitas
@@ -303,8 +310,18 @@ flowchart TD
 | Skema & Kompilasi Rule | JSON deklaratif (`id` slug `[a-z0-9_-]{1,40}`, `on`, `when` all/any/not & 19 field / 14 op, `do`, `throttle.per_chat`, `active_hours`, `respect_takeover` default `true`, `on_from_me`, `stop`) | Maks `64` kondisi, kedalaman `4`, regex `512` byte, `8` aksi, `50` rule/instance; error kompilasi menyebut path field persis |
 | Template & Aksi | `reply`, `send`, `react`, `mark_read`, `suppress_webhook`, `http`; substitusi `{{push_name}}`, `{{sender_pn}}`, `{{chat}}`, `{{text}}`, `{{date}}`, `{{time}}` memakai `strings.NewReplacer` (tanpa runtime script / `text/template`) | Seluruh `reply`/`send`/`react` wajib lewat `outbox.Enqueue` (`Origin{Kind: "hook"}`, `IdemKey: hook:<id>:<seq>:<n>`) |
 | Keamanan `trusted` & URL `http` | Rule dari control plane (`trusted=1`) boleh memanggil `http://` khusus loopback (`127.0.0.1`, `localhost`, `::1`); rule REST API selalu memaksa `trusted=0` (`https://` non-privat saja) termasuk saat `PUT` | IP privat LAN/CGNAT/link-local (`10.x`, `172.16.x`, `192.168.x`, `169.254.x`) selalu diblokir meski `trusted=1` |
-| Guard Bawaan & Pressure | Evaluasi per `priority` naik: `from_me` (jika `!on_from_me`), `active_hours`, Stale (`received_at > hooks_max_age` atau `offline` -> `skipped_stale`), Takeover (pesan `from_me` non-outbox mem-pause chat `takeover_pause` di LRU `4096` -> `skipped_takeover`), Pressure (saat `governor.Red`, aksi berat dilewati `skipped_pressure` sedangkan rule ringan `suppress_webhook`/`mark_read` tetap berjalan), Throttle LRU `4096` + kuota kirim `30/menit/instance` (`throttled`) | Jika rule gagal (`error`/`timeout_ms <= 5000`), rule berikutnya tetap dievaluasi meski `stop=true` |
+| Guard Bawaan & Pressure | Evaluasi per `priority` naik: `from_me` (jika `!on_from_me`), `active_hours`, Stale (`received_at > hooks_max_age` atau `offline` -> `skipped_stale`), Takeover (pesan `from_me` non-outbox mem-pause chat `takeover_pause` di LRU `4096` -> `skipped_takeover`), Pressure (saat `governor.Red`, aksi berat dilewati `skipped_pressure` kecuali `fallback_text` pada `ai_reply`, sedangkan rule ringan `suppress_webhook`/`mark_read` tetap berjalan), Throttle LRU `4096` + kuota kirim `30/menit/instance` (`throttled`) | Jika rule gagal (`error`/`timeout_ms <= 5000`), rule berikutnya tetap dievaluasi meski `stop=true` |
 | Replay & `Webhook Gate` | Status `matched` ditulis di `hook_runs` sebelum aksi lalu diperbarui ke `done`/`error`; Gate menahan delivery webhook hanya bila ada rule aktif `suppress_webhook` atau `http` ber-`expect_reply: true` (fail-open setelah `10s`) | Penanda `suppressed` tersimpan di memori dan `hook_runs` sehingga bertahan pasca-restart |
+
+### Native AI Responder (`internal/ai` & `ai_reply`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| Aktivasi & Konfigurasi Global | Dikonfigurasi via env: `WAAPI_AI_BASE_URL`, `WAAPI_AI_API_KEY`, `WAAPI_AI_MODEL`, `WAAPI_AI_TIMEOUT` (`20s`), `WAAPI_AI_MAX_CONCURRENCY` (`2`) | Bila `WAAPI_AI_BASE_URL` kosong, client bernilai `nil` (0 alokasi/goroutine) dan kompilasi rule `ai_reply` ditolak seketika; `WAAPI_AI_API_KEY` hanya di RAM/env (tidak pernah disimpan di DB atau log) |
+| Parameter Aksi `ai_reply` | `system`, `context_messages` (`0..30`, default `10`), `max_tokens` (`1..1024`, default `300`), `temperature` (`0..2`, default `0.3`), `model?`, `fallback_text?` (maks `4096` rune), `ai_handoff_keywords?` | Riwayat dari `ContextStore` di-dedupe terhadap `triggerWAID`; pesan grup diformat `[<sender>]: <text>` (riwayat dari nomor pengirim, pemicu dari `SenderName`) |
+| Prompt, Isolasi & Ukuran | Tanpa `tools`/function calling; `SecurityPromptSuffix` anti-injection ditambahkan otomatis pada peran `system`; maks `1000` rune/pesan dan total maks `8000` rune (riwayat tertua dibuang lebih dulu) | Pembacaan respons HTTP provider dibatasi `256 KiB` (`AllowPrivate: true` agar Ollama lokal `127.0.0.1:11434` didukung); balasan dipotong ke `4096` rune |
+| Guard Handoff & Pressure | Pencocokan batas kata case-insensitive `ai_handoff_keywords` pada `!from_me` menandai takeover chat selama `takeover_pause`, melewati AI & `fallback_text`, serta tetap mengeksekusi aksi non-AI lanjutan | Status `hook_runs`: `done` (`detail: handoff`) bila ada aksi lanjutan, atau `skipped_takeover` (`detail: handoff`) bila tidak ada; saat `governor.Red`, HTTP AI dilewati (`skipped_pressure`) namun `fallback_text` tetap diantrekan bila diisi |
+| Pengiriman Terjaga Guardian | Balasan AI maupun `fallback_text` (saat provider timeout/5xx/balasan kosong/governor Red) wajib melewati `outbox.Enqueue` (`Origin{Kind: "ai", KeyID: rule.ID}`, `IdemKey: ai:<id>:<seq>[:<n>]`) | Seluruh batasan Guardian (`restricted`, quiet hours, opt-out, rate limit) tetap berlaku tanpa jalur bypass |
 
 ## Transisi Status Instance
 
@@ -423,4 +440,5 @@ flowchart TD
 | Pencatatan & pencarian Context Store FTS5 | Jika `context_store` aktif, pesan masuk ditulis atomik via `RecordHook` (`Journal.Append`), pesan keluar dicatat saat `StatusSent` di outbox, lookup `Quoted` memprioritaskan context store sebelum journal, pencarian FTS5 membungkus setiap token dengan tanda kutip ganda (opsional `prefix=true`), dan paginasi memakai cursor komposit `<ts>:<id>` / `<ts>:<chat>` kompatibel `<ts>` |
 | Keamanan & eksekusi MCP 2026-07-28 | Tanpa tool eksekusi OS/baca berkas lokal; semua aksi kirim MCP melalui `outbox.Enqueue` (`Origin{Kind: "mcp"}`) dengan penegakan `Guardian` & `KeyPolicy`; cache publik `30s` hanya untuk `server/discover` sedangkan operasi baca lain bertanda `private`; bridge `waapi mcp` meneruskan JSON-RPC stdio -> UDS dengan batas `1 MiB`/baris & konkurensi default `8` |
 | Konsumen & isolasi goroutine Reactive Hooks | Engine hooks menjalankan satu worker berurutan per instance yang memiliki rule aktif (`0` rule aktif = `0` goroutine worker & cursor `hooks` dinonaktifkan agar pruning journal tidak terhambat); pruner tiap jam memangkas `hook_runs` > `7 hari` |
+| Responder AI native & privasi provider | Aksi `ai_reply` murni menghasilkan teks balasan ke chat yang sama via `outbox.Enqueue` tanpa tool calling maupun penyimpanan `WAAPI_AI_API_KEY` di DB/log; penggunaan provider LLM eksternal mengirim isi percakapan ke pihak ketiga sehingga instance sensitif disarankan memakai Ollama lokal |
 

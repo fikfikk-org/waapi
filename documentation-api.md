@@ -572,7 +572,7 @@
 | Query Params | - |
 | Request Body | `POST`: JSON `Rule` (`id`, `name?`, `enabled?`, `priority?`, `on`, `when?`, `do`, `throttle?`, `active_hours?`, `respect_takeover?`, `on_from_me?`, `stop?`) |
 | Response | `GET`: 200 `{ hooks: [...] }` · `POST`: 201 `HookDTO` (`trusted=false`) · 400 `invalid_spec` (menyebut path field) · 409 `hook_exists` · 422 `hooks_limit_reached` |
-| Notes | REST API selalu memaksa `trusted=false` (hanya `https://` publik non-privat yang diterima aksi `http`); batas `50` rule/instance |
+| Notes | REST API selalu memaksa `trusted=false` (hanya `https://` publik non-privat yang diterima aksi `http`); aksi `ai_reply` ditolak `400 invalid_spec` bila `WAAPI_AI_BASE_URL` kosong; batas `50` rule/instance |
 
 ## GET / PUT / DELETE /v2/instances/{id}/hooks/{hook_id}
 

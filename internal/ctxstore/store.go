@@ -105,6 +105,9 @@ type MessageItem struct {
 	QuotedID  string `json:"quoted_id"`
 }
 
+// Message adalah alias MessageItem untuk kontrak pembacaan riwayat percakapan lintas paket.
+type Message = MessageItem
+
 // MessagesPage membungkus hasil paginasi pesan chat yang terurut naik.
 type MessagesPage struct {
 	Messages   []MessageItem `json:"messages"`

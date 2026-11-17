@@ -659,6 +659,12 @@ var (
 	MetricGuardianShadowTotal = Default.NewCounterVec("guardian_shadow_total", "Total keputusan Guardian yang hanya dicatat selama shadow mode aktif", "code")
 	// MetricMemoryGovernorLevel mencatat level tekanan memori Governor aktif (0=green, 1=yellow, 2=red).
 	MetricMemoryGovernorLevel = Default.NewGauge("memory_governor_level", "Level tekanan memori Governor saat ini (0=green, 1=yellow, 2=red)")
+	// MetricAIRequestsTotal mencatat jumlah panggilan Chat Completions AI berdasarkan status hasilnya.
+	MetricAIRequestsTotal = Default.NewCounterVec("ai_requests_total", "Total permintaan Chat Completions AI berdasarkan hasil", "result")
+	// MetricAILatencySeconds mencatat distribusi latensi panggilan Chat Completions AI dalam detik.
+	MetricAILatencySeconds = Default.NewHistogram("ai_latency_seconds", "Latensi panggilan Chat Completions AI dalam detik", []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 20})
+	// MetricAITokensTotal mencatat total token prompt dan completion AI yang terpakai.
+	MetricAITokensTotal = Default.NewCounterVec("ai_tokens_total", "Total token AI yang digunakan berdasarkan kind", "kind")
 )
 
 // RefreshDefaultMetrics memperbarui seluruh metrik bawaan pada Default tanpa memakai runtime.ReadMemStats.
