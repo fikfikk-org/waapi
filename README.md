@@ -1,22 +1,26 @@
-# waapi — Ultra-Lightweight Headless WhatsApp API Gateway
+# waapi — Ultra-Lightweight Headless WhatsApp API Gateway (v2.0.0)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/fikfikk-org/waapi)](https://github.com/fikfikk-org/waapi/releases)
 
-Private WhatsApp Multi-Device API Gateway dalam **1 binary statis Go** (`whatsmeow` + pure-Go SQLite) tanpa admin panel web. Seluruh manajemen instance, pairing QR/kode 8 digit, webhook, dan API key dikendalikan langsung lewat terminal (`waapi`), dengan konsumsi RAM **< 100 MB** (`GOMEMLIMIT=80MiB`, `MemoryMax=100M`).
+Private WhatsApp Multi-Device API Gateway dalam **1 binary statis Go** (`go 1.27`, `CGO_ENABLED=0`, `whatsmeow` + `modernc.org/sqlite`) tanpa admin panel web dan tanpa layanan eksternal wajib. Seluruh backlog masuk maupun keluar disimpan di disk (`journal.db`), sementara memori kerja daemon dikendalikan oleh **Memory Governor** (`micro` / `lean` / `classic`, default `lean`: `GOMEMLIMIT=28MiB`, `MemoryMax=80M`).
+
+> [!NOTE]
+> **Perubahan penting v2.0.0 dibanding v1.0.2:** `waapi` kini mencatat event masuk & status pesan keluar secara sementara di `journal.db` untuk menjamin pengiriman nol-hilang, urutan webhook per chat, dan Durable Outbox. **Context Store (FTS5)** tetap **mati secara default** (`context_store: false`) untuk mempertahankan prinsip minimal retensi percakapan. Detail migrasi ada di [docs/MIGRATION-V2.md](docs/MIGRATION-V2.md).
 
 ---
 
 ## Daftar Isi
 
 1. [Instalasi di Server Linux (systemd)](#1-instalasi-di-server-linux-systemd)
-2. [Panduan Cepat: Dari Install Sampai Kirim Pesan Pertama](#2-panduan-cepat-dari-install-sampai-kirim-pesan-pertama)
-3. [Contoh Lengkap Pemanggilan REST API](#3-contoh-lengkap-pemanggilan-rest-api)
-4. [Menerima Pesan Masuk via Webhook](#4-menerima-pesan-masuk-via-webhook)
-5. [Referensi Perintah CLI (`waapi`)](#5-referensi-perintah-cli-waapi)
-6. [Konfigurasi Environment Variable](#6-konfigurasi-environment-variable)
-7. [Menjalankan di Lokal (Tanpa systemd)](#7-menjalankan-di-lokal-tanpa-systemd)
-8. [Dokumentasi Lanjutan](#8-dokumentasi-lanjutan)
+2. [Panduan Cepat: 5 Langkah Menuju Pesan Pertama](#2-panduan-cepat-5-langkah-menuju-pesan-pertama)
+3. [Fitur Utama v2.0.0](#3-fitur-utama-v200)
+4. [Contoh Pemanggilan REST API (v2 & Kompatibilitas v1)](#4-contoh-pemanggilan-rest-api-v2--kompatibilitas-v1)
+5. [Webhook v2, Standard Webhooks & Event Stream](#5-webhook-v2-standard-webhooks--event-stream)
+6. [Referensi Perintah CLI (`waapi`)](#6-referensi-perintah-cli-waapi)
+7. [Konfigurasi Environment Variable & Profil Memori](#7-konfigurasi-environment-variable--profil-memori)
+8. [Menjalankan di Lokal & Backup / Update](#8-menjalankan-di-lokal--backup--update)
+9. [Dokumentasi Lanjutan](#9-dokumentasi-lanjutan)
 
 ---
 
@@ -24,49 +28,47 @@ Private WhatsApp Multi-Device API Gateway dalam **1 binary statis Go** (`whatsme
 
 ### Opsi A — One-Liner Installer (Direkomendasikan)
 
-Mengunduh binary statis sesuai arsitektur server (`amd64` / `arm64`), membuat user & direktori `/var/lib/waapi`, serta menyalakan service `systemd` dengan batas RAM 100 MB:
+Mengunduh binary statis (`amd64` / `arm64`), membuat user `waapi`, menyiapkan `/var/lib/waapi`, serta memasang service `systemd` (`Type=notify` + `WatchdogSec=30s`, profil default `lean`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fikfikk-org/waapi/main/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/fikfikk-org/waapi/main/deploy/install.sh | sudo WAAPI_PROFILE=lean bash
 ```
 
-> **Catatan:** Setelah instalasi pertama, jalankan `source /etc/profile.d/waapi.sh` (atau login ulang SSH) agar perintah `waapi` dapat langsung dijalankan tanpa `sudo`.
+Pilih `WAAPI_PROFILE=micro` untuk VPS ≤ 512 MB (`MemoryMax=64M`), `lean` sebagai default (`MemoryMax=80M`), atau `classic` untuk beban lebih tinggi (`MemoryMax=100M`).
 
-### Opsi B — Build dari Source di VPS
+```bash
+source /etc/profile.d/waapi.sh
+```
 
-Jika ingin mengompilasi sendiri (membutuhkan Go 1.25+):
+### Opsi B — Build dari Source di Server
+
+Membutuhkan **Go 1.27+**:
 
 ```bash
 git clone https://github.com/fikfikk-org/waapi.git
 cd waapi
-make build-linux
+make build-linux          # atau make build-linux-arm64
 sudo bash deploy/install.sh
 source /etc/profile.d/waapi.sh
 ```
 
 ---
 
-## 2. Panduan Cepat: Dari Install Sampai Kirim Pesan Pertama
+## 2. Panduan Cepat: 5 Langkah Menuju Pesan Pertama
 
-Ikuti **5 langkah berurutan** berikut di terminal server Anda:
-
-### Langkah 1 — Pastikan daemon berjalan
+### Langkah 1 — Pastikan daemon aktif & sehat
 
 ```bash
 waapi status
 ```
 
-Output yang diharapkan:
-```text
-Daemon        running (pid 1423, uptime 1m)
-RSS           24.6 MB   (hard target < 100 MB)
-Go heap       8.4 MB alloc / 14.1 MB sys   (GOMEMLIMIT 80MiB, GOGC 50)
-...
+Untuk inspeksi memori lengkap (RSS, `Pss_Anon`, cgroup v2, PSI, THP, ukuran database, lag webhook, dan level Memory Governor):
+
+```bash
+waapi doctor --deep
 ```
 
 ### Langkah 2 — Buat instance WhatsApp baru
-
-Misalnya kita beri nama instance `sales` dengan batas kirim 20 pesan/menit:
 
 ```bash
 waapi add sales --rate 20
@@ -74,545 +76,221 @@ waapi add sales --rate 20
 
 ### Langkah 3 — Tautkan (Pairing) nomor WhatsApp
 
-Pilih **salah satu** metode di bawah ini:
-
 **Metode A — Scan QR Code langsung di terminal:**
 ```bash
 waapi pair sales
 ```
-Buka WhatsApp di HP → **Perangkat tertaut** → **Tautkan perangkat** → arahkan kamera ke QR yang muncul di terminal.
 
 **Metode B — Menggunakan 8-Digit Pairing Code (tanpa kamera):**
 ```bash
 waapi pair sales --phone 6281234567890
 ```
-Terminal akan menampilkan kode seperti `K7QD-2MXA`. Masukkan kode tersebut di notifikasi WhatsApp HP Anda.
 
-Pastikan status instance sudah `connected`:
+Pastikan status sudah `connected`:
 ```bash
 waapi list
-```
-```text
-ID      STATUS      JID                        RATE/MIN   QUEUE   WEBHOOK
-sales   connected   6281234567890:12@s...      20         0       -
 ```
 
 ### Langkah 4 — Buat API Key
 
-Buat API key untuk aplikasi backend Anda. Anda bisa membatasinya ke satu instance (`--instance sales`) atau mengosongkan flag `--instance` agar bisa mengakses semua instance:
+API key baru secara default menerima scope minimal yang aman (`instances:read,messages:send,messages:read,media:write,events:read,health:read`). Tambahkan `--scopes` bila memerlukan izin tambahan (`pair`, `groups:read`, `groups:write`, `settings:admin`, `hooks:admin`, `mcp`, atau `*`):
 
 ```bash
 waapi key add --name backend-prod --instance sales
 ```
 
-Output:
-```text
-✔ API key dibuat (simpan sekarang, tidak akan ditampilkan lagi)
+> **Penting:** Salin nilai `Key` (`wak_...`) segera karena tidak pernah ditampilkan ulang. Anda dapat mengirim API key menggunakan header `X-API-Key: wak_...` maupun `Authorization: Bearer wak_...`.
 
-  ID        k_7f3a9c
-  Name      backend-prod
-  Scope     instance: sales
-  Key       wak_Q2x9pL0vR7mN4sT8yB1cD6eF3gH5jK2lZ0aW9uV7
-```
-> **Penting:** Salin nilai `Key` (`wak_...`) karena hanya ditampilkan satu kali saat pembuatan.
-
-### Langkah 5 — Kirim pesan pertama Anda!
-
-Ganti `wak_...` dengan API key dari Langkah 4 dan `6289876543210` dengan nomor tujuan (format internasional tanpa `+`):
+### Langkah 5 — Kirim pesan pertama melalui Durable Outbox (v2)
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/messages/text \
-  -H "X-API-Key: wak_Q2x9pL0vR7mN4sT8yB1cD6eF3gH5jK2lZ0aW9uV7" \
+curl -X POST http://127.0.0.1:8080/v2/instances/sales/messages \
+  -H "Authorization: Bearer wak_..." \
+  -H "Idempotency-Key: order-1024-init" \
   -H "Content-Type: application/json" \
   -d '{
     "to": "6289876543210",
-    "text": "Halo! Ini pesan pertama dari waapi.",
+    "type": "text",
+    "text": "Halo! Pesanan #1024 sedang diproses.",
     "typing": true
   }'
 ```
 
-Response sukses (`200 OK`):
+Respons (`202 Accepted`):
 ```json
 {
-  "message_id": "3EB0A1B2C3D4E5F6",
+  "id": "msg_01J...",
+  "wa_message_id": "3EB0...",
+  "status": "queued",
   "to": "6289876543210@s.whatsapp.net",
-  "timestamp": 1794360012
+  "not_before": 1794360012,
+  "status_url": "/v2/instances/sales/messages/msg_01J..."
 }
 ```
 
+> Endpoint `/v1/instances/{id}/messages/text` tetap didukung penuh untuk klien v1 yang mengharapkan respons sinkron (`wait` hingga 60 detik).
+
 ---
 
-## 3. Contoh Lengkap Pemanggilan REST API
+## 3. Fitur Utama v2.0.0
 
-Semua request ke `/v1/*` wajib menyertakan header `X-API-Key: wak_...`.
-Nomor tujuan (`to`) dapat berupa nomor internasional (`6281234567890`) atau JID grup (`1203630123456789@g.us`).
+- **Zero-Loss Inbound Journal:** Memakai `SynchronousAck` + penyimpanan ke `journal.db` sebelum mengirim ack ke server WhatsApp, lengkap dengan dedupe key & resolusi `@lid` (`sender_pn`).
+- **Webhook v2 & Pull/SSE API:** Pengiriman berurutan per chat (`webhook_lanes`), tanda tangan `waapi` atau **Standard Webhooks** (`whsec_` + `v1,base64`), DLQ (`waapi webhook dlq`), Pull API, dan SSE (`Last-Event-ID`).
+- **Durable Outbox & Rich Messaging:** Pesan teks, media (upload sekali -> pakai ulang `upload_id`), *voice note* PTT OGG/Opus, stiker WebP, lokasi, kartu kontak vCard, polling bertally SHA-256 terdekripsi, reaksi, edit, tarik pesan (*revoke*), *quoted reply* penuh, dan penjadwalan `send_at`.
+- **Self-Healing Supervisor & Media Resurrection:** Deteksi socket half-open (`75s` keepalive + `TCP_USER_TIMEOUT` `45s`), backoff + circuit breaker, `waapi recycle`, serta pemulihan media CDN `404/410` otomatis lewat `SendMediaRetryReceipt`.
+- **Account Health Guardian & Memory Governor:** Skor kesehatan 0–100, *consent ledger* (`STOP`/`BERHENTI` otomatis), *quiet hours*, *warm-up* nomor baru, pembatasan fan-out/first-contact, serta pengendalian tekanan memori (`Green`/`Yellow`/`Red`, admission `503 memory_pressure`).
+- **Security v2:** Scope per API key, expiry & rotasi grace period, `KeyPolicy`, `audit_log` + `SO_PEERCRED`, proteksi SSRF [`internal/netguard`](internal/netguard/netguard.go), socket atomik `0660`, dan verifikasi update Ed25519 *fail-closed*.
+- **Opsional Zero-Cost Saat Mati:**
+  - **Context Store + FTS5 BM25** (`context_store=true` per instance).
+  - **Agent-Native MCP Server** (`2026-07-28`, stdio `waapi mcp` dan `POST /mcp`, lazy init).
+  - **Reactive Hooks deklaratif & AI Responder** (`ai_reply` kompatibel OpenAI/Ollama tanpa tool calling, *human takeover*, kata kunci handoff).
 
-### A. Kirim Pesan Teks (atau Balas Pesan)
+---
+
+## 4. Contoh Pemanggilan REST API (v2 & Kompatibilitas v1)
+
+Dokumentasi endpoint lengkap tersedia di [documentation-api.md](documentation-api.md).
+
+### A. Upload Media Sekali -> Kirim Banyak Penerima (v2)
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/messages/text \
+# 1. Upload streaming (mendukung ?kind=image|video|audio|ptt|document|sticker)
+curl -X POST "http://127.0.0.1:8080/v2/instances/sales/media?kind=document&filename=katalog.pdf" \
+  -H "X-API-Key: wak_..." \
+  --data-binary "@./katalog.pdf"
+# Menghasilkan: { "upload_id": "upl_...", "expires_at": ... }
+
+# 2. Kirim menggunakan upload_id (bisa dipakai ulang dalam 24 jam)
+curl -X POST http://127.0.0.1:8080/v2/instances/sales/messages \
   -H "X-API-Key: wak_..." \
   -H "Content-Type: application/json" \
   -d '{
     "to": "6289876543210",
-    "text": "Pesanan #1024 sudah dikirim.",
-    "typing": true,
-    "reply_to": ""
+    "type": "document",
+    "media": { "upload_id": "upl_...", "caption": "Katalog terbaru" }
   }'
 ```
 
-### B. Kirim Gambar / Dokumen / Video / Audio (Upload File)
-
-> **Aturan penting:** Karena `waapi` membaca stream secara langsung tanpa memuat file ke RAM, field `to` dan `type` (`image` | `video` | `audio` | `document`) **wajib diletakkan sebelum** `-F "file=@..."`.
+### B. Cek Status Pengiriman Outbox & Batalkan Pesan Terjadwal
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/messages/media \
-  -H "X-API-Key: wak_..." \
-  -F "to=6289876543210" \
-  -F "type=document" \
-  -F "filename=invoice-1024.pdf" \
-  -F "caption=Berikut invoice pesanan Anda" \
-  -F "file=@./invoice-1024.pdf"
+curl http://127.0.0.1:8080/v2/instances/sales/messages/msg_01J... \
+  -H "X-API-Key: wak_..."
+
+curl -X DELETE http://127.0.0.1:8080/v2/instances/sales/messages/msg_01J... \
+  -H "X-API-Key: wak_..."
 ```
 
-### C. Kirim Media dari URL (`https://`)
+### C. Kirim Polling, Reaksi & Penandaan Terbaca
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/messages/media-url \
+curl -X POST http://127.0.0.1:8080/v2/instances/sales/messages \
   -H "X-API-Key: wak_..." \
   -H "Content-Type: application/json" \
   -d '{
-    "to": "6289876543210",
-    "type": "image",
-    "url": "https://example.com/produk.jpg",
-    "caption": "Foto produk"
+    "to": "1203630123456789@g.us",
+    "type": "poll",
+    "poll": { "name": "Jadwal rilis?", "options": ["Besok", "Lusa"], "selectable": 1 }
   }'
 ```
 
-### D. Cek Apakah Nomor Terdaftar di WhatsApp
-
-Maksimal 20 nomor per request (hasil di-cache selama 24 jam):
+### D. Manajemen Grup, Kesehatan Guardian & Pull/SSE Events
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/contacts/check \
-  -H "X-API-Key: wak_..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "numbers": ["6281234567890", "6289999999999"]
-  }'
-```
-
-### E. Cek Status Instance via API
-
-```bash
-curl http://127.0.0.1:8080/v1/instances/sales \
-  -H "X-API-Key: wak_..."
-```
-
-### F. Pairing via REST API (Integrasi Dashboard Web / Laravel)
-
-Selain lewat terminal (`waapi pair`), proses pairing juga dapat dipicu dan dipantau lewat REST API per-instance (lihat panduan lengkap & contoh Controller Laravel di [docs/PAIRING-API-SPEC.md](docs/PAIRING-API-SPEC.md)):
-
-```bash
-# 1. Mulai pairing mode QR Code (body kosong)
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
+curl http://127.0.0.1:8080/v2/instances/sales/health \
   -H "X-API-Key: wak_..."
 
-# 2. Atau mulai pairing mode 8-Digit Code (isi nomor internasional tanpa +)
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
-  -H "X-API-Key: wak_..." \
-  -H "Content-Type: application/json" \
-  -d '{"phone": "6281234567890"}'
-
-# 3. Ambil gambar QR PNG langsung (untuk di-proxy ke <img src="..."> dashboard)
-curl http://127.0.0.1:8080/v1/instances/sales/qr.png?scale=6 \
-  -H "X-API-Key: wak_..." -o qr.png
-
-# 4. Polling status pairing terkini
-curl http://127.0.0.1:8080/v1/instances/sales/pair \
-  -H "X-API-Key: wak_..."
-
-# 5. Batalkan sesi pairing aktif
-curl -X DELETE http://127.0.0.1:8080/v1/instances/sales/pair \
+curl "http://127.0.0.1:8080/v2/instances/sales/events?after=0&limit=50&wait=20" \
   -H "X-API-Key: wak_..."
 ```
 
 ---
 
-## 4. Menerima Pesan Masuk via Webhook
+## 5. Webhook v2, Standard Webhooks & Event Stream
 
-### Pasang URL Webhook pada Instance
-
-```bash
-waapi webhook set sales https://api.domain-anda.com/webhook/wa --events message,receipt,connection
-```
-
-### Uji Pengiriman Webhook
+Pasang webhook (secara default mulai dari posisi `seq` terbaru via `--from now`, atau `--from retained` untuk memutar backlog tersimpan):
 
 ```bash
-waapi webhook test sales
+waapi webhook set sales https://backend.anda.com/webhook/wa --from now
+# Opsional aktifkan Standard Webhooks:
+waapi edit sales --set webhook_format=standard
 ```
 
-### Contoh Payload Webhook (`POST`)
-
-Setiap request webhook menyertakan header:
-- `X-WA-Event`: `message` | `receipt` | `connection`
-- `X-WA-Instance`: ID instance (mis. `sales`)
-- `X-WA-Timestamp`: Unix epoch detik
-- `X-WA-Signature`: `sha256=<hex HMAC-SHA256(webhook_secret, timestamp + "." + raw_body)>`
-
-```json
-{
-  "event": "message",
-  "instance": "sales",
-  "timestamp": 1794360100,
-  "data": {
-    "id": "3EB0F00D...",
-    "from": "6281234567890@s.whatsapp.net",
-    "chat": "6281234567890@s.whatsapp.net",
-    "is_group": false,
-    "from_me": false,
-    "push_name": "Budi",
-    "type": "text",
-    "text": "Halo, apakah stok masih ada?"
-  }
-}
-```
-
-Jika pesan masuk berupa media (`image`, `video`, `audio`, `document`), field `data.media` akan berisi *descriptor* yang dapat diunduh secara *on-demand* (streaming) melalui endpoint `POST /v1/instances/{id}/media/download` dengan mengirimkan JSON `data.media` sebagai request body.
+Pelajari struktur Envelope v2, verifikasi tanda tangan Go/PHP/Node/Python, penanganan `410 Gone`, dan antrean DLQ di [docs/WEBHOOKS.md](docs/WEBHOOKS.md).
 
 ---
 
-## 5. Referensi Perintah CLI (`waapi`)
+## 6. Referensi Perintah CLI (`waapi`)
 
-```text
-PERINTAH INSTANCE:
-  waapi list                                   Daftar semua instance WhatsApp
-  waapi add <id> [--rate 20] [--no-autostart]  Buat instance baru
-  waapi show <id>                              Detail status satu instance
-  waapi edit <id> [opsi]                       Ubah rate limit / webhook / autostart instance
-  waapi pair <id> [--phone 62812xxx]           Tautkan nomor via QR ASCII atau 8-digit kode
-  waapi restart <id>                           Sambungkan ulang instance
-  waapi stop <id>                              Hentikan koneksi instance dan matikan autostart
-  waapi logout <id>                            Unlink perangkat dari WhatsApp
-  waapi rm <id> [--yes]                        Logout dan hapus instance beserta datanya
-
-OPSI EDIT INSTANCE (waapi edit <id>):
-  --rate <n>              Batas kirim pesan per menit (contoh: --rate 30)
-  --webhook <url>         URL tujuan webhook (kosongkan "" untuk menghapus)
-  --events <csv>          Filter event: message,receipt,connection
-  --autostart <bool>      true atau false
-  --rotate-secret         Putar ulang secret HMAC webhook
-
-MANAJEMEN API KEY:
-  waapi key list                               Daftar seluruh API key
-  waapi key add --name <nama> [--instance <id>] Buat API key baru (ditampilkan sekali)
-  waapi key rm <key-id>                        Cabut (revoke) API key
-
-MANAJEMEN WEBHOOK:
-  waapi webhook set <id> <url> [--events ...]  Pasang URL webhook pada instance
-  waapi webhook unset <id>                     Hapus URL webhook dari instance
-  waapi webhook test <id>                      Kirim event uji coba ke webhook
-
-DAEMON, UPDATE & DIAGNOSTIK:
-  waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
-  waapi logs [<id>]                            Pantau log service systemd (journalctl)
-  waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
-  sudo waapi update | sudo waapi update:latest Update ke versi terbaru (otomatis backup versi lama)
-  sudo waapi update v1.0.0                     Pasang/downgrade ke versi spesifik
-  sudo waapi rollback [v1.0.0]                 Kembalikan ke backup lokal terakhir atau versi tertentu
-  waapi versions                               Lihat daftar rilis GitHub & backup lokal
-  sudo waapi uninstall [--purge]               Hapus service & binary (--purge untuk hapus data)
-  waapi serve                                  Jalankan background daemon
-  waapi version                                Tampilkan versi binary
-```
-
-### Contoh Cek Update & Rollback
-
-Session WhatsApp (`wa.db`) dan API key (`app.db`) **tidak pernah terhapus** saat update maupun rollback:
-
-```bash
-# 1. Cek apakah ada versi baru di GitHub Releases
-waapi update --check
-
-# 2. Lihat daftar versi di GitHub & backup lokal yang tersimpan di /var/lib/waapi/backups
-waapi versions
-
-# 3. Update ke versi terbaru (otomatis mem-backup binary lama & verifikasi SHA-256)
-sudo waapi update:latest
-
-# 4. Rollback instan ke versi sebelumnya (atau sebutkan versi: sudo waapi rollback v1.0.0)
-sudo waapi rollback
-```
+| Perintah | Kegunaan |
+|---|---|
+| `waapi list` / `add <id>` / `show <id>` / `edit <id>` | Kelola instance (`--rate`, `--webhook`, `--events`, `--autostart`, `--rotate-secret`, `--set key=val`) |
+| `waapi pair <id> [--phone N]` | Tautkan nomor WhatsApp (QR ASCII / 8-digit pairing code) |
+| `waapi restart` / `recycle` / `stop` / `logout` / `rm` | Kendalikan koneksi dan bersihkan cache internal instance (`recycle`) |
+| `waapi key list\|add\|show\|rotate\|rm` | Kelola API key beserta `--scopes`, `--expires`, `--rate`, `--policy`, & grace rotation |
+| `waapi audit [--since 24h] [--action pola]` | Tinjau jejak audit aksi administratif |
+| `waapi webhook set\|unset\|resume\|dlq\|test` | Konfigurasi target webhook, lanjutkan pasca `410 Gone`, kelola DLQ |
+| `waapi events <id> [--after N] [--follow]` | Baca event journal atau ikuti stream SSE lewat control plane |
+| `waapi send <id> <to> <text> [--wait] [--idem KEY]` | Kirim pesan teks lewat Durable Outbox dari terminal |
+| `waapi health <id> [--json]` | Inspeksi skor, state, kuota harian, & faktor Account Health Guardian |
+| `waapi context <id> on\|off\|purge [--chat JID]` | Nyalakan/matikan Context Store FTS5 opt-in atau hapus riwayat chat |
+| `waapi hook ls\|add\|rm\|enable\|disable\|logs\|test` | Kelola dan simulasi dry-run rule Reactive Hooks (membuat rule `trusted=true`) |
+| `waapi mcp [--key KEY_ID] [--max-inflight 8]` | Bridge stdio JSON-RPC MCP menuju `control.sock` |
+| `waapi backup [--out dir] [--json]` | Buat snapshot `VACUUM INTO` (`app.db`, `journal.db`, `wa.db`) |
+| `waapi status` / `waapi doctor [--deep] [--json]` | Cek kesehatan daemon, anatomi RAM `procfs`/`cgroup`/`DBStatus` |
+| `waapi debug pprof <profil> [-o file]` | Ambil profil `heap`, `goroutine`, `goroutineleak`, atau `profile` |
+| `waapi update` / `rollback` / `versions` | Pembaruan biner bertanda tangan Ed25519 beserta pre-backup DB otomatis |
 
 ---
 
-## 6. Konfigurasi Environment Variable
-
-Secara default dikonfigurasi di `/etc/systemd/system/waapi.service`:
+## 7. Konfigurasi Environment Variable & Profil Memori
 
 | Variabel | Default | Keterangan |
 |---|---|---|
-| `WAAPI_DATA_DIR` | `/var/lib/waapi` (`~/.wa-api` jika lokal) | Lokasi `app.db`, `wa.db`, `control.sock`, dan `tmp/` |
-| `WAAPI_HTTP_ADDR` | `127.0.0.1:8080` | Alamat bind HTTP REST API |
-| `WAAPI_MEMORY_LIMIT_MIB` | `80` | Fallback soft memory limit jika `GOMEMLIMIT` kosong |
-| `WAAPI_MAX_CONNS` | `64` | Batas koneksi HTTP publik konkuren |
-| `WAAPI_MEDIA_MAX_MIB` | `16` | Batas ukuran upload gambar/video/audio (MiB) |
-| `WAAPI_DOCUMENT_MAX_MIB` | `64` | Batas ukuran upload dokumen (MiB) |
-| `WAAPI_WEBHOOK_WORKERS` | `4` | Jumlah goroutine worker pengirim webhook |
+| `WAAPI_PROFILE` | `lean` | Profil memori: `micro`, `lean`, atau `classic` |
+| `WAAPI_DATA_DIR` | `~/.wa-api` (`/var/lib/waapi` di unit systemd) | Lokasi `app.db`, `journal.db`, `wa.db`, `control.sock`, `backups/`, `tmp/` |
+| `WAAPI_HTTP_ADDR` | `127.0.0.1:8080` | Alamat bind HTTP publik (letakkan di belakang Caddy/Nginx TLS) |
+| `WAAPI_METRICS_ADDR` | *(kosong / nonaktif)* | Bind listener Prometheus `/metrics` terpisah (mis. `127.0.0.1:9108`) |
+| `WAAPI_LOG_LEVEL` / `WAAPI_LOG_FORMAT` / `WAAPI_WA_LOG_LEVEL` | `info` / `text` / `warn` | Kontrol verbosity slog & filter/rate-limit log whatsmeow |
+| `WAAPI_MEMORY_BUDGET_MIB` | Sesuai profil (`16` / `22` / `64`) | Batas memori anonim acuan **Memory Governor** |
+| `WAAPI_AUTO_RECYCLE` / `WAAPI_PAGEOUT_AFTER_BOOT` | `off` / `off` | Mitigasi tekanan memori lanjut di host Linux |
+| `WAAPI_KEEPALIVE_MAX_FAIL` / `WAAPI_TCP_USER_TIMEOUT` | `75s` / `45s` | Ambang deteksi koneksi setengah mati (half-open) |
+| `WAAPI_JOURNAL_RETENTION` / `WAAPI_JOURNAL_REPLAY_WINDOW` / `WAAPI_JOURNAL_MAX_ROWS` / `WAAPI_JOURNAL_SYNC` | `72h` / `1h` / `50000` / `normal` | Retensi event journal, batas baris per instance, mode sync WAL |
+| `WAAPI_SSE_MAX` | Sesuai profil (`4` / `8` / `32`) | Kuota maksimum koneksi SSE publik serentak |
+| `WAAPI_OUTBOX_TTL` / `WAAPI_OUTBOX_MAX_QUEUED` | `24h` / `1000` | TTL & batas maksimum antrean per instance di Durable Outbox |
+| `WAAPI_MEDIA_DROPBEHIND` | `on` | Reclaim page cache tiap 4 MiB saat streaming media |
+| `WAAPI_MCP` / `WAAPI_MCP_ALLOWED_ORIGINS` | `on` / *(kosong)* | Aktifkan/matikan server MCP & daftar header `Origin` yang diizinkan |
+| `WAAPI_AI_BASE_URL`, `WAAPI_AI_API_KEY`, `WAAPI_AI_MODEL` | *(kosong / mati)* | Endpoint Chat Completions kompatibel OpenAI / Ollama lokal (API key hanya di env/RAM) |
+| `WAAPI_AI_TIMEOUT` / `WAAPI_AI_MAX_CONCURRENCY` | `20s` / `2` | Timeout & batas panggilan AI paralel |
 
 ---
 
-## 7. Menjalankan di Lokal (Tanpa systemd)
+## 8. Menjalankan di Lokal & Backup / Update
 
-Untuk pengembangan di komputer lokal (Linux / macOS / Windows):
+Jalankan daemon lokal tanpa `systemd`:
 
 ```bash
-# Terminal 1 — Jalankan daemon
-go build -o bin/waapi ./cmd/waapi
-./bin/waapi serve
-
-# Terminal 2 — Kelola via CLI
-./bin/waapi status
-./bin/waapi add dev
-./bin/waapi pair dev
-./bin/waapi key add --name local-test --instance dev
+WAAPI_DATA_DIR=./data WAAPI_HTTP_ADDR=127.0.0.1:8080 go run ./cmd/waapi serve
 ```
 
----
-
-## 8. Dokumentasi Lanjutan
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — Analisis first-principles, alokasi budget memori < 100 MB, pragma SQLite, dan diagram alur sistem.
-- [documentation.md](documentation.md) — Siklus hidup entitas, transisi status instance, dan batasan bisnis.
-- [documentation-api.md](documentation-api.md) — Tabel spesifikasi lengkap seluruh endpoint REST API dan payload webhook.
-
----
-
-## Lisensi, Hak Cipta & Kredit
-
-- **Hak Cipta & Lisensi Kode Sumber**: Dirilis di bawah [MIT License](LICENSE) — `Copyright (c) 2026 Fikri (fikfikk-org)`. Setiap salinan atau *fork* wajib mempertahankan pemberitahuan hak cipta asli.
-- **Pustaka Pihak Ketiga**: Menggunakan [`go.mau.fi/whatsmeow`](https://github.com/tulir/whatsmeow) (MPL-2.0), [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (BSD-3-Clause), dan [`github.com/mdp/qrterminal/v3`](https://github.com/mdp/qrterminal) (MIT). Lihat detail lengkap di [NOTICE](NOTICE).
-- **Disclaimer**: Proyek ini independen dan tidak berafiliasi dengan atau didukung oleh WhatsApp LLC maupun Meta Platforms, Inc. Penggunaan sepenuhnya menjadi tanggung jawab pengguna.
-
-
-### C. Kirim Media dari URL (`https://`)
+Backup manual yang aman dengan sandbox `systemd`:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/messages/media-url \
-  -H "X-API-Key: wak_..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "to": "6289876543210",
-    "type": "image",
-    "url": "https://example.com/produk.jpg",
-    "caption": "Foto produk"
-  }'
-```
-
-### D. Cek Apakah Nomor Terdaftar di WhatsApp
-
-Maksimal 20 nomor per request (hasil di-cache selama 24 jam):
-
-```bash
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/contacts/check \
-  -H "X-API-Key: wak_..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "numbers": ["6281234567890", "6289999999999"]
-  }'
-```
-
-### E. Cek Status Instance via API
-
-```bash
-curl http://127.0.0.1:8080/v1/instances/sales \
-  -H "X-API-Key: wak_..."
-```
-
-### F. Pairing via REST API (Integrasi Dashboard Web / Laravel)
-
-Selain lewat terminal (`waapi pair`), proses pairing juga dapat dipicu dan dipantau lewat REST API per-instance (lihat panduan lengkap & contoh Controller Laravel di [docs/PAIRING-API-SPEC.md](docs/PAIRING-API-SPEC.md)):
-
-```bash
-# 1. Mulai pairing mode QR Code (body kosong)
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
-  -H "X-API-Key: wak_..."
-
-# 2. Atau mulai pairing mode 8-Digit Code (isi nomor internasional tanpa +)
-curl -X POST http://127.0.0.1:8080/v1/instances/sales/pair \
-  -H "X-API-Key: wak_..." \
-  -H "Content-Type: application/json" \
-  -d '{"phone": "6281234567890"}'
-
-# 3. Ambil gambar QR PNG langsung (untuk di-proxy ke <img src="..."> dashboard)
-curl http://127.0.0.1:8080/v1/instances/sales/qr.png?scale=6 \
-  -H "X-API-Key: wak_..." -o qr.png
-
-# 4. Polling status pairing terkini
-curl http://127.0.0.1:8080/v1/instances/sales/pair \
-  -H "X-API-Key: wak_..."
-
-# 5. Batalkan sesi pairing aktif
-curl -X DELETE http://127.0.0.1:8080/v1/instances/sales/pair \
-  -H "X-API-Key: wak_..."
+waapi backup --out ~/waapi-backup-harian
 ```
 
 ---
 
-## 4. Menerima Pesan Masuk via Webhook
+## 9. Dokumentasi Lanjutan
 
-### Pasang URL Webhook pada Instance
-
-```bash
-waapi webhook set sales https://api.domain-anda.com/webhook/wa --events message,receipt,connection
-```
-
-### Uji Pengiriman Webhook
-
-```bash
-waapi webhook test sales
-```
-
-### Contoh Payload Webhook (`POST`)
-
-Setiap request webhook menyertakan header:
-- `X-WA-Event`: `message` | `receipt` | `connection`
-- `X-WA-Instance`: ID instance (mis. `sales`)
-- `X-WA-Timestamp`: Unix epoch detik
-- `X-WA-Signature`: `sha256=<hex HMAC-SHA256(webhook_secret, timestamp + "." + raw_body)>`
-
-```json
-{
-  "event": "message",
-  "instance": "sales",
-  "timestamp": 1794360100,
-  "data": {
-    "id": "3EB0F00D...",
-    "from": "6281234567890@s.whatsapp.net",
-    "chat": "6281234567890@s.whatsapp.net",
-    "is_group": false,
-    "from_me": false,
-    "push_name": "Budi",
-    "type": "text",
-    "text": "Halo, apakah stok masih ada?"
-  }
-}
-```
-
-Jika pesan masuk berupa media (`image`, `video`, `audio`, `document`), field `data.media` akan berisi *descriptor* yang dapat diunduh secara *on-demand* (streaming) melalui endpoint `POST /v1/instances/{id}/media/download` dengan mengirimkan JSON `data.media` sebagai request body.
-
----
-
-## 5. Referensi Perintah CLI (`waapi`)
-
-```text
-PERINTAH INSTANCE:
-  waapi list                                   Daftar semua instance WhatsApp
-  waapi add <id> [--rate 20] [--no-autostart]  Buat instance baru
-  waapi show <id>                              Detail status satu instance
-  waapi edit <id> [opsi]                       Ubah rate limit / webhook / autostart instance
-  waapi pair <id> [--phone 62812xxx]           Tautkan nomor via QR ASCII atau 8-digit kode
-  waapi restart <id>                           Sambungkan ulang instance
-  waapi stop <id>                              Hentikan koneksi instance dan matikan autostart
-  waapi logout <id>                            Unlink perangkat dari WhatsApp
-  waapi rm <id> [--yes]                        Logout dan hapus instance beserta datanya
-
-OPSI EDIT INSTANCE (waapi edit <id>):
-  --rate <n>              Batas kirim pesan per menit (contoh: --rate 30)
-  --webhook <url>         URL tujuan webhook (kosongkan "" untuk menghapus)
-  --events <csv>          Filter event: message,receipt,connection
-  --autostart <bool>      true atau false
-  --rotate-secret         Putar ulang secret HMAC webhook
-
-MANAJEMEN API KEY:
-  waapi key list                               Daftar seluruh API key
-  waapi key add --name <nama> [--instance <id>] Buat API key baru (ditampilkan sekali)
-  waapi key rm <key-id>                        Cabut (revoke) API key
-
-MANAJEMEN WEBHOOK:
-  waapi webhook set <id> <url> [--events ...]  Pasang URL webhook pada instance
-  waapi webhook unset <id>                     Hapus URL webhook dari instance
-  waapi webhook test <id>                      Kirim event uji coba ke webhook
-
-DAEMON, UPDATE & DIAGNOSTIK:
-  waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon
-  waapi logs [<id>]                            Pantau log service systemd (journalctl)
-  waapi update --check                         Cek apakah ada versi terbaru di GitHub Releases
-  sudo waapi update | sudo waapi update:latest Update ke versi terbaru (otomatis backup versi lama)
-  sudo waapi update v1.0.0                     Pasang/downgrade ke versi spesifik
-  sudo waapi rollback [v1.0.0]                 Kembalikan ke backup lokal terakhir atau versi tertentu
-  waapi versions                               Lihat daftar rilis GitHub & backup lokal
-  sudo waapi uninstall [--purge]               Hapus service & binary (--purge untuk hapus data)
-  waapi serve                                  Jalankan background daemon
-  waapi version                                Tampilkan versi binary
-```
-
-### Contoh Cek Update & Rollback
-
-Session WhatsApp (`wa.db`) dan API key (`app.db`) **tidak pernah terhapus** saat update maupun rollback:
-
-```bash
-# 1. Cek apakah ada versi baru di GitHub Releases
-waapi update --check
-
-# 2. Lihat daftar versi di GitHub & backup lokal yang tersimpan di /var/lib/waapi/backups
-waapi versions
-
-# 3. Update ke versi terbaru (otomatis mem-backup binary lama & verifikasi SHA-256)
-sudo waapi update:latest
-
-# 4. Rollback instan ke versi sebelumnya (atau sebutkan versi: sudo waapi rollback v1.0.0)
-sudo waapi rollback
-```
-
----
-
-## 6. Konfigurasi Environment Variable
-
-Secara default dikonfigurasi di `/etc/systemd/system/waapi.service`:
-
-| Variabel | Default | Keterangan |
-|---|---|---|
-| `WAAPI_DATA_DIR` | `/var/lib/waapi` (`~/.wa-api` jika lokal) | Lokasi `app.db`, `wa.db`, `control.sock`, dan `tmp/` |
-| `WAAPI_HTTP_ADDR` | `127.0.0.1:8080` | Alamat bind HTTP REST API |
-| `WAAPI_MEMORY_LIMIT_MIB` | `80` | Fallback soft memory limit jika `GOMEMLIMIT` kosong |
-| `WAAPI_MAX_CONNS` | `64` | Batas koneksi HTTP publik konkuren |
-| `WAAPI_MEDIA_MAX_MIB` | `16` | Batas ukuran upload gambar/video/audio (MiB) |
-| `WAAPI_DOCUMENT_MAX_MIB` | `64` | Batas ukuran upload dokumen (MiB) |
-| `WAAPI_WEBHOOK_WORKERS` | `4` | Jumlah goroutine worker pengirim webhook |
-
----
-
-## 7. Menjalankan di Lokal (Tanpa systemd)
-
-Untuk pengembangan di komputer lokal (Linux / macOS / Windows):
-
-```bash
-# Terminal 1 — Jalankan daemon
-go build -o bin/waapi ./cmd/waapi
-./bin/waapi serve
-
-# Terminal 2 — Kelola via CLI
-./bin/waapi status
-./bin/waapi add dev
-./bin/waapi pair dev
-./bin/waapi key add --name local-test --instance dev
-```
-
----
-
-## 8. Dokumentasi Lanjutan
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — Analisis first-principles, alokasi budget memori < 100 MB, pragma SQLite, dan diagram alur sistem.
-- [documentation.md](documentation.md) — Siklus hidup entitas, transisi status instance, dan batasan bisnis.
-- [documentation-api.md](documentation-api.md) — Tabel spesifikasi lengkap seluruh endpoint REST API dan payload webhook.
-
----
-
-## Lisensi, Hak Cipta & Kredit
-
-- **Hak Cipta & Lisensi Kode Sumber**: Dirilis di bawah [MIT License](LICENSE) — `Copyright (c) 2026 Fikri (fikfikk-org)`. Setiap salinan atau *fork* wajib mempertahankan pemberitahuan hak cipta asli.
-- **Pustaka Pihak Ketiga**: Menggunakan [`go.mau.fi/whatsmeow`](https://github.com/tulir/whatsmeow) (MPL-2.0), [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (BSD-3-Clause), dan [`github.com/mdp/qrterminal/v3`](https://github.com/mdp/qrterminal) (MIT). Lihat detail lengkap di [NOTICE](NOTICE).
-- **Disclaimer**: Proyek ini independen dan tidak berafiliasi dengan atau didukung oleh WhatsApp LLC maupun Meta Platforms, Inc. Penggunaan sepenuhnya menjadi tanggung jawab pengguna.
-
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Arsitektur V2 (3 DB SQLite, jalur masuk/keluar, supervisor, Guardian, Memory Governor)
+- [documentation.md](documentation.md) — Aturan bisnis lengkap, diagram status entitas & siklus hidup
+- [documentation-api.md](documentation-api.md) — Referensi teknis seluruh endpoint HTTP v1/v2, Control Plane, & tugas latar
+- [docs/WEBHOOKS.md](docs/WEBHOOKS.md) — Envelope v2, tanda tangan HMAC, contoh verifikasi Go/PHP/Node/Python, & DLQ
+- [docs/MCP.md](docs/MCP.md) — Server MCP `2026-07-28`, bridge `waapi mcp`, `KeyPolicy`, & persetujuan MRTR
+- [docs/HOOKS.md](docs/HOOKS.md) — 5 resep Reactive Hooks deklaratif & konfigurasi `ai_reply`
+- [docs/MIGRATION-V2.md](docs/MIGRATION-V2.md) — Panduan upgrade v1.0.2 -> v2.0.0, rollback aman, & kebijakan penyimpanan
+- [docs/PAIRING-API-SPEC.md](docs/PAIRING-API-SPEC.md) — Integrasi pairing QR & 8-digit untuk dashboard web
+- [SECURITY.md](SECURITY.md) — Kebijakan keamanan & rilis bertanda tangan Ed25519
+- [CHANGELOG.md](CHANGELOG.md) — Catatan perubahan versi
+- [bench/burnin-v2.0.0.md](bench/burnin-v2.0.0.md) — Hasil pengukuran terukur lokal & daftar uji burn-in ARM64

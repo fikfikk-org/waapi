@@ -1,8 +1,8 @@
 # PAIRING-API-SPEC.md — REST API Pairing per Instance (QR & 8-Digit Code)
 
-> **Status:** Spesifikasi siap implementasi · **Target versi:** `v1.1.0`
-> **Scope:** Pairing per-instance via `/v1/instances/{id}/pair*` untuk dashboard eksternal (mis. Laravel) tanpa CLI.
-> **Constraint:** Zero regression RAM (`GOMEMLIMIT=80MiB`, `MemoryMax=100M`), zero goroutine leak.
+> **Status:** Terimplementasi (v2.0.0) · **Scope HTTP wajib:** `pair`
+> **Scope:** Pairing per-instance via `/v1/instances/{id}/pair*` untuk dashboard eksternal tanpa CLI.
+> **Constraint:** Zero goroutine leak (`runtime/pprof` profil `goroutineleak` Go 1.27), sesuai profil Memory Governor (`micro`/`lean`/`classic`).
 
 ---
 
@@ -12,12 +12,12 @@
 
 `Instance.Pair(ctx, phone, emit)` di [`internal/wa/instance.go`](../internal/wa/instance.go) **terikat pada `ctx` request** milik stream NDJSON CLI. Model ini tidak cocok untuk REST:
 
-| Masalah | Dampak jika dipakai langsung di REST |
-|---|---|
-| Lifetime pairing = lifetime request | Request `POST` harus menunggu sampai 160 detik (scan selesai) → timeout di proxy/Laravel |
-| Tidak ada state yang bisa di-query | `GET qr.png` tidak punya sumber QR terbaru |
-| `pairingSem.Acquire` blocking | Request kedua menggantung, bukan ditolak cepat |
-| Tidak ada owner jelas saat browser ditutup | Pairing bisa terputus prematur, atau sebaliknya tidak pernah dibersihkan |
+| Masalah                                    | Dampak jika dipakai langsung di REST                                                     |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Lifetime pairing = lifetime request        | Request `POST` harus menunggu sampai 160 detik (scan selesai) → timeout di proxy/Laravel |
+| Tidak ada state yang bisa di-query         | `GET qr.png` tidak punya sumber QR terbaru                                               |
+| `pairingSem.Acquire` blocking              | Request kedua menggantung, bukan ditolak cepat                                           |
+| Tidak ada owner jelas saat browser ditutup | Pairing bisa terputus prematur, atau sebaliknya tidak pernah dibersihkan                 |
 
 ### 1.2 Solusi: `pairSession` detached dengan TTL keras
 
@@ -111,15 +111,15 @@ stateDiagram-v2
     error --> [*]
 ```
 
-| State | Terminal | Keterangan |
-|---|---|---|
-| `starting` | Tidak | WebSocket sedang dibuka, belum ada QR/kode |
-| `qr_refreshed` | Tidak | QR raw terbaru tersedia |
-| `code_generated` | Tidak | Kode 8 digit tersedia |
-| `connected` | Ya | Pairing sukses, JID tersimpan |
-| `timeout` | Ya | TTL 170s habis / server menutup channel QR |
-| `cancelled` | Ya | Dibatalkan manual |
-| `error` | Ya | Gagal (mis. `PairPhone` ditolak, rate-overlimit) |
+| State            | Terminal | Keterangan                                       |
+| ---------------- | -------- | ------------------------------------------------ |
+| `starting`       | Tidak    | WebSocket sedang dibuka, belum ada QR/kode       |
+| `qr_refreshed`   | Tidak    | QR raw terbaru tersedia                          |
+| `code_generated` | Tidak    | Kode 8 digit tersedia                            |
+| `connected`      | Ya       | Pairing sukses, JID tersimpan                    |
+| `timeout`        | Ya       | TTL 170s habis / server menutup channel QR       |
+| `cancelled`      | Ya       | Dibatalkan manual                                |
+| `error`          | Ya       | Gagal (mis. `PairPhone` ditolak, rate-overlimit) |
 
 Snapshot terminal **dipertahankan di memori sampai `POST /pair` berikutnya** (bukan goroutine, hanya struct kecil), agar polling dashboard tetap bisa membaca hasil akhir.
 
@@ -136,28 +136,28 @@ Snapshot terminal **dipertahankan di memori sampai `POST /pair` berikutnya** (bu
 
 **Headers**
 
-| Header | Wajib | Nilai |
-|---|---|---|
-| `X-API-Key` | Ya | `wak_...` |
+| Header         | Wajib         | Nilai              |
+| -------------- | ------------- | ------------------ |
+| `X-API-Key`    | Ya            | `wak_...`          |
 | `Content-Type` | Jika ada body | `application/json` |
 
 **Request body (opsional, maks 1 KB)**
 
-| Field | Tipe | Wajib | Keterangan |
-|---|---|---|---|
+| Field   | Tipe   | Wajib | Keterangan                                                                                                           |
+| ------- | ------ | ----- | -------------------------------------------------------------------------------------------------------------------- |
 | `phone` | string | Tidak | Format internasional tanpa `+`, 8–15 digit, tidak boleh diawali `0`. Ada → mode `code`; kosong/tidak ada → mode `qr` |
 
 Body kosong, `{}`, atau tanpa `Content-Type` → mode QR.
 
 **Perilaku idempoten**
 
-| Kondisi | Hasil |
-|---|---|
-| Tidak ada sesi aktif | Sesi baru dibuat, tunggu snapshot pertama (maks 15 detik) |
-| Sesi aktif dengan method + phone sama | Kembalikan snapshot sesi yang sedang berjalan (tidak membuat sesi baru) |
-| Sesi aktif dengan method/phone berbeda | `409 pairing_in_progress` |
-| Instance sudah `connected` | `409 already_paired` |
-| Instance lain sedang pairing | `409 pairing_busy` + `Retry-After` |
+| Kondisi                                | Hasil                                                                   |
+| -------------------------------------- | ----------------------------------------------------------------------- |
+| Tidak ada sesi aktif                   | Sesi baru dibuat, tunggu snapshot pertama (maks 15 detik)               |
+| Sesi aktif dengan method + phone sama  | Kembalikan snapshot sesi yang sedang berjalan (tidak membuat sesi baru) |
+| Sesi aktif dengan method/phone berbeda | `409 pairing_in_progress`                                               |
+| Instance sudah `connected`             | `409 already_paired`                                                    |
+| Instance lain sedang pairing           | `409 pairing_busy` + `Retry-After`                                      |
 
 **Response `200 OK`**
 
@@ -191,15 +191,15 @@ Body kosong, `{}`, atau tanpa `Content-Type` → mode QR.
 }
 ```
 
-| Field | Keterangan |
-|---|---|
-| `method` | `qr` \| `code` |
-| `state` | Lihat tabel state §1.5 |
-| `pairing_code` | Kode 8 digit dengan format `XXXX-XXXX`, `null` pada mode QR |
-| `qr_raw` | String mentah dari whatsmeow untuk render QR di frontend (mis. `qrcode.js`), `null` pada mode code |
-| `qr_image_url` | Path relatif ke waapi; **harus di-proxy** oleh backend (butuh `X-API-Key`) |
-| `expires_in` | Detik sampai QR saat ini kedaluwarsa (`QRChannelItem.Timeout` dikurangi waktu berlalu). Mode code = sisa umur sesi |
-| `session_expires_in` | Detik sampai sesi pairing ditutup paksa (TTL 170s) |
+| Field                | Keterangan                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `method`             | `qr` \| `code`                                                                                                     |
+| `state`              | Lihat tabel state §1.5                                                                                             |
+| `pairing_code`       | Kode 8 digit dengan format `XXXX-XXXX`, `null` pada mode QR                                                        |
+| `qr_raw`             | String mentah dari whatsmeow untuk render QR di frontend (mis. `qrcode.js`), `null` pada mode code                 |
+| `qr_image_url`       | Path relatif ke waapi; **harus di-proxy** oleh backend (butuh `X-API-Key`)                                         |
+| `expires_in`         | Detik sampai QR saat ini kedaluwarsa (`QRChannelItem.Timeout` dikurangi waktu berlalu). Mode code = sisa umur sesi |
+| `session_expires_in` | Detik sampai sesi pairing ditutup paksa (TTL 170s)                                                                 |
 
 ### 2.2 `GET /v1/instances/{id}/pair` — Status pairing (polling)
 
@@ -213,16 +213,16 @@ Response `200`: snapshot dengan `state: "cancelled"`. Tanpa sesi aktif: `404 no_
 
 ### 2.4 `GET /v1/instances/{id}/qr.png` — Gambar QR
 
-| Query | Tipe | Default | Batas | Keterangan |
-|---|---|---|---|---|
-| `scale` | int | `6` | 2–16 | Piksel per modul QR (QR WhatsApp ±53 modul → scale 6 ≈ 320 px) |
+| Query   | Tipe | Default | Batas | Keterangan                                                     |
+| ------- | ---- | ------- | ----- | -------------------------------------------------------------- |
+| `scale` | int  | `6`     | 2–16  | Piksel per modul QR (QR WhatsApp ±53 modul → scale 6 ≈ 320 px) |
 
 **Response `200`**
 
-| Header | Nilai |
-|---|---|
-| `Content-Type` | `image/png` |
-| `Cache-Control` | `no-store, max-age=0` |
+| Header            | Nilai                  |
+| ----------------- | ---------------------- |
+| `Content-Type`    | `image/png`            |
+| `Cache-Control`   | `no-store, max-age=0`  |
 | `X-QR-Expires-In` | Sisa detik QR saat ini |
 
 Body: PNG mentah (±1–3 KB). Kondisi gagal: `404 qr_not_available` (sesi mode code, sesi terminal, atau QR belum tersedia).
@@ -236,21 +236,21 @@ Body: PNG mentah (±1–3 KB). Kondisi gagal: `404 qr_not_available` (sesi mode 
 
 Envelope mengikuti [`respond.go`](../internal/httpapi/respond.go): `{"error":{"code":"...","message":"...","retry_after":N}}`.
 
-| HTTP | `error.code` | Kapan |
-|---|---|---|
-| 400 | `invalid_phone` | `phone` bukan 8–15 digit atau diawali `0` |
-| 400 | `invalid_request` | Body bukan JSON valid / > 1 KB |
-| 401 | `unauthorized` | Key salah/dicabut |
-| 403 | `forbidden_instance` | Key ter-scope ke instance lain |
-| 404 | `instance_not_found` | Instance tidak ada |
-| 404 | `no_pairing_session` | `GET /pair` tanpa riwayat sesi |
-| 404 | `no_active_pairing` | `DELETE /pair` tanpa sesi aktif |
-| 404 | `qr_not_available` | `qr.png` saat tidak ada QR aktif |
-| 409 | `already_paired` | Instance sudah tertaut; logout dulu |
-| 409 | `pairing_in_progress` | Sesi aktif dengan method/phone berbeda |
-| 409 | `pairing_busy` | Instance lain sedang pairing (`Retry-After: 10`) |
-| 502 | `pairing_failed` | Connect/`PairPhone` gagal (detail di `message`) |
-| 504 | `pairing_start_timeout` | QR/kode pertama tidak muncul dalam 15 detik |
+| HTTP | `error.code`            | Kapan                                            |
+| ---- | ----------------------- | ------------------------------------------------ |
+| 400  | `invalid_phone`         | `phone` bukan 8–15 digit atau diawali `0`        |
+| 400  | `invalid_request`       | Body bukan JSON valid / > 1 KB                   |
+| 401  | `unauthorized`          | Key salah/dicabut                                |
+| 403  | `forbidden_instance`    | Key ter-scope ke instance lain                   |
+| 404  | `instance_not_found`    | Instance tidak ada                               |
+| 404  | `no_pairing_session`    | `GET /pair` tanpa riwayat sesi                   |
+| 404  | `no_active_pairing`     | `DELETE /pair` tanpa sesi aktif                  |
+| 404  | `qr_not_available`      | `qr.png` saat tidak ada QR aktif                 |
+| 409  | `already_paired`        | Instance sudah tertaut; logout dulu              |
+| 409  | `pairing_in_progress`   | Sesi aktif dengan method/phone berbeda           |
+| 409  | `pairing_busy`          | Instance lain sedang pairing (`Retry-After: 10`) |
+| 502  | `pairing_failed`        | Connect/`PairPhone` gagal (detail di `message`)  |
+| 504  | `pairing_start_timeout` | QR/kode pertama tidak muncul dalam 15 detik      |
 
 ### 2.6 Webhook event `pairing`
 
@@ -273,14 +273,14 @@ Dikirim lewat dispatcher yang sudah ada (HMAC, retry, outbox). Header `X-WA-Even
 }
 ```
 
-| `data.status` | Dipicu saat |
-|---|---|
-| `qr_refreshed` | Setiap QR baru (pertama 60s, selanjutnya ~20s) |
-| `code_generated` | `PairPhone` mengembalikan kode |
-| `connected` | Pairing sukses (`jid` terisi) |
-| `timeout` | TTL habis / channel QR ditutup server |
-| `cancelled` | `DELETE /pair` atau CLI dibatalkan |
-| `error` | Gagal (`error` terisi) |
+| `data.status`    | Dipicu saat                                    |
+| ---------------- | ---------------------------------------------- |
+| `qr_refreshed`   | Setiap QR baru (pertama 60s, selanjutnya ~20s) |
+| `code_generated` | `PairPhone` mengembalikan kode                 |
+| `connected`      | Pairing sukses (`jid` terisi)                  |
+| `timeout`        | TTL habis / channel QR ditutup server          |
+| `cancelled`      | `DELETE /pair` atau CLI dibatalkan             |
+| `error`          | Gagal (`error` terisi)                         |
 
 > [!WARNING]
 > Default `webhook_events` instance adalah `message,receipt,connection`. Event `pairing` **tidak terkirim** sampai ditambahkan: `waapi edit kostash --events message,receipt,connection,pairing`. Default untuk instance baru di migrasi berikutnya diubah menjadi menyertakan `pairing`.
@@ -291,17 +291,17 @@ Dikirim lewat dispatcher yang sudah ada (HMAC, retry, outbox). Header `X-WA-Even
 
 Ringkasan perubahan:
 
-| File | Aksi |
-|---|---|
-| `internal/wa/pairing.go` | **Baru** — `pairSession`, state, snapshot, subscriber, PNG cache |
-| `internal/wa/instance.go` | Hapus `Pair()` lama, tambah `StartPairing`, `PairingSnapshot`, `CancelPairing`, field `pairing` |
-| `internal/wa/manager.go` | `pairingSem` dipakai via `TryAcquire`; default events menyertakan `pairing` |
-| `internal/httpapi/pairing.go` | **Baru** — 4 handler |
-| `internal/httpapi/router.go` | Registrasi 4 route |
-| `internal/httpapi/respond.go` | Mapping sentinel error pairing |
-| `internal/control/stream.go` | CLI memakai `StartPairing` + `Subscribe` |
-| `internal/store/migrations/0002_pairing_event.sql` | **Baru** — default `webhook_events` menyertakan `pairing` |
-| `go.mod` | `rsc.io/qr` naik dari `// indirect` menjadi direct (otomatis via `go mod tidy`) |
+| File                                               | Aksi                                                                                            |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `internal/wa/pairing.go`                           | **Baru** — `pairSession`, state, snapshot, subscriber, PNG cache                                |
+| `internal/wa/instance.go`                          | Hapus `Pair()` lama, tambah `StartPairing`, `PairingSnapshot`, `CancelPairing`, field `pairing` |
+| `internal/wa/manager.go`                           | `pairingSem` dipakai via `TryAcquire`; default events menyertakan `pairing`                     |
+| `internal/httpapi/pairing.go`                      | **Baru** — 4 handler                                                                            |
+| `internal/httpapi/router.go`                       | Registrasi 4 route                                                                              |
+| `internal/httpapi/respond.go`                      | Mapping sentinel error pairing                                                                  |
+| `internal/control/stream.go`                       | CLI memakai `StartPairing` + `Subscribe`                                                        |
+| `internal/store/migrations/0002_pairing_event.sql` | **Baru** — default `webhook_events` menyertakan `pairing`                                       |
+| `go.mod`                                           | `rsc.io/qr` naik dari `// indirect` menjadi direct (otomatis via `go mod tidy`)                 |
 
 ### 3.1 `internal/wa/pairing.go` (baru)
 
@@ -1067,42 +1067,42 @@ func (s *Server) handlePairInstance(w http.ResponseWriter, r *http.Request) {
 
 `internal/cli/instance.go` (`runInstancePair`) menyesuaikan decode dari `wa.PairEvent` ke `wa.PairSnapshot`:
 
-| `snap.State` | Aksi CLI |
-|---|---|
-| `qr_refreshed` | `renderQR(*snap.QRRaw)` |
-| `code_generated` | Cetak `*snap.PairingCode` |
-| `connected` | `✔ Terhubung sebagai *snap.JID` |
-| `timeout` / `error` | Kembalikan error |
-| `cancelled` | `Pairing dibatalkan.` |
+| `snap.State`        | Aksi CLI                        |
+| ------------------- | ------------------------------- |
+| `qr_refreshed`      | `renderQR(*snap.QRRaw)`         |
+| `code_generated`    | Cetak `*snap.PairingCode`       |
+| `connected`         | `✔ Terhubung sebagai *snap.JID` |
+| `timeout` / `error` | Kembalikan error                |
+| `cancelled`         | `Pairing dibatalkan.`           |
 
 Snapshot dengan `qr_raw` yang sama dengan sebelumnya di-skip agar QR tidak dicetak ulang.
 
 ### 3.8 Analisis memori (zero regression)
 
-| Item | Biaya | Lifetime |
-|---|---|---|
-| `pairSession` struct + snapshot | < 1 KB | Sampai `POST /pair` berikutnya |
-| Goroutine `run()` | ~8 KB stack | Maks 170 detik |
+| Item                                                 | Biaya                                           | Lifetime                          |
+| ---------------------------------------------------- | ----------------------------------------------- | --------------------------------- |
+| `pairSession` struct + snapshot                      | < 1 KB                                          | Sampai `POST /pair` berikutnya    |
+| Goroutine `run()`                                    | ~8 KB stack                                     | Maks 170 detik                    |
 | Goroutine internal whatsmeow (QR emitter, websocket) | ~3–5 MB (sama seperti pairing via CLI saat ini) | Maks 170 detik, lalu `Disconnect` |
-| Cache PNG | ~1–3 KB per scale aktif (hanya 1 disimpan) | Dibebaskan di `defer` |
-| Encode QR sementara | ~50–150 KB transient | Langsung GC |
-| Subscriber channel | 8 slot × ~200 B | Selama CLI streaming |
+| Cache PNG                                            | ~1–3 KB per scale aktif (hanya 1 disimpan)      | Dibebaskan di `defer`             |
+| Encode QR sementara                                  | ~50–150 KB transient                            | Langsung GC                       |
+| Subscriber channel                                   | 8 slot × ~200 B                                 | Selama CLI streaming              |
 
 Semaphore global `pairingSem = 1` tetap menjamin **hanya satu** spike app-state sync awal per proses. Tidak ada perubahan pada budget di `ARCHITECTURE.md` §4.1.
 
 ### 3.9 Jaminan zero goroutine leak
 
-| Skenario | Mekanisme |
-|---|---|
-| Browser ditutup saat pairing | Sesi tidak terikat request; `context.WithTimeout(170s)` memaksa selesai |
-| `POST /pair` dibatalkan klien sebelum QR pertama | `WaitReady` keluar via `ctx.Done()`; sesi tetap terikat TTL |
-| Polling berhenti total | Tidak ada goroutine per-poll; `GET` hanya baca snapshot |
-| Subscriber CLI lambat | `update()` non-blocking send; tidak menahan `run()` |
-| Subscriber lupa unsubscribe | `run()` defer menutup semua channel subscriber |
-| Instance dihapus saat pairing | `Close()` → `Cancel()` → tunggu `done` |
-| Daemon SIGTERM | `Manager.Close()` → `Instance.Close()` → sesi dibatalkan dan ditunggu |
-| whatsmeow channel ditutup tanpa event | Branch `!ok` → state `timeout` → return |
-| `PairPhone` menggantung | Memakai `s.ctx` dengan TTL yang sama |
+| Skenario                                         | Mekanisme                                                               |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| Browser ditutup saat pairing                     | Sesi tidak terikat request; `context.WithTimeout(170s)` memaksa selesai |
+| `POST /pair` dibatalkan klien sebelum QR pertama | `WaitReady` keluar via `ctx.Done()`; sesi tetap terikat TTL             |
+| Polling berhenti total                           | Tidak ada goroutine per-poll; `GET` hanya baca snapshot                 |
+| Subscriber CLI lambat                            | `update()` non-blocking send; tidak menahan `run()`                     |
+| Subscriber lupa unsubscribe                      | `run()` defer menutup semua channel subscriber                          |
+| Instance dihapus saat pairing                    | `Close()` → `Cancel()` → tunggu `done`                                  |
+| Daemon SIGTERM                                   | `Manager.Close()` → `Instance.Close()` → sesi dibatalkan dan ditunggu   |
+| whatsmeow channel ditutup tanpa event            | Branch `!ok` → state `timeout` → return                                 |
+| `PairPhone` menggantung                          | Memakai `s.ctx` dengan TTL yang sama                                    |
 
 ---
 
@@ -1404,19 +1404,19 @@ Implementasi produksi membungkus `*whatsmeow.Client`; test memakai `fakeDriver` 
 
 ### 5.2 Unit test (`internal/wa/pairing_test.go`)
 
-| Test | Skenario | Assertion |
-|---|---|---|
-| `TestPairQRRefreshAndSuccess` | Fake kirim `code` ×2 lalu `success` | State `qr_refreshed` → `connected`, `qr_raw` = code terakhir, semaphore terlepas |
-| `TestPairCodeMode` | Mode phone, fake kirim `code` | `PairPhone` dipanggil **tepat sekali**, state `code_generated`, `qr_raw` null |
-| `TestPairTimeoutTTL` | TTL di-override 200ms, fake tidak pernah success | State `timeout`, `done` tertutup < 1s |
-| `TestPairCancel` | `CancelPairing()` saat aktif | State `cancelled`, `Disconnect` dipanggil |
-| `TestPairChannelClosed` | Fake menutup channel tanpa event | State `timeout` |
-| `TestPairIdempotent` | `StartPairing("")` dua kali | Pointer sesi sama |
-| `TestPairInProgressConflict` | QR aktif lalu `StartPairing("62812...")` | `ErrPairingInProgress` |
-| `TestPairBusyAcrossInstances` | Instance A aktif, B mulai | `ErrPairingBusy` tanpa blocking (selesai < 10ms) |
-| `TestPairInvalidPhone` | `0812...`, `123` | `ErrInvalidPhone` |
-| `TestPNGCache` | `PNG(6)` dua kali, lalu QR berganti | Panggilan kedua mengembalikan slice identik; setelah QR baru hasil berbeda |
-| `TestSubscriberSlowNonBlocking` | Subscriber tidak membaca, fake kirim 50 QR | `run()` tetap selesai, tidak deadlock |
+| Test                            | Skenario                                         | Assertion                                                                        |
+| ------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `TestPairQRRefreshAndSuccess`   | Fake kirim `code` ×2 lalu `success`              | State `qr_refreshed` → `connected`, `qr_raw` = code terakhir, semaphore terlepas |
+| `TestPairCodeMode`              | Mode phone, fake kirim `code`                    | `PairPhone` dipanggil **tepat sekali**, state `code_generated`, `qr_raw` null    |
+| `TestPairTimeoutTTL`            | TTL di-override 200ms, fake tidak pernah success | State `timeout`, `done` tertutup < 1s                                            |
+| `TestPairCancel`                | `CancelPairing()` saat aktif                     | State `cancelled`, `Disconnect` dipanggil                                        |
+| `TestPairChannelClosed`         | Fake menutup channel tanpa event                 | State `timeout`                                                                  |
+| `TestPairIdempotent`            | `StartPairing("")` dua kali                      | Pointer sesi sama                                                                |
+| `TestPairInProgressConflict`    | QR aktif lalu `StartPairing("62812...")`         | `ErrPairingInProgress`                                                           |
+| `TestPairBusyAcrossInstances`   | Instance A aktif, B mulai                        | `ErrPairingBusy` tanpa blocking (selesai < 10ms)                                 |
+| `TestPairInvalidPhone`          | `0812...`, `123`                                 | `ErrInvalidPhone`                                                                |
+| `TestPNGCache`                  | `PNG(6)` dua kali, lalu QR berganti              | Panggilan kedua mengembalikan slice identik; setelah QR baru hasil berbeda       |
+| `TestSubscriberSlowNonBlocking` | Subscriber tidak membaca, fake kirim 50 QR       | `run()` tetap selesai, tidak deadlock                                            |
 
 TTL & start timeout dibuat `var` (bukan `const`) di level package agar test bisa meng-override:
 
@@ -1428,32 +1428,35 @@ var (
 )
 ```
 
-### 5.3 Goroutine leak test
+### 5.3 Pengujian Kebocoran Goroutine (`goroutineleak`)
 
-Gunakan `go.uber.org/goleak` (dependensi **test-only**, tidak masuk binary):
+Gunakan detektor race dan profil `goroutineleak` bawaan Go 1.27 (tanpa dependensi pihak ketiga):
 
-```go
-// TestMain memastikan seluruh test package wa tidak meninggalkan goroutine
-func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
-}
+```bash
+go test -race -count=3 ./internal/wa/... ./internal/httpapi/...
 ```
 
-Setiap test di §5.2 otomatis gagal jika ada goroutine `pairSession.run`, subscriber, atau timer yang tersisa.
+Saat pengujian integrasi daemon aktif, status bebas kebocoran goroutine pasca-pairing dapat diverifikasi lewat control plane:
+
+```bash
+waapi debug pprof goroutineleak -o goroutineleak.pprof
+```
+
+Setiap goroutine `pairSession.run`, subscriber SSE, maupun timer TTL wajib bersih setelah pairing selesai, dibatalkan (`DELETE /pair`), atau melewati TTL `170` detik.
 
 ### 5.4 HTTP handler test (`internal/httpapi/pairing_test.go`)
 
-| Test | Assertion |
-|---|---|
-| `POST /pair` tanpa key | `401 unauthorized` |
-| `POST /pair` key scope instance lain | `403 forbidden_instance` |
-| `POST /pair` body `{"phone":"0812"}` | `400 invalid_phone` |
-| `POST /pair` body > 1KB | `400 invalid_request` |
-| `GET /pair` sebelum ada sesi | `404 no_pairing_session` |
-| `GET /qr.png` mode code | `404 qr_not_available` |
-| `GET /qr.png?scale=99` | `400 invalid_request` |
-| `GET /qr.png` sukses | `Content-Type: image/png`, 8 byte awal = signature PNG `\x89PNG\r\n\x1a\n`, `Cache-Control: no-store` |
-| `DELETE /pair` tanpa sesi aktif | `404 no_active_pairing` |
+| Test                                 | Assertion                                                                                             |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `POST /pair` tanpa key               | `401 unauthorized`                                                                                    |
+| `POST /pair` key scope instance lain | `403 forbidden_instance`                                                                              |
+| `POST /pair` body `{"phone":"0812"}` | `400 invalid_phone`                                                                                   |
+| `POST /pair` body > 1KB              | `400 invalid_request`                                                                                 |
+| `GET /pair` sebelum ada sesi         | `404 no_pairing_session`                                                                              |
+| `GET /qr.png` mode code              | `404 qr_not_available`                                                                                |
+| `GET /qr.png?scale=99`               | `400 invalid_request`                                                                                 |
+| `GET /qr.png` sukses                 | `Content-Type: image/png`, 8 byte awal = signature PNG `\x89PNG\r\n\x1a\n`, `Cache-Control: no-store` |
+| `DELETE /pair` tanpa sesi aktif      | `404 no_active_pairing`                                                                               |
 
 ### 5.5 Race detector
 
@@ -1495,28 +1498,27 @@ systemctl show waapi -p MemoryPeak
 
 ### 5.7 Kriteria selesai
 
-| Kriteria | Target |
-|---|---|
-| Unit + handler test | 100% lulus dengan `-race` |
-| goleak | Nol goroutine tersisa |
-| Goroutine setelah TTL | Kembali ke baseline ±2 |
-| RSS setelah stress 50 siklus | < baseline + 5 MB |
-| `MemoryPeak` cgroup selama pairing | < 60 MB |
-| Pairing nyata QR & code | `connected` dan instance auto-reconnect setelah `systemctl restart waapi` |
-| CLI `waapi pair` | Tetap berfungsi dengan mesin baru; Ctrl+C → `cancelled` |
+| Kriteria                           | Target                                                                    |
+| ---------------------------------- | ------------------------------------------------------------------------- |
+| Unit + handler test                | 100% lulus dengan `-race`                                                 |
+| Kebocoran goroutine                | Nol goroutine tersisa (`goroutineleak`)                                   |
+| Goroutine setelah TTL              | Kembali ke baseline ±2                                                    |
+| RSS setelah stress 50 siklus       | < baseline + 5 MB                                                         |
+| `MemoryPeak` cgroup selama pairing | < 60 MB                                                                   |
+| Pairing nyata QR & code            | `connected` dan instance auto-reconnect setelah `systemctl restart waapi` |
+| CLI `waapi pair`                   | Tetap berfungsi dengan mesin baru; Ctrl+C → `cancelled`                   |
 
 ---
 
 ## 6. Known Pitfalls
 
-| Pitfall | Mitigasi |
-|---|---|
-| `<img src>` tidak bisa kirim `X-API-Key` | Proxy via Laravel (§4.4) |
-| Nomor diawali `0` (format lokal) | Ditolak `invalid_phone`; validasi juga di Laravel |
-| `PairPhone` berulang → `rate-overlimit` | Idempoten: `POST` ulang dengan phone sama mengembalikan sesi berjalan, tidak memanggil `PairPhone` lagi |
-| QR pertama berlaku 60 detik, berikutnya ~20 detik | Gunakan `expires_in` dari response, bukan angka tetap |
-| Event `pairing` tidak sampai ke webhook | Tambahkan `pairing` ke `--events` instance lama (§2.6) |
-| Pairing ulang saat instance `connected` | `409 already_paired`; jalankan `waapi logout <id>` dulu |
-| `resolveOrCreateDevice` menghapus device lama | Hanya dipanggil setelah cek `IsConnected()` false; instance `logged_out` memang perlu device baru |
-| Reverse proxy (Nginx) timeout < 15 detik | Set `proxy_read_timeout 30s` untuk path `/v1/instances/*/pair` |
-
+| Pitfall                                           | Mitigasi                                                                                                |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `<img src>` tidak bisa kirim `X-API-Key`          | Proxy via Laravel (§4.4)                                                                                |
+| Nomor diawali `0` (format lokal)                  | Ditolak `invalid_phone`; validasi juga di Laravel                                                       |
+| `PairPhone` berulang → `rate-overlimit`           | Idempoten: `POST` ulang dengan phone sama mengembalikan sesi berjalan, tidak memanggil `PairPhone` lagi |
+| QR pertama berlaku 60 detik, berikutnya ~20 detik | Gunakan `expires_in` dari response, bukan angka tetap                                                   |
+| Event `pairing` tidak sampai ke webhook           | Tambahkan `pairing` ke `--events` instance lama (§2.6)                                                  |
+| Pairing ulang saat instance `connected`           | `409 already_paired`; jalankan `waapi logout <id>` dulu                                                 |
+| `resolveOrCreateDevice` menghapus device lama     | Hanya dipanggil setelah cek `IsConnected()` false; instance `logged_out` memang perlu device baru       |
+| Reverse proxy (Nginx) timeout < 15 detik          | Set `proxy_read_timeout 30s` untuk path `/v1/instances/*/pair`                                          |

@@ -1,6 +1,6 @@
-# Dokumentasi API — wa-api
+# Dokumentasi API — waapi
 
-> Status: terimplementasi (`internal/httpapi`, `internal/control`, `internal/cli`). Base URL: `http://127.0.0.1:8080` (diekspos via reverse proxy TLS).
+> Status: terimplementasi (`internal/httpapi`, `internal/control`, `internal/cli`, `v2.0.0`). Base URL: `http://127.0.0.1:8080` (diekspos via reverse proxy TLS).
 > Autentikasi: header `X-API-Key: wak_...` atau `Authorization: Bearer wak_...` (bukan Sanctum). Key dibuat lewat CLI `waapi key add --name <nama>`. Setiap respons membawa header `X-Request-Id`.
 
 ## Format Error Umum
@@ -554,13 +554,13 @@
 
 | Field | Detail |
 |---|---|
-| Method + Endpoint | POST /mcp (beserta `GET` / `DELETE` Streamable HTTP MCP 2026-07-28) |
+| Method + Endpoint | POST /mcp (Streamable HTTP MCP `2026-07-28` & fallback `2025-11-25`) |
 | Auth Required | Yes (`Authorization: Bearer` / `X-API-Key`, scope `mcp`, dibatasi `instance_id` key bila terisi) |
 | Headers | `Authorization: Bearer wak_...` atau `X-API-Key`, `MCP-Protocol-Version` (`2026-07-28` / `2025-11-25`), `Mcp-Method`, `Mcp-Name`, `Mcp-Session-Id`, `Origin` (bila dikirim, wajib cocok `WAAPI_MCP_ALLOWED_ORIGINS`) |
 | Query Params | - |
 | Request Body | JSON-RPC 2.0 MCP (maks `1 MiB`), termasuk `initialize`, `server/discover`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `subscriptions/listen` |
-| Response | `200` (`application/json` atau `text/event-stream`) · `202` notifikasi · `403 origin_forbidden` / `scope_denied` · `404 mcp_disabled` · `429 mcp_overloaded` (semafor `8`) |
-| Notes | Lazy init pada request pertama; `X-Waapi-Principal` eksternal dihapus middleware; 15 tool terfilter per `KeyPolicy.Tools`; elisitasi MRTR / JSON-RPC error `-32042` + `approval_token` HMAC-SHA256 (`5m`) untuk `first_contact=ask` dan `destructive=ask`; langganan resource maks `32` URI global (`0` subscriber = `0` goroutine) |
+| Response | `200` (`application/json` atau `text/event-stream`) · `202` notifikasi · `403 origin_forbidden` / `scope_denied` · `404 mcp_disabled` · `405` untuk method non-`POST` · `429 mcp_overloaded` (semafor `8`) |
+| Notes | Pada router HTTP publik hanya method `POST /mcp` yang didaftarkan (sedangkan `/control/mcp` menerima seluruh method untuk bridge CLI); lazy init pada request pertama; `X-Waapi-Principal` eksternal dihapus middleware; 15 tool terfilter per `KeyPolicy.Tools`; elisitasi MRTR / JSON-RPC error `-32042` + `approval_token` HMAC-SHA256 (`5m`) untuk `first_contact=ask` dan `destructive=ask`; langganan resource maks `32` URI global (`0` subscriber = `0` goroutine) |
 
 ## GET / POST /v2/instances/{id}/hooks
 
@@ -610,7 +610,7 @@
 
 ## Control Plane (CLI only, Unix socket)
 
-Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.sock` (perm 0660).
+Tidak diekspos via HTTP publik; hanya diakses perintah `waapi` lewat `control.sock` (perm 0660).
 - `PATCH /control/instances/{id}` menerima field tambahan `settings` (objek JSON parsial untuk di-merge ke `InstanceSettings`; diakses dari CLI lewat `waapi edit <id> --set key=value`) serta `webhook_from` (`now` atau `retained`, diakses lewat `waapi webhook set <id> <url> [--from now|retained]`).
 - `POST /control/instances/{id}/webhook/resume` menghapus status `webhook_paused` dan menyalakan ulang deliverer dari cursor tersimpan (`waapi webhook resume <id>`).
 - `GET /control/instances/{id}/webhook/dlq` (`?limit=N`), `POST /control/instances/{id}/webhook/dlq/replay` (`{ all, seq, seqs }`), dan `DELETE /control/instances/{id}/webhook/dlq` mengelola dead-letter queue (`waapi webhook dlq <id> <ls|replay|purge>`).
@@ -622,7 +622,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `GET /control/instances/{id}/health` mengembalikan `HealthReport` Guardian lengkap untuk sebuah instance (`waapi health <id> [--json]`).
 - `POST /control/keys` mendukung atribut v2 (`scopes`, `expires_in`/`expires_at`, `rate_per_sec`, `policy`), `GET /control/keys/{id}` menampilkan detail metadata key tanpa rahasia (`waapi key show <id>`), dan `POST /control/keys/{id}/rotate` menerbitkan key pengganti sekaligus menetapkan masa grace key lama (`waapi key rotate <id> [--grace 24h]`).
 - `GET /control/audit` (`?since=24h&action=...&limit=100`) membaca entri `audit_log` beserta actor UID (`SO_PEERCRED` Linux) / key ID (`waapi audit`).
-- `POST /control/backup` membuat backup atomik `VACUUM INTO` untuk `app.db`, `journal.db`, dan `wa.db` ke `backups/db-<versi>-<timestamp>/` (`0600`, retensi 3 backup terbaru); dipanggil otomatis oleh `waapi update` bila daemon hidup. Socket `control.sock` dibuat atomik lewat temp socket -> `chmod 0660` -> `rename`.
+- `POST /control/backup` membuat backup atomik `VACUUM INTO` untuk `app.db`, `journal.db`, dan `wa.db` ke `backups/db-<versi>-<timestamp>/` (`0600`, retensi 3 backup terbaru); diakses lewat `waapi backup [--out dir] [--json]` (bila `--out` dipakai, proses CLI menyalin ketiga berkas hasil `VACUUM INTO` ke tujuan) serta dipanggil otomatis oleh `waapi update` bila daemon hidup. Socket `control.sock` dibuat atomik lewat temp socket -> `chmod 0660` -> `rename`.
 - `POST /control/instances/{id}/context` (`{ enabled, purge? }`) mengaktifkan/mematikan context store sekaligus opsional mem-purge data instance, dan `POST /control/instances/{id}/context/purge` (`{ chat? }`) membersihkan satu chat atau seluruh instance (`waapi context <id> on|off [--purge]|purge [--chat jid]`, mencatat `audit_log`).
 - `/control/mcp` (`POST`/`GET`/`DELETE`) mengekspos server MCP Streamable HTTP ke `control.sock` dengan dukungan header `X-Waapi-Key-Id` opsional atau default policy operator lokal (`first_contact: ask`, `destructive: ask`); diakses dari CLI melalui bridge stdio `waapi mcp [--key KEY_ID] [--max-inflight 8]` (batas baris `1 MiB`, meneruskan `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/`Mcp-Session-Id`).
 - `/control/instances/{id}/hooks` (`GET`/`POST` dengan `trusted=1`), `POST /control/instances/{id}/hooks/{hook_id}/enable|disable`, `DELETE /control/instances/{id}/hooks/{hook_id}`, `GET /control/instances/{id}/hooks/logs` (`?hook=...&since=1h&limit=50`), dan `POST /control/instances/{id}/hooks/test` (dry-run rule ad-hoc `--file rule.json` maupun `hook_id`); diakses melalui CLI `waapi hook <ls|add|rm|enable|disable|logs|test>` serta dicatat ke `audit_log`.
