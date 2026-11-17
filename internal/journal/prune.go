@@ -220,6 +220,41 @@ func (j *Journal) pruneInstance(ctx context.Context, inst string, replayCutoff, 
 	return deleted, dropped, nil
 }
 
+// PruneHookRuns memangkas catatan eksekusi hook_runs yang melewati batas umur retensi secara bertahap.
+func (j *Journal) PruneHookRuns(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if j == nil || j.db == nil {
+		return 0, nil
+	}
+	if limit <= 0 {
+		limit = pruneChunkSize
+	}
+	cutoffMs := cutoff.UnixMilli()
+	var total int64
+	for {
+		if ctx.Err() != nil {
+			return total, ctx.Err()
+		}
+		res, err := j.db.ExecContext(ctx, `
+			DELETE FROM hook_runs
+			WHERE (instance_id, seq, hook_id) IN (
+				SELECT instance_id, seq, hook_id FROM hook_runs
+				WHERE at < ?
+				ORDER BY at ASC LIMIT ?
+			)`,
+			cutoffMs, limit,
+		)
+		if err != nil {
+			return total, fmt.Errorf("prune hook_runs: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < int64(limit) {
+			break
+		}
+	}
+	return total, nil
+}
+
 func (j *Journal) deleteReturningCount(ctx context.Context, query string, hasConsumer bool, minCursor int64, args ...any) (int64, int64, error) {
 	rows, err := j.db.QueryContext(ctx, query, args...)
 	if err != nil {

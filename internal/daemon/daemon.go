@@ -20,6 +20,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/guardian"
+	"github.com/fikfikk-org/waapi/internal/hooks"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
@@ -196,7 +197,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	for i := range instances {
 		instanceIDs = append(instanceIDs, instances[i].ID)
 	}
-	whSvc.Start(ctx, instanceIDs)
 
 	wh := webhook.NewDispatcher(st, nil, 0)
 	wh.SetTargetCache(tc)
@@ -306,8 +306,25 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			if _, aErr := auditLog.Prune(pCtx, time.Now().Add(-auth.AuditRetention)); aErr != nil && ctx.Err() == nil {
 				slog.Warn("pruner audit_log gagal", "err", aErr)
 			}
+			if _, hErr := j.PruneHookRuns(pCtx, time.Now().Add(-hooks.DefaultHookRunsKeep), 1000); hErr != nil && ctx.Err() == nil {
+				slog.Warn("pruner hook_runs gagal", "err", hErr)
+			}
 		},
 	})
+
+	hooksEng := hooks.NewEngine(hooks.EngineDeps{
+		AppStore: st,
+		Journal:  j,
+		Outbox:   outboxSvc,
+		WA:       waMgr,
+		CtxStore: ctxStore,
+		Targets:  tc,
+		Governor: gov,
+	})
+	whSvc.SetGate(hooksEng.Gate())
+	hooksEng.Start(ctx)
+	defer hooksEng.Stop()
+	whSvc.Start(ctx, instanceIDs)
 
 	mcpSrv := mcpserver.New(mcpserver.Deps{
 		Auth:      authMgr,
@@ -335,6 +352,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		control.WithAuditLog(auditLog),
 		control.WithContextStore(ctxStore),
 		control.WithMCP(mcpSrv),
+		control.WithHooks(hooksEng),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
@@ -368,7 +386,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithContextStore(ctxStore), httpapi.WithMCP(mcpSrv), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithContextStore(ctxStore), httpapi.WithMCP(mcpSrv), httpapi.WithHooks(hooksEng), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,
@@ -464,6 +482,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	_ = pubHTTP.Shutdown(shutCtx)
 	_ = ctrlHTTP.Shutdown(shutCtx)
 	mcpSrv.Close()
+	hooksEng.Stop()
 	outboxSvc.Stop()
 	_ = waMgr.Close()
 	guard.Stop()

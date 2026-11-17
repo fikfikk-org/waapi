@@ -79,6 +79,7 @@ func materialiseRoutePath(pattern string) (method, urlPath string) {
 	p := parts[1]
 	p = strings.ReplaceAll(p, "{id}", "sales")
 	p = strings.ReplaceAll(p, "{seq}", "1")
+	p = strings.ReplaceAll(p, "{hook_id}", "jam-buka")
 	p = strings.ReplaceAll(p, "{msg_id}", "msg_1")
 	p = strings.ReplaceAll(p, "{jid}", "6281234@s.whatsapp.net")
 	p = strings.ReplaceAll(p, "{wa_id}", "3EB0TEST")

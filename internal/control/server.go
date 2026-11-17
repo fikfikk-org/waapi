@@ -22,6 +22,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/guardian"
+	"github.com/fikfikk-org/waapi/internal/hooks"
 	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/mcpserver"
@@ -114,6 +115,15 @@ func WithMCP(ms *mcpserver.Server) ServerOption {
 	}
 }
 
+// WithHooks memasang mesin Reactive Hooks ke control plane.
+func WithHooks(eng *hooks.Engine) ServerOption {
+	return func(s *Server) {
+		if eng != nil {
+			s.hooks = eng
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -130,6 +140,7 @@ type Server struct {
 	audit      *auth.AuditLog
 	ctxStore   *ctxstore.Store
 	mcpSrv     *mcpserver.Server
+	hooks      *hooks.Engine
 	startedAt  time.Time
 	version    string
 }
@@ -238,6 +249,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /control/instances/{id}/messages", s.handleSendMessage)
 	mux.HandleFunc("POST /control/instances/{id}/context", s.handleContextToggle)
 	mux.HandleFunc("POST /control/instances/{id}/context/purge", s.handleContextPurge)
+	mux.HandleFunc("GET /control/instances/{id}/hooks", s.handleListHooks)
+	mux.HandleFunc("POST /control/instances/{id}/hooks", s.handleUpsertHook)
+	mux.HandleFunc("GET /control/instances/{id}/hooks/logs", s.handleListHookLogs)
+	mux.HandleFunc("POST /control/instances/{id}/hooks/test", s.handleTestHookDryRun)
+	mux.HandleFunc("POST /control/instances/{id}/hooks/{hook_id}/enable", s.handleEnableHook)
+	mux.HandleFunc("POST /control/instances/{id}/hooks/{hook_id}/disable", s.handleDisableHook)
+	mux.HandleFunc("DELETE /control/instances/{id}/hooks/{hook_id}", s.handleDeleteHook)
 	mux.HandleFunc("/control/mcp", s.handleMCP)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik

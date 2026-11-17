@@ -22,8 +22,8 @@ func (s stubGovernor) Level() governor.Level { return s.lvl }
 func TestServerRoutes(t *testing.T) {
 	srv := NewServer(nil, nil)
 	routes := srv.Routes()
-	if len(routes) != 42 {
-		t.Fatalf("diharapkan 42 route terdaftar, didapat %d", len(routes))
+	if len(routes) != 48 {
+		t.Fatalf("diharapkan 48 route terdaftar, didapat %d", len(routes))
 	}
 	for _, rt := range routes {
 		if rt.Pattern == "" || rt.Scope == "" {

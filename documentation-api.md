@@ -562,6 +562,42 @@
 | Response | `200` (`application/json` atau `text/event-stream`) · `202` notifikasi · `403 origin_forbidden` / `scope_denied` · `404 mcp_disabled` · `429 mcp_overloaded` (semafor `8`) |
 | Notes | Lazy init pada request pertama; `X-Waapi-Principal` eksternal dihapus middleware; 15 tool terfilter per `KeyPolicy.Tools`; elisitasi MRTR / JSON-RPC error `-32042` + `approval_token` HMAC-SHA256 (`5m`) untuk `first_contact=ask` dan `destructive=ask`; langganan resource maks `32` URI global (`0` subscriber = `0` goroutine) |
 
+## GET / POST /v2/instances/{id}/hooks
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/hooks & POST /v2/instances/{id}/hooks |
+| Auth Required | Yes (`Authorization: Bearer` / `X-API-Key`, scope `hooks:admin`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | - |
+| Request Body | `POST`: JSON `Rule` (`id`, `name?`, `enabled?`, `priority?`, `on`, `when?`, `do`, `throttle?`, `active_hours?`, `respect_takeover?`, `on_from_me?`, `stop?`) |
+| Response | `GET`: 200 `{ hooks: [...] }` · `POST`: 201 `HookDTO` (`trusted=false`) · 400 `invalid_spec` (menyebut path field) · 409 `hook_exists` · 422 `hooks_limit_reached` |
+| Notes | REST API selalu memaksa `trusted=false` (hanya `https://` publik non-privat yang diterima aksi `http`); batas `50` rule/instance |
+
+## GET / PUT / DELETE /v2/instances/{id}/hooks/{hook_id}
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET / PUT / DELETE /v2/instances/{id}/hooks/{hook_id} |
+| Auth Required | Yes (`Authorization: Bearer` / `X-API-Key`, scope `hooks:admin`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | - |
+| Request Body | `PUT`: JSON `Rule` (maks `256 KiB`) |
+| Response | 200 `HookDTO` (`GET`/`PUT`) atau `{ deleted: true, id }` (`DELETE`) · 400 `invalid_spec` · 404 `hook_not_found` |
+| Notes | Memperbarui rule via `PUT` REST otomatis menurunkan `trusted=false` dan mencatat `audit_log` (`hook.update`) |
+
+## POST /v2/instances/{id}/hooks/{hook_id}/test
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | POST /v2/instances/{id}/hooks/{hook_id}/test |
+| Auth Required | Yes (`Authorization: Bearer` / `X-API-Key`, scope `hooks:admin`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | - |
+| Request Body | `{ event: <Envelope v2 JSON> }` |
+| Response | 200 `{ matched, skipped_reason?, actions: [{ action, text?, to?, emoji?, url? }] }` · 400 `invalid_request` · 404 `hook_not_found` |
+| Notes | Dry-run terhadap rule `{hook_id}` tersimpan tanpa enqueue outbox, HTTP I/O, mutasi throttle, atau penulisan `hook_runs` |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -589,6 +625,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `POST /control/backup` membuat backup atomik `VACUUM INTO` untuk `app.db`, `journal.db`, dan `wa.db` ke `backups/db-<versi>-<timestamp>/` (`0600`, retensi 3 backup terbaru); dipanggil otomatis oleh `waapi update` bila daemon hidup. Socket `control.sock` dibuat atomik lewat temp socket -> `chmod 0660` -> `rename`.
 - `POST /control/instances/{id}/context` (`{ enabled, purge? }`) mengaktifkan/mematikan context store sekaligus opsional mem-purge data instance, dan `POST /control/instances/{id}/context/purge` (`{ chat? }`) membersihkan satu chat atau seluruh instance (`waapi context <id> on|off [--purge]|purge [--chat jid]`, mencatat `audit_log`).
 - `/control/mcp` (`POST`/`GET`/`DELETE`) mengekspos server MCP Streamable HTTP ke `control.sock` dengan dukungan header `X-Waapi-Key-Id` opsional atau default policy operator lokal (`first_contact: ask`, `destructive: ask`); diakses dari CLI melalui bridge stdio `waapi mcp [--key KEY_ID] [--max-inflight 8]` (batas baris `1 MiB`, meneruskan `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/`Mcp-Session-Id`).
+- `/control/instances/{id}/hooks` (`GET`/`POST` dengan `trusted=1`), `POST /control/instances/{id}/hooks/{hook_id}/enable|disable`, `DELETE /control/instances/{id}/hooks/{hook_id}`, `GET /control/instances/{id}/hooks/logs` (`?hook=...&since=1h&limit=50`), dan `POST /control/instances/{id}/hooks/test` (dry-run rule ad-hoc `--file rule.json` maupun `hook_id`); diakses melalui CLI `waapi hook <ls|add|rm|enable|disable|logs|test>` serta dicatat ke `audit_log`.
 
 ## Scheduled Tasks
 
@@ -610,4 +647,5 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Scheduled recycle harian | Tiap 30 detik cek `recycle_at` lokal | Refresh client `wa.Manager.Recycle` sekali sehari di luar jam sibuk | Dilewati untuk hari itu bila ada job `sending` atau aktivitas pesan 5 menit terakhir |
 | Boot binary pageout | 90 detik setelah start (bila `WAAPI_PAGEOUT_AFTER_BOOT` `cold` \| `pageout`) | Terapkan `SYS_MADVISE` pada mapping `r-xp`/`r--p` binary Linux (mati secara default) | Tandai halaman teks/rodata binary agar siap di-reclaim kernel |
 | Fanout subscription MCP | On-demand selama URI terlanggan > `0` (`0` subscriber = `0` goroutine) | Pantau notifikasi `journal.Subscribe` dan teruskan ke sesi MCP | Mengalirkan pembaruan resource `waapi://instances/{instance}/chats/{+chat}` & `.../health` (maks `32` URI global) |
+| Worker Reactive Hooks per instance | Berbasis sinyal `journal.Subscribe` selama instance memiliki `>= 1` rule aktif (`0` rule = `0` goroutine) | Evaluasi rule hooks terkompilasi berurutan, jaga human takeover & throttle, eksekusi aksi & beri sinyal `Webhook Gate` | Memajukan cursor `hooks`, menyisipkan job outbox (`origin=hook`), memicu `http` bertanda tangan, mencatat `hook_runs` (dipangkas tiap jam setelah `7 hari`) |
 

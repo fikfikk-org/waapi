@@ -61,8 +61,58 @@ func mustParsePrefixes(list []string) []netip.Prefix {
 
 // Policy mengendalikan pengecualian akses host atau IP privat pada koneksi keluar.
 type Policy struct {
-	AllowPrivate bool     // true hanya untuk URL yang dikonfigurasi operator (webhook, AI base URL)
-	AllowHosts   []string // pengecualian eksplisit host tertentu (pengujian)
+	AllowPrivate      bool     // true hanya untuk URL yang dikonfigurasi operator (webhook, AI base URL)
+	AllowLoopbackHTTP bool     // true khusus rule hooks trusted: izinkan HTTP/HTTPS ke host loopback murni
+	AllowHosts        []string // pengecualian eksplisit host tertentu (pengujian)
+}
+
+// IsLoopbackHost melaporkan apakah host adalah loopback murni (localhost, 127.0.0.1, ::1).
+func IsLoopbackHost(host string) bool {
+	h := strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if h == "localhost" {
+		return true
+	}
+	if ip, err := netip.ParseAddr(h); err == nil {
+		return ip.Unmap().IsLoopback()
+	}
+	return false
+}
+
+// ValidateHookURL memvalidasi URL aksi http pada hook sesuai tingkat kepercayaan rule (trusted mengizinkan loopback murni).
+func ValidateHookURL(rawURL string, trusted bool) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || strings.TrimSpace(u.Host) == "" {
+		return nil, ErrNonHTTPS
+	}
+	host := strings.Trim(strings.ToLower(strings.TrimSpace(u.Hostname())), "[]")
+	if host == "" {
+		return nil, ErrNonHTTPS
+	}
+	isLoopback := IsLoopbackHost(host) || strings.HasSuffix(host, ".localhost")
+
+	switch {
+	case strings.EqualFold(u.Scheme, "https"):
+		if isLoopback {
+			if !trusted {
+				return nil, fmt.Errorf("%w: host loopback membutuhkan rule trusted", ErrBlockedIP)
+			}
+			return u, nil
+		}
+		if ip, parseErr := netip.ParseAddr(host); parseErr == nil && IsBlocked(ip) {
+			return nil, fmt.Errorf("%w: %s", ErrBlockedIP, ip.Unmap().String())
+		}
+		return u, nil
+	case strings.EqualFold(u.Scheme, "http"):
+		if trusted && IsLoopbackHost(host) {
+			return u, nil
+		}
+		if ip, parseErr := netip.ParseAddr(host); parseErr == nil && IsBlocked(ip) && !ip.Unmap().IsLoopback() {
+			return nil, fmt.Errorf("%w: %s", ErrBlockedIP, ip.Unmap().String())
+		}
+		return nil, ErrNonHTTPS
+	default:
+		return nil, ErrNonHTTPS
+	}
 }
 
 // IsBlocked mengembalikan true jika alamat IP (setelah unmap IPv4-mapped) termasuk rentang privat atau terlarang.
@@ -122,9 +172,14 @@ func (p Policy) DialContext(ctx context.Context, network, addr string) (net.Conn
 	}
 
 	if !p.AllowPrivate && !p.isHostAllowed(host) {
+		loopbackHost := IsLoopbackHost(host)
 		for _, ip := range ips {
-			if IsBlocked(ip) {
-				return nil, fmt.Errorf("%w: %s", ErrBlockedIP, ip.Unmap().String())
+			unmapped := ip.Unmap()
+			if p.AllowLoopbackHTTP && loopbackHost && unmapped.IsLoopback() {
+				continue
+			}
+			if IsBlocked(unmapped) {
+				return nil, fmt.Errorf("%w: %s", ErrBlockedIP, unmapped.String())
 			}
 		}
 	}
@@ -168,6 +223,24 @@ func NewClient(p Policy, timeout time.Duration) *http.Client {
 			}
 			if !strings.EqualFold(req.URL.Scheme, "https") {
 				return ErrNonHTTPS
+			}
+			return nil
+		},
+	}
+}
+
+// NewHookClient membangun HTTP client anti-SSRF untuk aksi HTTP hook dengan pengecualian loopback hanya untuk rule trusted.
+func NewHookClient(trusted bool, timeout time.Duration) *http.Client {
+	p := Policy{AllowLoopbackHTTP: trusted}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: NewTransport(p),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return ErrTooManyRedirects
+			}
+			if _, err := ValidateHookURL(req.URL.String(), trusted); err != nil {
+				return err
 			}
 			return nil
 		},

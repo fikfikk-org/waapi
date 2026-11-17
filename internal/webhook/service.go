@@ -193,6 +193,16 @@ func defaultWebhookHTTPClient() *http.Client {
 	}
 }
 
+// SetGate memasang webhook.Gate untuk menunda atau menahan event yang di-suppress sebelum dikirim (sebelum Start).
+func (s *Service) SetGate(g Gate) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.gate = g
+	s.mu.Unlock()
+}
+
 // Start menyalakan deliverer lane untuk seluruh instance yang memiliki webhook aktif (tidak di-pause).
 func (s *Service) Start(ctx context.Context, instanceIDs []string) {
 	if s == nil || s.jr == nil {

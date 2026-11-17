@@ -256,6 +256,22 @@ func (s *Service) HasSending(ctx context.Context, instanceID string) (bool, erro
 	return sc.HasSending(ctx, instanceID)
 }
 
+type waIDChecker interface {
+	HasWAID(ctx context.Context, instanceID, waID string) (bool, error)
+}
+
+// HasWAID mengembalikan true jika pesan keluar dengan wa_id tersebut dibuat oleh outbox daemon.
+func (s *Service) HasWAID(ctx context.Context, instanceID, waID string) (bool, error) {
+	if s == nil || s.st == nil || instanceID == "" || waID == "" {
+		return false, nil
+	}
+	wc, ok := s.st.(waIDChecker)
+	if !ok {
+		return false, nil
+	}
+	return wc.HasWAID(ctx, instanceID, waID)
+}
+
 // Get mengambil detail satu job outbox milik instance tertentu.
 func (s *Service) Get(ctx context.Context, instanceID, id string) (*Job, error) {
 	if s == nil || s.st == nil {

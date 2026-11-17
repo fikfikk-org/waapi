@@ -18,6 +18,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
+	"github.com/fikfikk-org/waapi/internal/hooks"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/mcpserver"
 	"github.com/fikfikk-org/waapi/internal/media"
@@ -94,6 +95,15 @@ func WithMCP(ms *mcpserver.Server) ServerOption {
 	return func(s *Server) {
 		if ms != nil {
 			s.mcp = ms
+		}
+	}
+}
+
+// WithHooks memasang engine Reactive Hooks untuk reload saat mutasi rule serta simulasi dry-run.
+func WithHooks(eng *hooks.Engine) ServerOption {
+	return func(s *Server) {
+		if eng != nil {
+			s.hooks = eng
 		}
 	}
 }
@@ -238,6 +248,7 @@ type Server struct {
 	audit          *auth.AuditLog
 	ctxStore       *ctxstore.Store
 	mcp            *mcpserver.Server
+	hooks          *hooks.Engine
 	gov            governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -351,6 +362,12 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("GET /v2/instances/{id}/chats/{jid}/messages", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextMessages))
 	s.handle("GET /v2/instances/{id}/search", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextSearch))
 	s.handle("POST /mcp", auth.ScopeMCP, s.handleMCP)
+	s.handle("GET /v2/instances/{id}/hooks", auth.ScopeHooksAdmin, s.withInstanceAuth(s.handleV2ListHooks))
+	s.handle("POST /v2/instances/{id}/hooks", auth.ScopeHooksAdmin, s.withInstanceAuth(s.handleV2CreateHook))
+	s.handle("GET /v2/instances/{id}/hooks/{hook_id}", auth.ScopeHooksAdmin, s.withInstanceAuth(s.handleV2GetHook))
+	s.handle("PUT /v2/instances/{id}/hooks/{hook_id}", auth.ScopeHooksAdmin, s.withInstanceAuth(s.handleV2UpdateHook))
+	s.handle("DELETE /v2/instances/{id}/hooks/{hook_id}", auth.ScopeHooksAdmin, s.withInstanceAuth(s.handleV2DeleteHook))
+	s.handle("POST /v2/instances/{id}/hooks/{hook_id}/test", auth.ScopeHooksAdmin, s.withInstanceAuth(s.handleV2TestHook))
 
 	s.handler = requestIDAndRecoverMiddleware(s.mux)
 	return s

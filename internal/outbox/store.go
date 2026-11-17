@@ -96,6 +96,23 @@ func (s *SQLiteStore) HasSending(ctx context.Context, instanceID string) (bool, 
 	return exists == 1, nil
 }
 
+// HasWAID memeriksa apakah wa_id tertentu sudah tercatat milik instance di outbox (untuk deteksi human takeover).
+func (s *SQLiteStore) HasWAID(ctx context.Context, instanceID, waID string) (bool, error) {
+	if s == nil || s.db == nil || instanceID == "" || waID == "" {
+		return false, nil
+	}
+	var exists int
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT EXISTS(SELECT 1 FROM outbox WHERE instance_id = ? AND wa_id = ?)`,
+		instanceID, waID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("cek wa_id outbox: %w", err)
+	}
+	return exists == 1, nil
+}
+
 // Insert menyisipkan baris job baru dan mengembalikan ErrIdempotencyConflict jika melanggar indeks idem_key.
 func (s *SQLiteStore) Insert(ctx context.Context, job *Job) error {
 	if s == nil || s.db == nil {

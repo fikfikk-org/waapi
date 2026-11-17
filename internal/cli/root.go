@@ -89,6 +89,8 @@ func Execute(args []string) error {
 		return runContext(ctx, ctrl, rest)
 	case "mcp":
 		return runMCP(ctx, ctrl, rest)
+	case "hook":
+		return runHook(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
 	case "update", "self-update":
@@ -192,6 +194,7 @@ MANAJEMEN WEBHOOK:
   waapi send <id> <to> <text> [--wait] [--idem KEY]  Kirim pesan teks lewat durable outbox
   waapi health <id> [--json]                   Lihat skor kesehatan akun Guardian, kuota & faktor
   waapi context <id> on|off|purge [opsi]       Kelola context store FTS5 opt-in per instance
+  waapi hook <ls|add|rm|enable|disable|logs|test>  Kelola dan uji coba rule reactive hooks per instance
   waapi mcp [--key KEY_ID] [--max-inflight 8]  Bridge MCP stdio ke control.sock (/control/mcp)
 
 DAEMON, UPDATE & DIAGNOSTIK:

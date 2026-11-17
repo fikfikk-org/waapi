@@ -109,6 +109,14 @@ flowchart TD
         M3 -->|"disetujui + token valid"| M2
         M1 -->|"subscribe resource (maks 32 URI)"| M4["Fanout journal aktif selama subscriber > 0"]
     end
+    subgraph ReactiveHooks
+        HK0["Idle (0 rule aktif = 0 goroutine)"] -->|"rule aktif >= 1"| HK1["Konsumen journal hooks (1 lane/instance)"]
+        HK1 -->|"from_me non-outbox"| HK2["Catat Human Takeover LRU (30m)"]
+        HK1 -->|"stale / offline"| HK3["hook_runs: skipped_stale"]
+        HK1 -->|"takeover aktif / throttle / Red heavy"| HK4["hook_runs: skipped_takeover / throttled / skipped_pressure"]
+        HK1 -->|"lolos & cocok when"| HK5["Tulis matched -> Outbox/HTTP/MarkRead/Suppress -> done/error"]
+        HK5 -->|"commit cursor + sinyal Gate"| HK6["Webhook Gate lanjut atau suppress (fail-open 10s)"]
+    end
 ```
 
 ## Aturan per Entitas
@@ -288,6 +296,16 @@ flowchart TD
 | Outbox, Untrusted & MRTR | Semua aksi kirim wajib melewati `outbox.Enqueue` (`Origin{Kind: "mcp"}`); pesan eksternal ditandai `untrusted: true`; `first_contact: ask` (`send_message`) dan `destructive: ask` (`revoke_message`, `manage_group_participants` `remove`) menuntut elisitasi atau `approval_token` HMAC-SHA256 (secret acak 32 byte, TTL `5m`, kode `-32042`) | Token terikat key ID, tool, instance, target, dan hash argumen |
 | Resource & Subscriptions | Template `waapi://instances/{instance}/chats/{+chat}` & `waapi://instances/{instance}/health`; `SubscribeHandler` + `subscriptions/listen` dibatasi maks `32` URI global | Fanout `journal.Subscribe` hanya aktif selama URI langganan > `0` |
 
+### Reactive Hooks (`0005_hooks.sql` & `0008_hook_runs.sql`)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| Skema & Kompilasi Rule | JSON deklaratif (`id` slug `[a-z0-9_-]{1,40}`, `on`, `when` all/any/not & 19 field / 14 op, `do`, `throttle.per_chat`, `active_hours`, `respect_takeover` default `true`, `on_from_me`, `stop`) | Maks `64` kondisi, kedalaman `4`, regex `512` byte, `8` aksi, `50` rule/instance; error kompilasi menyebut path field persis |
+| Template & Aksi | `reply`, `send`, `react`, `mark_read`, `suppress_webhook`, `http`; substitusi `{{push_name}}`, `{{sender_pn}}`, `{{chat}}`, `{{text}}`, `{{date}}`, `{{time}}` memakai `strings.NewReplacer` (tanpa runtime script / `text/template`) | Seluruh `reply`/`send`/`react` wajib lewat `outbox.Enqueue` (`Origin{Kind: "hook"}`, `IdemKey: hook:<id>:<seq>:<n>`) |
+| Keamanan `trusted` & URL `http` | Rule dari control plane (`trusted=1`) boleh memanggil `http://` khusus loopback (`127.0.0.1`, `localhost`, `::1`); rule REST API selalu memaksa `trusted=0` (`https://` non-privat saja) termasuk saat `PUT` | IP privat LAN/CGNAT/link-local (`10.x`, `172.16.x`, `192.168.x`, `169.254.x`) selalu diblokir meski `trusted=1` |
+| Guard Bawaan & Pressure | Evaluasi per `priority` naik: `from_me` (jika `!on_from_me`), `active_hours`, Stale (`received_at > hooks_max_age` atau `offline` -> `skipped_stale`), Takeover (pesan `from_me` non-outbox mem-pause chat `takeover_pause` di LRU `4096` -> `skipped_takeover`), Pressure (saat `governor.Red`, aksi berat dilewati `skipped_pressure` sedangkan rule ringan `suppress_webhook`/`mark_read` tetap berjalan), Throttle LRU `4096` + kuota kirim `30/menit/instance` (`throttled`) | Jika rule gagal (`error`/`timeout_ms <= 5000`), rule berikutnya tetap dievaluasi meski `stop=true` |
+| Replay & `Webhook Gate` | Status `matched` ditulis di `hook_runs` sebelum aksi lalu diperbarui ke `done`/`error`; Gate menahan delivery webhook hanya bila ada rule aktif `suppress_webhook` atau `http` ber-`expect_reply: true` (fail-open setelah `10s`) | Penanda `suppressed` tersimpan di memori dan `hook_runs` sehingga bertahan pasca-restart |
+
 ## Transisi Status Instance
 
 | Dari | Ke | Pemicu |
@@ -404,4 +422,5 @@ flowchart TD
 | Penegakan Scope, Policy, Bearer & 5xx | REST API mendukung `Authorization: Bearer` setara `X-API-Key`, meneruskan `X-Request-Id` ke respons + `error.request_id`, menegakkan scope & rate limit per key, menyaring pengiriman outbox & aksi destruktif grup (`revoke`, `remove`, `leave`) via `PolicyChecker`, dan memastikan respons `5xx` memakai pesan generik tanpa detail error internal |
 | Pencatatan & pencarian Context Store FTS5 | Jika `context_store` aktif, pesan masuk ditulis atomik via `RecordHook` (`Journal.Append`), pesan keluar dicatat saat `StatusSent` di outbox, lookup `Quoted` memprioritaskan context store sebelum journal, pencarian FTS5 membungkus setiap token dengan tanda kutip ganda (opsional `prefix=true`), dan paginasi memakai cursor komposit `<ts>:<id>` / `<ts>:<chat>` kompatibel `<ts>` |
 | Keamanan & eksekusi MCP 2026-07-28 | Tanpa tool eksekusi OS/baca berkas lokal; semua aksi kirim MCP melalui `outbox.Enqueue` (`Origin{Kind: "mcp"}`) dengan penegakan `Guardian` & `KeyPolicy`; cache publik `30s` hanya untuk `server/discover` sedangkan operasi baca lain bertanda `private`; bridge `waapi mcp` meneruskan JSON-RPC stdio -> UDS dengan batas `1 MiB`/baris & konkurensi default `8` |
+| Konsumen & isolasi goroutine Reactive Hooks | Engine hooks menjalankan satu worker berurutan per instance yang memiliki rule aktif (`0` rule aktif = `0` goroutine worker & cursor `hooks` dinonaktifkan agar pruning journal tidak terhambat); pruner tiap jam memangkas `hook_runs` > `7 hari` |
 
