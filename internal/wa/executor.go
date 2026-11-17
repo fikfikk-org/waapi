@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -249,36 +248,7 @@ func (d *realComposeDeps) Media(ctx context.Context, ref outbox.MediaRef, kind s
 }
 
 func (d *realComposeDeps) Quoted(ctx context.Context, chat, waID string) (QuotedInfo, bool) {
-	if d.mgr == nil || d.mgr.journal == nil || waID == "" {
-		return QuotedInfo{}, false
-	}
-	ev, err := d.mgr.journal.FindByWAID(ctx, d.instanceID, chat, waID)
-	if err != nil || ev == nil {
-		return QuotedInfo{}, false
-	}
-
-	var msg MessageV2
-	if err := json.Unmarshal(ev.Payload, &msg); err != nil {
-		return QuotedInfo{}, false
-	}
-
-	sender := ev.Sender
-	if msg.IsFromMe {
-		if own := d.OwnJID(); !own.IsEmpty() {
-			sender = own.String()
-		}
-	} else if sender == "" {
-		sender = msg.From
-	}
-
-	var quotedMsg *waE2E.Message
-	if msg.Text != "" {
-		quotedMsg = &waE2E.Message{Conversation: proto.String(msg.Text)}
-	}
-	return QuotedInfo{
-		Sender:  sender,
-		Message: quotedMsg,
-	}, true
+	return resolveQuotedFromStores(ctx, d.mgr, d.instanceID, d.OwnJID(), chat, waID)
 }
 
 func canonicalKindForMessageType(kind string) string {

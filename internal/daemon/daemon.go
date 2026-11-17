@@ -17,6 +17,7 @@ import (
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
 	"github.com/fikfikk-org/waapi/internal/control"
+	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/guardian"
 	"github.com/fikfikk-org/waapi/internal/httpapi"
@@ -208,6 +209,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		DropBehindOff:    strings.EqualFold(cfg.MediaDropbehind, "off"),
 	})
 	retryWaiter := media.NewRetryWaiter()
+	ctxStore := ctxstore.New(j.DB(), ctxstore.NewStoreSettings(st))
 
 	waMgr, err := wa.NewManager(ctx, cfg, st, wh,
 		wa.WithJournal(j),
@@ -215,6 +217,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		wa.WithWebhookService(whSvc),
 		wa.WithMedia(mediaPipe, uploadStore, retryWaiter),
 		wa.WithPolls(pollStore),
+		wa.WithContextStore(ctxStore),
 	)
 	if err != nil {
 		whSvc.Stop()
@@ -256,9 +259,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	policyEnf := policy.New(authMgr, guard)
 
 	outboxSvc := outbox.NewService(outbox.NewSQLiteStore(j.DB()), j, waMgr, guard, policyEnf, outbox.Options{
-		DefaultTTL: cfg.OutboxTTL,
-		MaxQueued:  cfg.OutboxMaxQueued,
-		OnActivity: waMgr.RecordActivity,
+		DefaultTTL:   cfg.OutboxTTL,
+		MaxQueued:    cfg.OutboxMaxQueued,
+		OnActivity:   waMgr.RecordActivity,
+		ContextStore: ctxStore,
 	})
 	waMgr.AttachOutbox(outboxSvc, guard)
 	waMgr.SetFreeOSMemoryFn(func() { gov.TriggerFreeOSMemory() })
@@ -283,6 +287,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		ReplayWindow: cfg.JournalReplayWindow,
 		MaxRows:      cfg.JournalMaxRows,
 		Interval:     5 * time.Minute,
+		ContextTask: func(pCtx context.Context, now time.Time) {
+			if _, cErr := ctxStore.Prune(pCtx, now); cErr != nil && ctx.Err() == nil {
+				slog.Warn("pruner context store gagal", "err", cErr)
+			}
+		},
 		HourlyTask: func(pCtx context.Context) {
 			if _, pErr := outboxSvc.PruneOutbox(pCtx, time.Now(), 7*24*time.Hour, 1000); pErr != nil && ctx.Err() == nil {
 				slog.Warn("pruner outbox gagal", "err", pErr)
@@ -306,6 +315,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		control.WithHealthProvider(guard),
 		control.WithGovernor(gov),
 		control.WithAuditLog(auditLog),
+		control.WithContextStore(ctxStore),
 	)
 	ctrlSrv.SetVersion(daemonBuildVersion)
 	ctrlLn, err := ctrlSrv.Listen()
@@ -339,7 +349,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	pubHTTP := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithSSEMax(cfg.SSEMax)),
+		Handler:           httpapi.NewHandler(authMgr, waMgr, httpapi.WithDB(st.DB), httpapi.WithJournal(j), httpapi.WithOutbox(outboxSvc), httpapi.WithMedia(mediaPipe, uploadStore), httpapi.WithPolls(pollStore), httpapi.WithHealthDriver(guard), httpapi.WithGovernor(gov), httpapi.WithPolicyEnforcer(policyEnf), httpapi.WithAuditLog(auditLog), httpapi.WithContextStore(ctxStore), httpapi.WithSSEMax(cfg.SSEMax)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       90 * time.Second, // cukup untuk unggah media 16-64 MB pada jaringan lambat
 		WriteTimeout:      90 * time.Second,

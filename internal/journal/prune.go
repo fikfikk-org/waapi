@@ -20,11 +20,12 @@ const (
 
 // PrunePolicy mengatur retensi event dan batas jumlah baris per instance pada journal.db.
 type PrunePolicy struct {
-	Retention    time.Duration        // umur maksimal event yang belum terkirim (default 72h)
-	ReplayWindow time.Duration        // umur maksimal event yang sudah terkirim (default 1h)
-	MaxRows      int                  // batas baris maksimal per instance (default 50000)
-	Interval     time.Duration        // interval pruner periodik (default 5m)
-	HourlyTask   func(context.Context) // tugas retensi tambahan yang dijalankan setiap 1 jam
+	Retention    time.Duration                // umur maksimal event yang belum terkirim (default 72h)
+	ReplayWindow time.Duration                // umur maksimal event yang sudah terkirim (default 1h)
+	MaxRows      int                          // batas baris maksimal per instance (default 50000)
+	Interval     time.Duration                // interval pruner periodik (default 5m)
+	ContextTask  func(context.Context, time.Time) // pemangkasan context store yang dijalankan dalam loop pruner yang sama
+	HourlyTask   func(context.Context)        // tugas retensi tambahan yang dijalankan setiap 1 jam
 }
 
 func (p PrunePolicy) withDefaults() PrunePolicy {
@@ -258,6 +259,9 @@ func (j *Journal) RunPruner(ctx context.Context, policy PrunePolicy) {
 			pCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			if _, err := j.Prune(pCtx, policy, now); err != nil && !errorsIsCanceled(ctx, err) {
 				slog.Warn("pruner journal gagal", "err", err)
+			}
+			if policy.ContextTask != nil {
+				policy.ContextTask(pCtx, now)
 			}
 			if policy.HourlyTask != nil && now.Sub(lastHourly) >= time.Hour {
 				policy.HourlyTask(pCtx)

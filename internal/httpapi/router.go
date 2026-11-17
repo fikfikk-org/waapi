@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/fikfikk-org/waapi/internal/auth"
+	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/media"
@@ -74,6 +75,15 @@ func WithAuditLog(al *auth.AuditLog) ServerOption {
 	return func(s *Server) {
 		if al != nil {
 			s.audit = al
+		}
+	}
+}
+
+// WithContextStore menyetel Store context store opt-in untuk endpoint riwayat percakapan & FTS5.
+func WithContextStore(cs *ctxstore.Store) ServerOption {
+	return func(s *Server) {
+		if cs != nil {
+			s.ctxStore = cs
 		}
 	}
 }
@@ -216,6 +226,7 @@ type Server struct {
 	healthDriver   healthTransport
 	policyEnforcer *policy.Enforcer
 	audit          *auth.AuditLog
+	ctxStore       *ctxstore.Store
 	gov            governor.Source
 	sseMax        int
 	sseSem        chan struct{}
@@ -263,6 +274,9 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	}
 	if s.contactDriver == nil && w != nil {
 		s.contactDriver = w
+	}
+	if s.ctxStore == nil && w != nil {
+		s.ctxStore = w.ContextStore()
 	}
 	if s.audit == nil && s.appDB != nil {
 		s.audit = auth.NewAuditLog(s.appDB)
@@ -322,6 +336,9 @@ func NewServer(a *auth.Manager, w *wa.Manager, opts ...ServerOption) *Server {
 	s.handle("GET /v2/instances/{id}/health", auth.ScopeHealthRead, s.withInstanceAuth(s.handleV2GetHealth))
 	s.handle("GET /v2/instances/{id}/settings", auth.ScopeSettingsAdmin, s.withInstanceAuth(s.handleV2GetSettings))
 	s.handle("PATCH /v2/instances/{id}/settings", auth.ScopeSettingsAdmin, s.withInstanceAuth(s.handleV2PatchSettings))
+	s.handle("GET /v2/instances/{id}/chats", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextChats))
+	s.handle("GET /v2/instances/{id}/chats/{jid}/messages", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextMessages))
+	s.handle("GET /v2/instances/{id}/search", auth.ScopeMessagesRead, s.withInstanceAuth(s.handleV2ContextSearch))
 
 	s.handler = requestIDAndRecoverMiddleware(s.mux)
 	return s

@@ -3,6 +3,7 @@ package wa
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -381,4 +382,56 @@ func escapeVCardValue(s string) string {
 	s = strings.ReplaceAll(s, ",", `\,`)
 	s = strings.ReplaceAll(s, ";", `\;`)
 	return s
+}
+
+// resolveQuotedFromStores membaca pesan rujukan dari context store lebih dulu, lalu fallback ke journal.
+func resolveQuotedFromStores(ctx context.Context, mgr *Manager, instanceID string, ownJID types.JID, chat, waID string) (QuotedInfo, bool) {
+	if mgr == nil || waID == "" {
+		return QuotedInfo{}, false
+	}
+	if mgr.ctxStore != nil {
+		if sender, text, fromMe, ok := mgr.ctxStore.LookupQuoted(ctx, instanceID, chat, waID); ok {
+			if fromMe && !ownJID.IsEmpty() {
+				sender = ownJID.String()
+			}
+			var quotedMsg *waE2E.Message
+			if text != "" {
+				quotedMsg = &waE2E.Message{Conversation: proto.String(text)}
+			}
+			return QuotedInfo{
+				Sender:  sender,
+				Message: quotedMsg,
+			}, true
+		}
+	}
+	if mgr.journal == nil {
+		return QuotedInfo{}, false
+	}
+	ev, err := mgr.journal.FindByWAID(ctx, instanceID, chat, waID)
+	if err != nil || ev == nil {
+		return QuotedInfo{}, false
+	}
+
+	var msg MessageV2
+	if err := json.Unmarshal(ev.Payload, &msg); err != nil {
+		return QuotedInfo{}, false
+	}
+
+	sender := ev.Sender
+	if msg.IsFromMe {
+		if !ownJID.IsEmpty() {
+			sender = ownJID.String()
+		}
+	} else if sender == "" {
+		sender = msg.From
+	}
+
+	var quotedMsg *waE2E.Message
+	if msg.Text != "" {
+		quotedMsg = &waE2E.Message{Conversation: proto.String(msg.Text)}
+	}
+	return QuotedInfo{
+		Sender:  sender,
+		Message: quotedMsg,
+	}, true
 }

@@ -944,6 +944,11 @@ func (i *Instance) handleEventV2(rawEvt any) bool {
 			hooks = append(hooks, hook)
 		}
 	}
+	if ev.Type == "message" && i.mgr != nil && i.mgr.ctxStore != nil && i.cachedSettings().ContextStore {
+		if hook := i.mgr.ctxStore.RecordHook(ev); hook != nil {
+			hooks = append(hooks, hook)
+		}
+	}
 	res, err := j.Append(ctx, ev, hooks...)
 	if err != nil {
 		slog.Warn("gagal menyimpan event masuk ke journal", "instance", i.id, "type", ev.Type, "err", err)

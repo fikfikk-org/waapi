@@ -96,6 +96,12 @@ flowchart TD
         MY -->|"anon < 0.65 & PSI some < 2.5"| MG
         MR -->|"bertahap: anon < 0.80 & PSI full < 1.0"| MY
     end
+    subgraph ContextStore
+        CSOFF["nonaktif (default, 409 context_store_disabled)"] -->|"context on"| CSON["aktif (record atomik + FTS5)"]
+        CSON -->|"edit pesan"| CSED["update text & preview + trigger FTS5"]
+        CSON -->|"revoke pesan"| CSDEL["hapus baris + trigger FTS5 + sync chat"]
+        CSON -->|"prune (cap/max_age) / context off --purge"| CSOFF
+    end
 ```
 
 ## Aturan per Entitas
@@ -134,6 +140,15 @@ flowchart TD
 | `audit_log` (`app.db`) | Mencatat aksi mutasi control plane + pairing/settings HTTP dengan retensi `90 hari` | Actor `"control:uid=<UID>"` dari `SO_PEERCRED` di Linux atau `"key:<key_id>"` di HTTP; tidak pernah mencatat token/secret mentah |
 | Socket control atomik | `net.Listen` ke `.tmp` -> `chmod 0660` -> `os.Rename` ke `control.sock` | Meniadakan race permission sesuai `umask` saat startup daemon |
 | Backup & update binary | `waapi update` memverifikasi `checksums.txt` via tanda tangan Ed25519 (`checksums.txt.sig`) fail-closed sebelum unduh/pasang | Bila daemon hidup, memicu `POST /control/backup` (`VACUUM INTO` 3 DB perm `0600`, simpan maks 3 backup); `--insecure-no-verify` hanya untuk rilis lama |
+
+### Context Store + FTS5 (`journal.db`, Opt-In)
+
+| Field | Rule | Catatan |
+|---|---|---|
+| `context_store` (`off` default) | Nonaktif secara default (0 alokasi/goroutine); endpoint baca mengembalikan `409 context_store_disabled` | Dikelola via `waapi context <id> on\|off [--purge]\|purge [--chat]` atau `PATCH /v2/instances/{id}/settings` |
+| `messages` (`0007_context.sql`) | `text` maks `4096` karakter, `meta` JSON ringkas (`quoted_id`, `media_kind`, `filename`, `origin`) tanpa media/blob | Pesan dari `status@broadcast` dan bertipe `reaction` (inbound/outbound) dilewati; `edit` memperbarui target + `last_preview`; `revoke` menghapus baris & entri FTS5 |
+| `chats` | `last_preview` 120 karakter pertama; `unread` naik untuk pesan masuk non-`from_me` dan reset `0` saat outbound sent atau `POST /chats/{jid}/read` | Saat pesan terakhir di-revoke, `last_ts`/`last_preview` disinkronkan ulang atau baris `chats` dihapus bila kosong |
+| `context_per_chat` & `context_max_age` | Chat tersentuh di RAM (set maks `10.000`) dipangkas ke `context_per_chat` (default `50`); pesan melewati `context_max_age` (default `168h`) dihapus per chunk `1000` | Dijalankan periodik dalam loop pruner `journal.db` |
 
 ### Webhook Outbox (Legacy / Migrasi V1 -> V2)
 
@@ -369,4 +384,5 @@ flowchart TD
 | Skor & penegakan Account Health Guardian | Skor murni [0,100] mengevaluasi `recent_temp_ban`, `undelivered_ratio` (`>=20` di `[now-25j,now-1j)`), `first_contact_ratio` (`>=10`), `content_fanout` (`>=0.8`), `rate_overlimit`, dan bonus `reply_rate` (`>=10`); evaluasi `Decide` menerapkan 10 aturan berurutan (opt-out -> ban -> restricted -> fan-out -> low score -> FC cap -> daily cap -> quiet hours -> token bucket); pesan non-teks/caption kosong bebas cek fan-out; pembaruan counter RAM & konfirmasi opt-out hanya berjalan pasca-commit transaksi journal |
 | Admission control & hardening governor | Pada level `Red`, endpoint berat (`POST /pair`, SSE `events/stream`, unggah/unduh media v1/v2, serta `POST /v2/messages` dengan `media.url`) ditolak `503 memory_pressure` (`Retry-After: 15`) dan `/readyz` kembali `503 not_ready`; kirim teks biasa & media `upload_id` tetap diizinkan; unit systemd menyertakan profil `lean` default serta skrip burn-in `scripts/burnin.sh` |
 | Penegakan Scope, Policy, Bearer & 5xx | REST API mendukung `Authorization: Bearer` setara `X-API-Key`, meneruskan `X-Request-Id` ke respons + `error.request_id`, menegakkan scope & rate limit per key, menyaring pengiriman outbox & aksi destruktif grup (`revoke`, `remove`, `leave`) via `PolicyChecker`, dan memastikan respons `5xx` memakai pesan generik tanpa detail error internal |
+| Pencatatan & pencarian Context Store FTS5 | Jika `context_store` aktif, pesan masuk ditulis atomik via `RecordHook` (`Journal.Append`), pesan keluar dicatat saat `StatusSent` di outbox, lookup `Quoted` memprioritaskan context store sebelum journal, pencarian FTS5 membungkus setiap token dengan tanda kutip ganda (opsional `prefix=true`), dan paginasi memakai cursor komposit `<ts>:<id>` / `<ts>:<chat>` kompatibel `<ts>` |
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/media"
@@ -75,6 +76,10 @@ func writeMappedError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "instance_not_found", "instance tidak ditemukan", 0)
+	case errors.Is(err, ctxstore.ErrDisabled):
+		writeError(w, http.StatusConflict, "context_store_disabled", err.Error(), 0)
+	case errors.Is(err, ctxstore.ErrInvalidQuery):
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), 0)
 	case errors.Is(err, journal.ErrNotFound):
 		writeError(w, http.StatusNotFound, "event_not_found", "event tidak ditemukan", 0)
 	case errors.Is(err, media.ErrUploadNotFound):

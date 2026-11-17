@@ -16,6 +16,7 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/logx"
@@ -108,6 +109,13 @@ func WithPolls(ps *PollStore) ManagerOption {
 	}
 }
 
+// WithContextStore memasang context store opt-in untuk pencatatan pesan masuk atomik bersama journal dan lookup Quoted.
+func WithContextStore(cs *ctxstore.Store) ManagerOption {
+	return func(m *Manager) {
+		m.ctxStore = cs
+	}
+}
+
 // Manager mengelola siklus hidup seluruh instance WhatsApp di dalam satu proses daemon.
 type Manager struct {
 	cfg         *config.Config
@@ -129,6 +137,7 @@ type Manager struct {
 	uploadStore *media.UploadStore
 	retryWaiter  *media.RetryWaiter
 	pollStore    *PollStore
+	ctxStore     *ctxstore.Store
 	mediaHTTP    *http.Client
 	waLog        waLog.Logger
 	pairingSem   *semaphore.Weighted
@@ -209,6 +218,14 @@ func (m *Manager) Journal() *journal.Journal {
 		return nil
 	}
 	return m.journal
+}
+
+// ContextStore mengembalikan instance context store opt-in yang terpasang pada Manager.
+func (m *Manager) ContextStore() *ctxstore.Store {
+	if m == nil {
+		return nil
+	}
+	return m.ctxStore
 }
 
 // AddInboundObserver mendaftarkan observer yang menghasilkan TxHook saat event masuk disimpan ke journal.db.

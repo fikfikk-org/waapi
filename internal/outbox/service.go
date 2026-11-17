@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/idgen"
 	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
@@ -39,6 +40,7 @@ type Options struct {
 	ExecTimeout        time.Duration
 	RecoverInterval    time.Duration
 	OnActivity         func(instanceID string, at time.Time) // dipanggil saat pesan baru diterima ke antrian outbox
+	ContextStore       *ctxstore.Store                       // opsional: catat pesan keluar ke context store saat berstatus sent
 	DisableSendJitter  bool // khusus pengujian synctest agar jeda 300-1500 ms tidak menggeser jadwal deterministik
 	DisableRetryJitter bool // khusus pengujian synctest agar backoff retry deterministik
 }
@@ -595,6 +597,9 @@ func (s *Service) runScheduler(ctx context.Context, instanceID string, wake <-ch
 				serverTS = doneAt
 			}
 			if sentJob, mErr := s.st.MarkSent(ctx, job.ID, serverTS, doneAt); mErr == nil {
+				if s.opt.ContextStore != nil {
+					s.recordSentContext(ctx, sentJob, serverTS)
+				}
 				if s.gov != nil {
 					s.gov.Record(ctx, sentJob, Outcome{Success: true, Attempts: attempts})
 				}
@@ -924,5 +929,68 @@ func sleepWithCancel(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+func (s *Service) recordSentContext(ctx context.Context, job *Job, sentAt time.Time) {
+	if s.opt.ContextStore == nil || job == nil {
+		return
+	}
+	chat := job.ToJID
+	if chat == "" {
+		chat = job.Spec.To
+	}
+	msgType := strings.ToLower(strings.TrimSpace(job.Spec.Type))
+	msg := ctxstore.OutboundMessage{
+		InstanceID: job.InstanceID,
+		Chat:       chat,
+		WAID:       job.WAID,
+		TS:         sentAt.Unix(),
+		Type:       msgType,
+		Origin:     job.Origin,
+	}
+	if job.Spec.ReplyTo != nil {
+		msg.QuotedID = job.Spec.ReplyTo.ID
+	}
+	switch msgType {
+	case "text":
+		msg.Text = job.Spec.Text
+	case "image", "video", "audio", "document", "sticker":
+		if job.Spec.Media != nil {
+			msg.Text = job.Spec.Media.Caption
+			msg.Filename = job.Spec.Media.Filename
+			if msgType == "audio" && job.Spec.Media.PTT {
+				msg.MediaKind = "ptt"
+			} else {
+				msg.MediaKind = msgType
+			}
+		}
+	case "location":
+		if job.Spec.Location != nil {
+			msg.Text = job.Spec.Location.Name
+			if msg.Text == "" {
+				msg.Text = job.Spec.Location.Address
+			}
+		}
+	case "contact":
+		if len(job.Spec.Contacts) > 0 {
+			msg.Text = job.Spec.Contacts[0].Name
+		}
+	case "poll":
+		if job.Spec.Poll != nil {
+			msg.Text = job.Spec.Poll.Name
+		}
+	case "edit":
+		if job.Spec.Edit != nil {
+			msg.TargetID = job.Spec.Edit.MessageID
+			msg.Text = job.Spec.Edit.Text
+		}
+	case "revoke":
+		if job.Spec.Revoke != nil {
+			msg.TargetID = job.Spec.Revoke.MessageID
+		}
+	}
+	if err := s.opt.ContextStore.RecordOutbound(ctx, msg); err != nil {
+		slog.Warn("gagal mencatat outbound ke context store", "instance", job.InstanceID, "msg_id", job.ID, "err", err)
 	}
 }

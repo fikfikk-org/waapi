@@ -85,6 +85,8 @@ func Execute(args []string) error {
 		return runSend(ctx, ctrl, rest)
 	case "health":
 		return runHealth(ctx, ctrl, rest)
+	case "context":
+		return runContext(ctx, ctrl, rest)
 	case "logs":
 		return runLogs(ctx, rest)
 	case "update", "self-update":
@@ -187,6 +189,7 @@ MANAJEMEN WEBHOOK:
   waapi events <id> [--after N] [--follow]     Baca/pantau stream event journal (SSE --follow)
   waapi send <id> <to> <text> [--wait] [--idem KEY]  Kirim pesan teks lewat durable outbox
   waapi health <id> [--json]                   Lihat skor kesehatan akun Guardian, kuota & faktor
+  waapi context <id> on|off|purge [opsi]       Kelola context store FTS5 opt-in per instance
 
 DAEMON, UPDATE & DIAGNOSTIK:
   waapi status | waapi doctor                  Cek pemakaian RAM (RSS/Heap), DB, & kesehatan daemon

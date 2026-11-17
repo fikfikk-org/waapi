@@ -19,8 +19,10 @@ import (
 
 	"github.com/fikfikk-org/waapi/internal/auth"
 	"github.com/fikfikk-org/waapi/internal/config"
+	"github.com/fikfikk-org/waapi/internal/ctxstore"
 	"github.com/fikfikk-org/waapi/internal/governor"
 	"github.com/fikfikk-org/waapi/internal/guardian"
+	"github.com/fikfikk-org/waapi/internal/jid"
 	"github.com/fikfikk-org/waapi/internal/journal"
 	"github.com/fikfikk-org/waapi/internal/obs"
 	"github.com/fikfikk-org/waapi/internal/outbox"
@@ -93,6 +95,15 @@ func WithAuditLog(al *auth.AuditLog) ServerOption {
 	}
 }
 
+// WithContextStore memasang Store context store ke control plane untuk perintah waapi context.
+func WithContextStore(cs *ctxstore.Store) ServerOption {
+	return func(s *Server) {
+		if cs != nil {
+			s.ctxStore = cs
+		}
+	}
+}
+
 // Server melayani seluruh perintah administratif dari CLI lewat control.sock.
 type Server struct {
 	cfg        *config.Config
@@ -107,6 +118,7 @@ type Server struct {
 	health     healthProvider
 	gov        governor.Source
 	audit      *auth.AuditLog
+	ctxStore   *ctxstore.Store
 	startedAt  time.Time
 	version    string
 }
@@ -136,6 +148,9 @@ func NewServer(cfg *config.Config, st *store.Store, a *auth.Manager, w *wa.Manag
 	}
 	if s.audit == nil && st != nil && st.DB != nil {
 		s.audit = auth.NewAuditLog(st.DB)
+	}
+	if s.ctxStore == nil && w != nil {
+		s.ctxStore = w.ContextStore()
 	}
 	return s
 }
@@ -210,6 +225,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /control/instances/{id}/events/stream", s.handleStreamEvents)
 	mux.HandleFunc("GET /control/instances/{id}/health", s.handleGetHealth)
 	mux.HandleFunc("POST /control/instances/{id}/messages", s.handleSendMessage)
+	mux.HandleFunc("POST /control/instances/{id}/context", s.handleContextToggle)
+	mux.HandleFunc("POST /control/instances/{id}/context/purge", s.handleContextPurge)
 
 	// Ekspos pprof hanya melalui Unix Domain Socket control plane, tidak pernah di port HTTP publik
 	pprofMux := http.NewServeMux()
@@ -617,8 +634,91 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 		writeStatusErr(w, err)
 		return
 	}
+	if s.ctxStore != nil {
+		_ = s.ctxStore.Purge(r.Context(), id, "")
+	}
 	s.recordAudit(r.Context(), "instance.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
+}
+
+type contextToggleReq struct {
+	Enabled bool `json:"enabled"`
+	Purge   bool `json:"purge"`
+}
+
+func (s *Server) handleContextToggle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req contextToggleReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	cur, err := s.store.GetInstance(r.Context(), id)
+	if err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	cur.Settings.ContextStore = req.Enabled
+	if _, err := s.wa.UpdateSettings(r.Context(), id, cur.Settings); err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	if req.Purge && s.ctxStore != nil {
+		if err := s.ctxStore.Purge(r.Context(), id, ""); err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	action := "context.disable"
+	if req.Enabled {
+		action = "context.enable"
+	}
+	s.recordAudit(r.Context(), action, id, fmt.Sprintf("purge=%t", req.Purge))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"instance":      id,
+		"context_store": req.Enabled,
+		"purged":        req.Purge,
+	})
+}
+
+type contextPurgeReq struct {
+	Chat string `json:"chat"`
+}
+
+func (s *Server) handleContextPurge(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.GetInstance(r.Context(), id); err != nil {
+		writeStatusErr(w, err)
+		return
+	}
+	var req contextPurgeReq
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	chatCanon := strings.TrimSpace(req.Chat)
+	if chatCanon != "" && !strings.HasSuffix(chatCanon, "@lid") {
+		parsed, err := jid.ParseRecipient(chatCanon)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		chatCanon = parsed.String()
+	}
+	if s.ctxStore != nil {
+		if err := s.ctxStore.Purge(r.Context(), id, chatCanon); err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	s.recordAudit(r.Context(), "context.purge", id, fmt.Sprintf("chat=%s", chatCanon))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"instance": id,
+		"chat":     chatCanon,
+		"purged":   true,
+	})
 }
 
 func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {

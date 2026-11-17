@@ -74,6 +74,10 @@ func (s *Server) handleV2MarkRead(w http.ResponseWriter, r *http.Request, _ *wa.
 		writeMappedError(w, err)
 		return
 	}
+	if s.ctxStore != nil {
+		// No-op apabila context_store mati; mereset unread ke 0 jika aktif.
+		_ = s.ctxStore.MarkChatRead(r.Context(), r.PathValue("id"), chatJID.String())
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

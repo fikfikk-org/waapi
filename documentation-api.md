@@ -11,7 +11,7 @@
 | 401 | unauthorized / key_expired | Key tidak ada, salah, dicabut, atau melewati `expires_at` |
 | 403 | forbidden_instance / scope_denied / chat_not_allowed / outside_reply_window / first_contact_denied / first_contact_requires_approval / destructive_denied / destructive_requires_approval | Key tidak punya akses instance, scope kurang, atau melanggar aturan `KeyPolicy` pengiriman / aksi destruktif |
 | 404 | instance_not_found / message_not_found / event_not_found / upload_not_found | Instance, pesan outbox, event journal, atau descriptor upload tidak ditemukan |
-| 409 | instance_not_paired / message_not_cancellable | Instance belum di-pairing atau status pesan bukan `queued` saat pembatalan |
+| 409 | instance_not_paired / message_not_cancellable / context_store_disabled | Instance belum di-pairing, status pesan bukan `queued` saat pembatalan, atau context store belum diaktifkan |
 | 410 | upload_expired / media_gone | Descriptor `upload_id` kedaluwarsa (>24 jam) atau media sudah tidak tersedia (termasuk setelah media resurrection) |
 | 413 | media_too_large | Media melebihi batas (16 MiB media, 64 MiB dokumen, 1 MiB sticker) |
 | 415 | unsupported_media / ptt_requires_ogg_opus / sticker_requires_webp | Format media tidak didukung (mis. GIF sebagai `image`), PTT wajib OGG Opus, sticker wajib WebP |
@@ -514,6 +514,42 @@
 | Response | 200 langsung objek `store.InstanceSettings` terbaru · 400 `invalid_request` / `invalid_spec` · 403 `scope_denied` · 404 |
 | Notes | Menerapkan `InstanceSettings.Merge`, menyinkronkan cache target/instance di memori, dan mencatat entri `settings.update` ke `audit_log` |
 
+## GET /v2/instances/{id}/chats
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/chats |
+| Auth Required | Yes (`X-API-Key` / `Bearer`, scope `messages:read`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | `limit` (int, default `50`, maks `100`), `before` (opsional, cursor `<ts>:<chat>` atau Unix detik `<ts>`) |
+| Request Body | - |
+| Response | 200 `{ chats: [{ chat, chat_type, name, last_ts, last_preview, unread }], next_before }` (`next_before` string cursor atau `null`) · 400 `invalid_request` · 409 `context_store_disabled` |
+| Notes | Diurutkan menurun berdasar `last_ts`; `chat_type` diturunkan dari domain JID (`dm\|group\|newsletter\|broadcast\|status`) |
+
+## GET /v2/instances/{id}/chats/{jid}/messages
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/chats/{jid}/messages |
+| Auth Required | Yes (`X-API-Key` / `Bearer`, scope `messages:read`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | `limit` (int, default `20`, maks `100`), `before` (opsional, cursor `<ts>:<id>` atau Unix detik `<ts>`) |
+| Request Body | - |
+| Response | 200 `{ messages: [{ id, from, from_me, timestamp, type, text, quoted_id }], next_before }` (terurut naik kronologis dalam halaman) · 400 · 409 `context_store_disabled` |
+| Notes | Tidak menyimpan media; pesan `reaction`/`status@broadcast` dilewati, pesan `revoke` terhapus beserta FTS5 |
+
+## GET /v2/instances/{id}/search
+
+| Field | Detail |
+|---|---|
+| Method + Endpoint | GET /v2/instances/{id}/search |
+| Auth Required | Yes (`X-API-Key` / `Bearer`, scope `messages:read`) |
+| Headers | `X-API-Key` atau `Authorization: Bearer wak_...` |
+| Query Params | `q` (string wajib), `chat` (opsional, filter JID/nomor), `limit` (int, default `20`, maks `100`), `prefix` (bool, default `false`) |
+| Request Body | - |
+| Response | 200 `{ hits: [{ chat, id, from, from_me, timestamp, type, snippet, rank }] }` · 400 `invalid_request` · 409 `context_store_disabled` |
+| Notes | Pencarian FTS5 (`unicode61 remove_diacritics 2`) BM25; seluruh token dibungkus kutip ganda aman sintaks, `prefix=true` menambah `*` di token terakhir |
+
 ## Webhook Keluar (dikirim daemon ke backend)
 
 | Field | Detail |
@@ -539,6 +575,7 @@ Tidak diekspos via HTTP publik; hanya diakses perintah `wa-api` lewat `control.s
 - `POST /control/keys` mendukung atribut v2 (`scopes`, `expires_in`/`expires_at`, `rate_per_sec`, `policy`), `GET /control/keys/{id}` menampilkan detail metadata key tanpa rahasia (`waapi key show <id>`), dan `POST /control/keys/{id}/rotate` menerbitkan key pengganti sekaligus menetapkan masa grace key lama (`waapi key rotate <id> [--grace 24h]`).
 - `GET /control/audit` (`?since=24h&action=...&limit=100`) membaca entri `audit_log` beserta actor UID (`SO_PEERCRED` Linux) / key ID (`waapi audit`).
 - `POST /control/backup` membuat backup atomik `VACUUM INTO` untuk `app.db`, `journal.db`, dan `wa.db` ke `backups/db-<versi>-<timestamp>/` (`0600`, retensi 3 backup terbaru); dipanggil otomatis oleh `waapi update` bila daemon hidup. Socket `control.sock` dibuat atomik lewat temp socket -> `chmod 0660` -> `rename`.
+- `POST /control/instances/{id}/context` (`{ enabled, purge? }`) mengaktifkan/mematikan context store sekaligus opsional mem-purge data instance, dan `POST /control/instances/{id}/context/purge` (`{ chat? }`) membersihkan satu chat atau seluruh instance (`waapi context <id> on|off [--purge]|purge [--chat jid]`, mencatat `audit_log`).
 
 ## Scheduled Tasks
 
@@ -552,7 +589,7 @@ Belum ada `routes/web.php` / `Kernel.php` (bukan proyek Laravel). Tugas berkala 
 | Outbox lease recovery | Saat startup & tiap 60 detik | Kembalikan pekerjaan `sending` yang lease-nya kedaluwarsa (crash/kill) | Ubah status kembali ke `queued` dan bangunkan scheduler instance |
 | Webhook lane deliverer | Berbasis notif (`Subscribe`) + fallback idle | Kirim envelope v2 per lane dari `journal.db` ke `webhook_url` | Commit cursor, pause saat `410`, catat gagal permanen ke `webhook_dead` |
 | Flush last_used_at | Tiap 60 detik | Simpan waktu pakai API key | Write batch ke app.db |
-| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, dan jalankan pemangkasan final `outbox`, `uploads`, bucket Guardian, serta `audit_log` (> 90 hari) tiap jam | Hapus baris lama (kecuali `webhook_dead`), bersihkan baris final `outbox`, descriptor `uploads` > 24h, `guardian_hourly` > 8 hari, `guardian_fanout` > 2 hari, `audit_log` > 90 hari, serta inkremen `dropped_undelivered_total` |
+| Journal pruner | Tiap 5 menit (+ tugas per jam) | Pangkas baris `journal.db` sesuai replay window, retensi, batas baris, pangkas context store (`context_per_chat` & `context_max_age`), dan jalankan pemangkasan final `outbox`, `uploads`, bucket Guardian, serta `audit_log` (> 90 hari) tiap jam | Hapus baris lama (kecuali `webhook_dead`), pangkas chat tersentuh & pesan context kedaluwarsa per chunk `1000`, bersihkan baris final `outbox`, descriptor `uploads` > 24h, `guardian_hourly` > 8 hari, `guardian_fanout` > 2 hari, `audit_log` > 90 hari, serta inkremen `dropped_undelivered_total` |
 | Guardian bucket flusher | Tiap 30 detik & saat shutdown | Sinkronkan delta ring counter 25 jam dari RAM ke tabel `guardian_hourly` di `journal.db` | Menjaga hitungan skor dan kuota tetap akurat setelah restart tanpa write DB per pesan |
 | Temp sweeper | Saat startup | Hapus file media sementara > 1 jam | Hapus file di `tmp/` |
 | Systemd watchdog loop | Tiap `WATCHDOG_USEC/2` (bila disetel) | Kirim `WATCHDOG=1` ke `$NOTIFY_SOCKET` setelah `SELECT 1` ke `app.db` lulus <= 500 ms | Menunda heartbeat jika DB macet agar systemd dapat me-restart service |
